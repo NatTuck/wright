@@ -81,16 +81,19 @@ def test_bad_module_lists(text: str) -> None:
         parse_modules(text)
 
 
-def test_flags_set_the_variables_that_ranks_inherit(monkeypatch) -> None:
+def test_flags_set_the_variables_that_ranks_inherit(monkeypatch, tmp_path) -> None:
     for name in (VISIBLE_MODULES, "RESIN_GAUDI_CACHE", "LOG_LEVEL_ALL"):
-        monkeypatch.delenv(name, raising=False)
+        # setenv first so teardown restores the variable even if it was unset.
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    cache = str(tmp_path / "cache")
     parser = argparse.ArgumentParser()
     add_gaudi_arguments(parser)
-    args = parser.parse_args(["--gpu", "0,1", "--cache-dir", "/c", "--log-level", "2"])
+    args = parser.parse_args(["--gpu", "0,1", "--cache-dir", cache, "--log-level", "2"])
     monkeypatch.setitem(os.environ, VISIBLE_MODULES, "7")
     apply_gaudi_arguments(args)
     assert os.environ[VISIBLE_MODULES] == "0,1"
-    assert os.environ["RESIN_GAUDI_CACHE"] == "/c"
+    assert os.environ["RESIN_GAUDI_CACHE"] == cache
     assert os.environ["LOG_LEVEL_ALL"] == "2"
 
 

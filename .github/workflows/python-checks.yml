@@ -18,6 +18,9 @@ jobs:
         run: rustup toolchain install
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # resin-py's tests embed PYO3_PYTHON and import numpy.
+      - name: Install NumPy for the system Python
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-numpy
       - name: Tests
         run: cargo test --locked --workspace
 
