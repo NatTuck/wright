@@ -1,0 +1,29 @@
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10"]
+build-backend = "uv_build"
+
+[project]
+name = "resin-models-gaudi"
+version = "0.1.0"
+description = "LLM implementations for Resin on Intel Gaudi2, over the Synapse graph compiler"
+requires-python = ">=3.11"
+license = "Apache-2.0 AND PolyForm-Noncommercial-1.0.0"
+license-files = ["resin_models_gaudi/kernels/LICENSE"]
+dependencies = [
+  "resin==0.1.0",
+  "numpy>=1.26,<3",
+  "huggingface-hub>=0.35",
+  "safetensors>=0.5",
+  "tokenizers>=0.22.2",
+  "coloredlogs>=15,<16",
+  "typer>=0.15,<1",
+]
+
+[project.scripts]
+wright = "resin_models_gaudi.cli:main"
+
+[tool.uv.sources]
+resin = { workspace = true }
+
+[tool.uv.build-backend]
+module-root = ""

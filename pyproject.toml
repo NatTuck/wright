@@ -1,0 +1,126 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "resin"
+version = "0.1.0"
+description = "A small Rust substrate for model-specific inference engines"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "crates/resin-recipe/licenses/*.txt"]
+authors = [{ name = "Eric Zhang <ekzhang1@gmail.com>" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["blake3>=1.0,<2", "numpy>=1.26,<3"]
+
+[dependency-groups]
+# Gaudi2 serving: the Synapse runner package, plus CPU-only Torch for the Gloo control plane.
+gaudi = [
+  "huggingface-hub>=0.35",
+  "resin-models-gaudi",
+  "safetensors>=0.5",
+  "tokenizers>=0.22.2",
+  "torch>=2.13.0",
+]
+# Gaudi2 development: serving plus test tools.
+gaudi-dev = [
+  { include-group = "gaudi" },
+  "hypothesis>=6.140,<7",
+  "maturin>=1.9,<2",
+  "pytest>=8,<9",
+  "ruff>=0.16,<0.17",
+  "ty>=0.0.90",
+]
+dev = [
+  "hypothesis>=6.140,<7",
+  "tml-renderers==0.2.0",
+  "resin-models-torch",
+  "resin-models-gaudi",
+  "maturin>=1.9,<2",
+  "pytest>=8,<9",
+  "ruff>=0.16,<0.17",
+  "huggingface-hub>=0.35",
+  "safetensors>=0.5",
+  "renderers==0.1.9",
+  "tokenizers>=0.22.2",
+  "transformers>=5.14.1",
+  "ty>=0.0.90",
+  "deepseek-recipe==0.2.0",
+  "openai-harmony==0.0.8",
+  "matplotlib>=3.10,<4",
+]
+
+[tool.maturin]
+manifest-path = "crates/resin-py/Cargo.toml"
+module-name = "resin._resin"
+python-source = "."
+python-packages = ["resin"]
+features = ["pyo3/extension-module"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "TID252"]
+
+[tool.ruff.lint.per-file-ignores]
+"resin/_resin.pyi" = ["I001"]
+"models/gaudi/tools/*" = ["E402", "E701", "E702", "E731", "F841"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "resin",
+  "resin_models_gaudi",
+  "resin_models_torch",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "models/gaudi", "models/torch"]
+testpaths = [
+  "tests",
+  "models/gaudi/tests",
+  "models/torch/tests",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+# Torch runs the reference models and the control plane on the CPU.
+torch = { index = "pytorch-cpu" }
+resin-models-gaudi = { workspace = true }
+resin-models-torch = { workspace = true }
+
+[tool.uv.workspace]
+members = ["models/*"]
+
+[tool.ty.rules]
+# Development doesn't have every optional package available.
+unresolved-import = "ignore"
+
+# nn.Module declares forward as a writable Callable; model methods specialize it.
+invalid-mutable-override = "ignore"
+
+[tool.ty.src]
+# The Gaudi package is numeric code against untyped ctypes and NumPy shapes.
+exclude = ["models/gaudi"]
+
+# These tests pass mixed option dictionaries to create_runner on purpose.
+[[tool.ty.overrides]]
+include = ["tests/test_deploy_models.py"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"

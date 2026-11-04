@@ -1,0 +1,282 @@
+{
+ "source": {
+  "repo": "mistralai/Mistral-Large-4-1T-A52B-NVFP4",
+  "revision": "bb6d00fe249b0e876f0cffc6b85014be02de3e68"
+ },
+ "template": "chat_template.jinja",
+ "cases": [
+  {
+   "name": "simple",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello 🦀"
+     }
+    ]
+   },
+   "text": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Hello 🦀[/INST]"
+  },
+  {
+   "name": "system",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Be brief."
+     },
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "text": "<s>[SYSTEM_PROMPT]Be brief.[/SYSTEM_PROMPT][MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Hi[/INST]"
+  },
+  {
+   "name": "effort_low",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "extra": {
+     "reasoning_effort": "low"
+    }
+   },
+   "text": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"low\"}[/MODEL_SETTINGS][INST]Hi[/INST]"
+  },
+  {
+   "name": "effort_medium",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ],
+    "extra": {
+     "reasoning_effort": "medium"
+    }
+   },
+   "text": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"medium\"}[/MODEL_SETTINGS][INST]Hi[/INST]"
+  },
+  {
+   "name": "multi_turn_reasoning",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is 2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4",
+      "reasoning_content": "Simple sum."
+     },
+     {
+      "role": "user",
+      "content": "And 3+3?"
+     }
+    ]
+   },
+   "text": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]What is 2+2?[/INST][THINK]Simple sum.[/THINK]4</s>[INST]And 3+3?[/INST]"
+  },
+  {
+   "name": "thinking_blocks",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Q"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "thinking",
+        "thinking": "hmm"
+       },
+       {
+        "type": "text",
+        "text": "A"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": "Q2"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "thinking",
+        "thinking": "open",
+        "closed": false
+       }
+      ]
+     }
+    ]
+   },
+   "text": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Q[/INST][THINK]hmm[/THINK]A</s>[INST]Q2[/INST][THINK]open</s>"
+  },
+  {
+   "name": "merged_users",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "one"
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "two"
+       },
+       {
+        "type": "text",
+        "text": " three"
+       }
+      ]
+     }
+    ]
+   },
+   "text": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]one\n\ntwo three[/INST]"
+  },
+  {
+   "name": "tools",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Use tools."
+     },
+     {
+      "role": "user",
+      "content": "Weather in Paris?"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "a1",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris",
+          "days": 2
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "a1",
+      "content": "{\"temp\": 18}"
+     },
+     {
+      "role": "assistant",
+      "content": "18 degrees.",
+      "tool_calls": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\":\"Lyon\"}"
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": ""
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "content": [
+       {
+        "type": "text",
+        "text": "ok"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": "Thanks"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather in a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "days": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "text": "<s>[SYSTEM_PROMPT]Use tools.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]Weather in Paris?[/INST][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", \"days\": 2}</s>[TOOL_RESULTS]{\"temp\": 18}[/TOOL_RESULTS]18 degrees.[TOOL_CALLS]get_weather[ARGS]{\"city\":\"Lyon\"}[TOOL_CALLS]get_weather[ARGS]{}</s>[TOOL_RESULTS]ok[/TOOL_RESULTS][INST]Thanks[/INST]"
+  },
+  {
+   "name": "assistant_last",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "assistant",
+      "content": "y"
+     }
+    ]
+   },
+   "text": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]x[/INST]y</s>"
+  },
+  {
+   "name": "system_between",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "a"
+     },
+     {
+      "role": "system",
+      "content": "b"
+     },
+     {
+      "role": "user",
+      "content": "c"
+     }
+    ]
+   },
+   "text": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST]a[/INST][SYSTEM_PROMPT]b[/SYSTEM_PROMPT][INST]c[/INST]"
+  }
+ ]
+}

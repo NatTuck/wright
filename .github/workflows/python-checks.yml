@@ -1,0 +1,80 @@
+name: Checks
+
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Rust's abi3-py311 bindings can use the runner's system Python 3.12.
+      PYO3_PYTHON: /usr/bin/python3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked --workspace
+
+  hardware-free-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYO3_PYTHON: /usr/bin/python3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Install dependencies
+        run: uv sync --locked --no-default-groups --group gaudi-dev
+      # These tests need packages outside the Gaudi groups.
+      # test_distributed_http aborts intermittently at the upstream commit too.
+      - name: Tests
+        run: >-
+          uv run --no-sync python -m pytest -q tests
+          models/gaudi/tests/test_gguf.py
+          models/gaudi/tests/test_ml4_cache.py
+          models/gaudi/tests/test_qwen_checkpoint.py
+          models/gaudi/tests/test_sampling_plan.py
+          models/gaudi/tests/test_trace.py
+          --ignore=tests/recipe_fuzz
+          --ignore=tests/test_backend_plans.py
+          --ignore=tests/test_bench_cli.py
+          --ignore=tests/test_bench_plots.py
+          --ignore=tests/test_demo_ui.py
+          --ignore=tests/test_distributed_http.py
+          --ignore=tests/test_glm_media.py
+          --ignore=tests/test_glm_recipe.py
+          --ignore=tests/test_http_logprobs.py
+          --ignore=tests/test_http_stream_interval.py
+          --ignore=tests/test_recipe_http.py
+          --ignore=tests/test_recipe_media.py
+          --ignore=tests/test_recipe_media_cache.py
+          --ignore=tests/test_recipe_media_preparation.py
+          --ignore=tests/test_server_media.py
+
+  lint-and-types:
+    # Match local development on macOS.
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Ruff lint
+        run: uv run --no-sync ruff check .
+      - name: Check types
+        run: uv run --no-sync ty check

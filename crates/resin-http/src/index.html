@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="resin-dp-size" content="1">
+  <title>Resin</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/contrib/auto-render.min.js"></script>
+  <style>
+    :root { color-scheme:light dark; font:15px/1.6 ui-sans-serif,system-ui,-apple-system,sans-serif; --line:#8884; --muted:#888; --accent:#2563d9; --soft:#8881 }
+    * { box-sizing:border-box }
+    html { scrollbar-gutter:stable }
+    body { max-width:880px; min-height:100dvh; margin:0 auto; padding:24px 20px 18px; display:flex; flex-direction:column; background:Canvas; color:CanvasText }
+    header { position:sticky; top:0; z-index:2; display:flex; align-items:baseline; justify-content:space-between; gap:20px; margin-top:-24px; padding:24px 0 12px; background:Canvas }
+    header::after,footer::before { content:""; position:absolute; left:0; right:0; height:24px; opacity:0; pointer-events:none; transition:opacity .15s }
+    header::after { top:100%; background:linear-gradient(to bottom,Canvas,transparent) }
+    footer::before { bottom:100%; background:linear-gradient(to bottom,transparent,Canvas) }
+    body.can-scroll-up header::after,body.can-scroll-down footer::before { opacity:1 }
+    h1 { font-size:23px; letter-spacing:-.025em; margin:0 } .muted,#stats { color:var(--muted) }
+    #model { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+    #chat-shell { min-width:0; flex:1 0 auto; display:flex; flex-direction:column }
+    #chat { min-width:0; flex:1 0 auto; display:flex; flex-direction:column; gap:18px; padding:18px 3px 26px }
+    #empty-state { margin:auto; display:grid; justify-items:center; gap:5px; color:var(--muted); font-size:13px; opacity:.72; user-select:none }
+    #empty-state svg { width:140px; height:auto; transform:translateX(-5px); overflow:visible }
+    #empty-state svg path { fill:currentColor }
+    .turn { min-width:0; border:1px solid var(--line); border-radius:15px; padding:14px 17px; overflow-wrap:anywhere }
+    .user { align-self:flex-end; width:min(88%,760px); background:var(--soft); white-space:pre-wrap }
+    .assistant { width:100%; padding:17px 19px }
+    .markdown { min-width:0; max-width:100% }
+    .markdown > :first-child { margin-top:0 } .markdown > :last-child { margin-bottom:0 }
+    .markdown p { margin:.7em 0 } .markdown h1,.markdown h2,.markdown h3 { line-height:1.25; margin:1.15em 0 .45em }
+    .markdown h1 { font-size:1.45em } .markdown h2 { font-size:1.25em } .markdown h3 { font-size:1.08em }
+    .markdown ul,.markdown ol { margin:.6em 0; padding-left:1.5em }
+    .markdown blockquote { margin:.8em 0; padding:.1em 0 .1em 1em; border-left:3px solid var(--line); color:var(--muted) }
+    .markdown hr { border:0; border-top:1px solid var(--line); margin:1.3em 0 }
+    .table-wrap { width:100%; max-width:100%; overflow-x:auto; margin:.9em 0 }
+    .markdown table { width:100%; border-collapse:collapse; font-size:.95em }
+    .markdown th,.markdown td { padding:.45em .7em; border:1px solid var(--line); text-align:left; vertical-align:top }
+    .markdown th { background:var(--soft); font-weight:650 }
+    .markdown .align-center { text-align:center } .markdown .align-right { text-align:right }
+    code { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--soft); border-radius:5px; padding:.15em .35em }
+    pre { max-width:100%; overflow:auto; margin:.9em 0; padding:13px 15px; border:1px solid var(--line); border-radius:10px; background:var(--soft) }
+    pre code { background:none; padding:0 } a { color:var(--accent) }
+    details { min-width:0; color:var(--muted); margin:0 3px -5px } details summary { cursor:pointer; user-select:none; font-weight:600 }
+    details.pending summary { animation:pulse 1.4s ease-in-out infinite }
+    details .markdown { padding:7px 3px 2px }
+    .assistant:empty { display:none }
+    footer { min-width:0; position:sticky; bottom:0; z-index:2; margin-bottom:-18px; padding:9px 0 18px; background:Canvas }
+    #stats { min-height:24px; margin:0 3px 8px; font-size:13px }
+    #attachments { display:flex; gap:8px; overflow-x:auto; margin:0 3px 8px; padding:2px }
+    #attachments[hidden] { display:none }
+    .attachment { position:relative; flex:0 0 76px; height:76px; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:var(--soft) }
+    .attachment img { width:100%; height:100%; display:block; object-fit:cover }
+    .attachment button { position:absolute; top:4px; right:4px; width:22px; height:22px; border:1px solid #fff8; border-radius:50%; padding:0; background:#111b; color:white; font:16px/18px system-ui }
+    .user-media { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:9px }
+    .user-media img { display:block; width:min(180px,100%); max-height:240px; border-radius:10px; object-fit:cover }
+    .user-text:empty { display:none }
+    #settings { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:8px; padding:11px 13px 12px; border:1px solid var(--line); border-radius:14px }
+    #settings[hidden] { display:none }
+    #settings label { display:grid; gap:4px; color:var(--muted); font-size:12px; font-weight:600 }
+    #settings input,#settings select { width:100%; height:34px; border:1px solid var(--line); border-radius:9px; padding:0 9px; background:Canvas; color:CanvasText; font:14px/1 ui-sans-serif,system-ui,-apple-system,sans-serif }
+    form { display:flex; align-items:flex-end; gap:8px; padding:7px 7px 7px 13px; border:1px solid var(--line); border-radius:17px; background:Canvas }
+    textarea { flex:1; min-height:38px; min-width:0; max-height:160px; resize:none; border:0; outline:0; padding:8px 2px; background:transparent; color:inherit; font:inherit; line-height:22px }
+    button { flex:0 0 38px; width:38px; height:38px; border:0; border-radius:11px; background:var(--accent); color:white; font:700 20px/1 system-ui; cursor:pointer }
+    #attach,#settings-toggle { background:var(--soft); color:CanvasText; font-size:20px; font-weight:400 }
+    #settings-toggle[aria-expanded="true"] { color:var(--accent) }
+    button:hover { filter:brightness(1.08) } button:disabled { opacity:.45; cursor:wait }
+    @keyframes pulse { 50% { opacity:.5 } }
+    @media (max-width:600px) { body { padding:16px 12px 10px } header { margin-top:-16px; padding:16px 0 8px } footer { margin-bottom:-10px; padding-bottom:10px } .user { width:94% } .assistant { padding:14px } #settings { grid-template-columns:repeat(2,minmax(0,1fr)) } textarea,#settings input,#settings select { font-size:16px } }
+  </style>
+</head>
+<body>
+  <header><h1>Resin</h1><span id="model" class="muted"></span></header>
+  <div id="chat-shell"><main id="chat"><div id="empty-state" aria-hidden="true">
+    <svg viewBox="0 0 1194 824"><path d="M539.625 30.688c28.1 21.3 44.2 60.9 55.4 93.3v2c1-.5 2-1 3.1-1.6 59.3-29 125.2-42.5 190.9-42.7h6.2c18.8.1 37.4 1.4 55.9 4.6 1.3.2 2.5.5 3.8.7 53.1 9.3 103.2 30.3 146.1 63 1 .8 2.1 1.6 3.2 2.4 7 5.2 13.5 10.9 19.8 16.9 2.3 2.1 4.7 4.2 7.1 6.3 7.9 6.9 15 14.4 21.9 22.4 1.4 1.6 2.9 3.2 4.4 4.9 24.2 27.2 43.9 58.4 61.6 90.1.7 1.3 1.4 2.5 2.1 3.8 25.1 45.3 40 96.1 46.9 147.2.2 1.6.4 3.2.7 4.9 9.3 78.3-10.3 165.7-58.9 228.6-.5.6-.5.6-2.8 3.5l-2.4 3c-11.5 14.4-24.2 27.7-38.6 39-.5.4-.5.4-3.1 2.4-80.6 63.3-192.6 74.8-291.7 74.9h-4.6c-26.9 0-53.7-1-80.6-3.3-1.7-.1-3.4-.3-5.1-.4-114.3-10.3-114.3-10.3-147.9-46.6-7.3-9.2-15-20.8-15-33-2 .3-4 .7-6 1-25.7 1.1-51.9-1.4-72.3-18.4-3.9-3.7-7.5-7.4-10.7-11.6v-2c-1.2 1-2.3 2-3.5 3.1-29 25-63.5 28.4-100.5 26.9-34.4-2.5-70.5-14.8-96.6-37.9-6.3-4.7-10.9-6.2-18.4-8.1-3.5 4.9-6.9 9.8-10 15l-2 2c-6-1-6-1-7-2 0-6.4.9-8.5 4-13.9.7-1.3 1.5-2.6 2.2-4 .6-1 1.2-2 1.8-3.1-2-.6-4-1.3-6-2q-4.05-2.1-8.1-4.5c-4.3-2.5-8.3-4.6-12.9-6.5-5.8 6.4-11.4 12.8-16.7 19.6-2.3 2.4-2.3 2.4-7.3 3.4-3-3-3-3-4-7 4.9-7.5 10.6-14 16.8-20.6 2.2-2.4 2.2-2.4 3.2-4.4-1.3-.6-2.7-1.3-4-2-3.2-2.9-6.2-5.9-9.3-8.9-.4-.5-.4-.5-2.6-2.6-5.7-5.8-10.7-11.7-15.1-18.5-6.3 3.4-11.4 7.5-16.8 12.1-3.2 1.9-3.2 1.9-9.2.9-.9-3.1-.9-3.1-1-7 2.3-2.9 2.3-2.9 5.5-5.6 1.1-.9 2.2-1.9 3.3-2.9 3.3-2.6 6.6-5.2 10.2-7.5-1.8-5.2-3.8-9.7-6.2-14.5-19.4-40.8-20.8-83.4-8.9-126.5 1.1-5 1.1-5 .1-10-3-3.4-6-6.7-9-10-9.7-10.8-18.4-22.3-27-34-1.1-1.4-2.1-2.8-3.2-4.3-21.9-30.5-49-70.3-46.8-109.7 2.6-11.8 8.4-19.6 18-27 42.3-25.8 104.1-25.3 151.8-23.5 2.3 0 4.5.1 6.9.2 5.2.3 10.2.8 15.3 1.5 7-.2 7-.2 9.9-2.4 2.5-2.7 2.5-2.7 6.1-7.8h2c.6-1.3 1.3-2.6 2-4 38.4-36.7 100.3-73.2 155-73 3.7 0 3.7 0 10-2 4.3-6.2 7-13.1 10-20 14.9-28 33.2-55.7 56-78 .9-1.1 1.8-2.2 2.7-3.4 18.3-20.3 43.9-36 69.9-20.9m-68.6 43.3c-22.2 26.2-41 55.6-55 87-2 4-2 4-6 7-4 .8-8 1.4-12 2-32 4.9-63.4 13.5-92 29-1.3.7-2.6 1.3-3.9 2-8.1 4.2-15.7 8.8-23.1 14-1.1.8-2.2 1.5-3.4 2.3-14 9.8-26.1 21-38 33.1-7.5 7.6-7.5 7.6-12.6 7.7-8.1 0-16.2 0-24.3-.6-45.8-2.8-114.8-5.1-153.3 22.8-5 5.4-6.2 9.4-6.9 16.7 1.4 19.2 9.8 36.2 18.5 53 .5 1.1 1.1 2.3 1.6 3.4 14.3 28.4 34.7 54.7 56.2 77.9 12.2 13.3 12.2 13.3 12.2 21.7-1 4-2.2 7.9-3.3 11.8-12.1 41.7-8.4 84.3 12.7 122.5.5.9 1.1 1.8 1.6 2.7 6.5-3.2 12.9-6.5 19.2-10.2 10.7-6.1 22.2-10.4 33.8-14.8 1.5-.6 3.1-1.2 4.7-1.8 23.6-8.3 49.3-12.7 74.3-11.2.5.3.5.3 3 2v6c-3.7 3.6-9.8 2.6-14.7 2.9-34 2.1-66.2 11.1-96.3 27.1-.8.4-.8.4-4.8 2.5-4.1 2.2-8.2 4.3-12.2 6.5 5 12.5 17.3 24 28 32 3.9-2 6.5-4 9.8-6.9 23.3-20 62.1-49.1 94.2-49.1 2 2 2 2 2 7-5.7 3-11.5 5.4-17.5 7.8-9.1 3.6-17.9 7.6-26.5 12.2-1.5.8-2.9 1.5-4.4 2.3-16.9 9.1-32 20.4-46.6 32.7 1.6 4.8 5.4 5.8 9.7 8.1 1.6.9 3.2 1.8 4.9 2.7 4.4 2.2 4.4 2.2 9.4 3.2 2.8-2.4 2.8-2.4 5.7-5.8 1.1-1.2 2.1-2.4 3.2-3.6 1-1.2 2-2.4 3.1-3.6 27-30.3 62.4-55.8 104-60 31.8-1.3 60.2 3.5 85 25 6.9 6.8 13.1 13.6 18 22 3-3 3-3 6.8-8.8 29.4-42.7 87.2-59.1 135.4-68.1 14.3-2.3 28.9-4.1 43.4-4.2 8-1.1 11.2-4.2 16.4-9.9 1.3-1.2 2.6-2.5 3.9-3.8 13.8-13.3 25.1-27.8 35.1-44.2 1.1-1.8 2.2-3.6 3.4-5.4 5.6-9.8 5.6-9.8 5.6-14.6-8.6.5-16.5 2.2-24.8 4.4-1.3.3-2.5.7-3.9 1-16 4.5-32.3 9.5-47.4 16.5-2.9 1.1-2.9 1.1-7.9.1-.4-1.6-.7-3.3-1-5 20.4-20.4 64.9-25.7 92-31 6.3-17.3 10.6-34.7 13-53-36.7 6.1-72.5 34.6-100 58-5 4.3-5 4.3-9 7-1.7-.3-3.3-.6-5-1-.4-2-.7-3.9-1-6 2.1-2.9 2.1-2.9 5.2-5.8 1.1-1 2.3-2.1 3.4-3.2 15.5-13.8 32.5-25.5 50.4-36 1.2-.7 2.5-1.5 3.8-2.3 16.6-9.6 34.2-17.3 52.2-23.7.9-37.6-7.7-72.3-33-101-.4-.5-.4-.5-2.5-2.9-16-18.3-36.9-31.3-58.5-42.1-2.8-7-3.2-14.7-4.3-22.1-8.5-57.7-24.3-128.4-66.7-170.9-24-16.8-47 10.3-63 27m260 28c-.7.1-.7.1-4.1.6-42.1 6.6-82.1 19-120.9 36.4-1.7.7-3.3 1.3-5 2 1.3 7.9 3.1 15.4 5.2 23.1 5.1 19.8 9.3 40.5 11.1 60.8.7 3.1.7 3.1 4.4 6q4.2 2.55 8.4 4.8c13.9 7.7 26.3 17.4 37.9 28.3 1.4 1.3 2.8 2.7 4.3 4 30.1 32.1 41.2 70 43.7 113 .6-.1.6-.1 3.9-.9 1.7-.3 3.4-.7 5.1-1.1s3.4-.7 5.1-1.1c4.9-.9 4.9-.9 11.9-.9 1 1 1 1 1 7-2.5.8-4.9 1.6-7.4 2.3-.7.3-.7.3-4.4 1.4-3.3 1-6.7 1.9-10.1 2.8-1.4.5-2.7 1-4.1 1.5-2.4 5.9-3 11.2-3.8 17.5-1.5 11-3.9 21.6-7.1 32.4-1.1 4.1-1.1 4.1-1.1 7.1 1.9-.2 3.8-.3 5.8-.5 7.8-.5 15.6-.6 23.5-.7h3.7c3 0 6 .1 9 .2 2 2 2 2 2 8-4.2 1.1-8.1 1.4-12.5 1.7-.8.1-.8.1-5 .4-1.8.1-3.5.3-5.3.4-3.5.3-6.9.5-10.4.8-1.5.1-3 .2-4.6.3-.7.1-.7.1-4.2.4l-3.9.3c-1 .2-2.1.5-3.1.7-2.7 4.6-2.7 4.6-5.2 10.7-6.9 16.3-15.2 31.9-26.8 45.3-1.4 1.8-2.9 3.6-4.3 5.4-4.3 5.2-8.8 10.1-13.4 15-2.3 2.6-2.3 2.6-4.3 6.6l4.8.9c18.1 3.3 33.7 7.4 48.2 19.1 1.3 1.1 2.7 2.2 4.1 3.3 9.7 9.3 18.8 22 23.3 34.8 2.6 3.9 2.6 3.9 7.6 5.8 2.1.3 4.2.7 6.3 1.1 1.2.2 2.3.5 3.5.7 3.7.7 7.4 1.3 11.1 2 2.6.5 5.1.9 7.7 1.4 56.6 10.4 112.8 16.2 168.4-3.1 1.3-.4 2.6-.9 3.9-1.4 9.8-3.5 18.9-7.8 28.1-12.6 1.2-.6 2.5-1.3 3.8-1.9 7.9-4.1 15-8.7 22.1-14.1 3.1-2 3.1-2 9.1-3 1.6 1 3.3 2 5 3 1 5 1 5-1 10-10 8.4-21.5 15-33 21-.8.4-.8.4-4.7 2.5-69.1 34.4-142.8 26.8-216.1 12.8-60.1-11.5-124.4-17.5-178.2 17.7-17.7 12.9-30.7 28.6-36 50-1 19.2 1.5 33.2 14.4 48.1 6.3 6.1 13.7 10 21.6 13.9 1.1.6 2.1 1.1 3.2 1.7 37.3 17.3 82.9 19.9 123.5 23l8.1.6c43.6 3.7 88.6 3.3 132.2-.3 1.5-.1 3.1-.2 4.7-.4 77.3-6.4 160.5-23.9 220.3-76.6 1.3-1.1 2.7-2.3 4.1-3.5 8.8-7.9 16.5-16.2 23.9-25.5 1.2-1.5 2.5-3 3.8-4.5 38.6-50.2 58.7-113.5 60.2-176.5 0-1.2.1-2.4.1-3.6 1.5-85.2-32.1-171.8-81.1-240.4-.9-1.2-1.8-2.5-2.7-3.7-6.8-9.4-13.9-18.4-21.3-27.3l-2.7-3.3c-29.2-35.3-65.4-63.2-106.3-83.7-1.4-.7-2.7-1.3-4.1-2-62.1-30-137-38.6-204.9-28m-153 461c-2.2.4-4.3.7-6.5 1.1-44.6 8-95.3 24-123.5 61.9-8.9 13.2-12.6 26.7-10 42.3 3.7 10.8 10 18.8 20.1 24.4 13.5 6.5 26.1 8.5 41 8.4h6.9c6-.1 6-.1 11-1.1.4-2.2.8-4.5 1.2-6.8 3.3-16.3 10-29.6 20.8-42.2.9-1.2 1.8-2.3 2.8-3.5 27.5-29.7 71.9-44.2 111.3-46.4 18.4-.6 36.5.3 54.9 1.9-1.8-7.3-5.4-12-10-18-1-1.2-1.9-2.5-2.9-3.7-16.1-16.8-39.1-21.1-61.5-21.6h-15.4c-13.6.1-26.7 1-40.2 3.3m-333 74c-5.2 6.2-10 12.5-13 20 1.8 5.5 7.5 8.5 12 12 1.7 1.3 3.4 2.7 5.1 4 34.1 24.2 78.4 29.7 119.2 25.3 4.7-.9 9.1-1.9 13.7-3.3 1.4-.4 2.8-.8 4.3-1.3 13.6-4.6 24.3-11 31.7-23.7 4.3-13 3-25.8-3-38-13-19.7-31.6-31.8-54.6-36.9-43.4-7-85.3 10.7-115.4 41.9"/><path d="M566 395c4 4 4 4 4 11-3.6 7.8-8.7 14.3-15 20-.8.8-1.6 1.6-2.4 2.5-15.5 14.7-34.8 21.8-55.9 22.7-5.8-.2-11.1-.9-16.7-2.2-4-5-4-5-3.9-8.6.9-3.4.9-3.4 3.9-6.4 4.3-.3 8.4-.4 12.7-.4 19.9-.4 35.6-5.6 50.3-19.4 4.3-4.5 8-9.4 11.7-14.3 3.8-4.9 4.9-4.9 11.3-4.9m-220 85c6 2 6 2 9 6 0 8.9-4.4 12.9-10.3 19.4-15.9 15.4-37.7 23.8-59.7 23.6-11.2-.8-22-1.8-31-9-.6-4-.6-4 0-8l4-4c5.8 0 8.7.4 14 2 18.7 3 37.2-.5 53-11 7.3-5.4 13.1-11.2 19-18 .7-.3 1.3-.7 2-1m98 5.688c1.2 0 2.4-.1 3.6-.1 3.4.4 3.4.4 8.4 4.4 2.7 5.5.8 11.5-.8 17.1-2.2 5.9-2.2 5.9-4.5 10.2-2.6 5.8-1.3 9.1.7 14.8 3.5 5.2 6.8 6.7 12.6 8.9 6.5.9 10.4-.7 16-4 4.6-4.6 5.8-9.3 6.4-15.7.6-4.3.6-4.3 4.6-8.3h7c4 4 4 4 4.5 7.4-.1 12.4-3 20.2-11.5 29.6-9.8 6.6-18.2 9.1-30 8-6.4-2-6.4-2-11-4-.7 2-1.3 4-2 6-3.9 7.2-9.9 12.6-17.2 15.9-11.1 3.2-20.2 3-30.8-1.9-4-3.1-7.2-5.8-10-10-.4-3.9-.4-3.9 0-8l4-4c7 0 7 0 10.6 3.4 1.1 1.2 2.3 2.4 3.4 3.6 5.3 2.1 8.4 2.4 14 2l6-3c1-.3 2-.6 3-1 .7-1.6 1.3-3.3 2-5 .7-1.6 1.3-3.3 2-5 .5-6.9.2-12.7-3-19-3.6-2-7.3-3.3-11.2-4.6-6.7-2.4-11.6-5.7-15.8-11.4-.4-3.9-.4-3.9 0-8 9.3-11.6 24.2-18 39-18.3"/></svg>
+    <span>Ready for a prompt</span>
+  </div></main></div>
+  <footer>
+    <div id="stats"></div>
+    <div id="attachments" aria-label="Attached images" hidden></div>
+    <section id="settings" aria-label="Generation settings" hidden>
+      <label>Reasoning
+        <select id="reasoning-effort">
+          <option value="">Off</option>
+          <option value="minimal">Minimal</option>
+          <option value="low" selected>Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="xhigh">Max</option>
+        </select>
+      </label>
+      <label>Temperature
+        <input id="temperature" type="number" min="0" max="2" step="0.1" value="1">
+      </label>
+      <label>Top P
+        <input id="top-p" type="number" min="0.01" max="1" step="0.01" value="1">
+      </label>
+      <label>Max output
+        <input id="max-output-tokens" type="number" min="1" max="32768" step="1" value="16384">
+      </label>
+    </section>
+    <form id="form">
+      <input id="image-input" type="file" accept="image/avif,image/bmp,image/gif,image/jpeg,image/png,image/tiff,image/webp" multiple hidden>
+      <button id="attach" type="button" title="Add images" aria-label="Add images">＋</button>
+      <textarea id="prompt" rows="1" autofocus placeholder="Message the model…"></textarea>
+      <button id="settings-toggle" type="button" title="Generation settings" aria-label="Generation settings" aria-controls="settings" aria-expanded="false">⚙</button>
+      <button id="send" type="submit" title="Send" aria-label="Send">↑</button>
+    </form>
+  </footer>
+<script>
+const chat=document.querySelector('#chat'),emptyState=document.querySelector('#empty-state'),form=document.querySelector('#form'),footerEl=document.querySelector('footer');
+const prompt=document.querySelector('#prompt'),send=document.querySelector('#send');
+const stats=document.querySelector('#stats'),modelEl=document.querySelector('#model');
+const settings=document.querySelector('#settings'),settingsToggle=document.querySelector('#settings-toggle');
+const reasoningEffort=document.querySelector('#reasoning-effort'),temperature=document.querySelector('#temperature');
+const topP=document.querySelector('#top-p'),maxOutputTokens=document.querySelector('#max-output-tokens');
+const attach=document.querySelector('#attach'),imageInput=document.querySelector('#image-input'),attachments=document.querySelector('#attachments');
+const supportedImageTypes=new Set(['image/avif','image/bmp','image/gif','image/jpeg','image/png','image/tiff','image/webp']);
+const maxImages=4,maxImageBytes=8*1024*1024;let history=[],pendingImages=[];
+const replicaCount=Math.max(1,Number(document.querySelector('meta[name="resin-dp-size"]').content)||1);
+const conversationRank=crypto.getRandomValues(new Uint32Array(1))[0]%replicaCount;
+fetch('/v1/models').then(r=>r.json()).then(x=>modelEl.textContent=x.data?.[0]?.id||'');
+function chatViewportBottom(){return window.innerHeight-footerEl.offsetHeight}
+function atChatBottom(){return chat.getBoundingClientRect().bottom-chatViewportBottom()<48}
+function scrollChat(follow=true){requestAnimationFrame(()=>{if(follow)window.scrollTo({top:window.scrollY+chat.getBoundingClientRect().bottom-chatViewportBottom()})})}
+function updateScrollFades(){const max=document.documentElement.scrollHeight-window.innerHeight;document.body.classList.toggle('can-scroll-up',window.scrollY>1);document.body.classList.toggle('can-scroll-down',max>1&&window.scrollY<max-1)}
+function turn(role,text=''){const follow=atChatBottom(),e=document.createElement('div');emptyState?.remove();e.className='turn '+role;if(role==='assistant')e.classList.add('markdown');else e.textContent=text;chat.append(e);scrollChat(follow);return e}
+function userTurn(text,images){const e=turn('user');e.textContent='';if(images.length){const media=document.createElement('div');media.className='user-media';for(const image of images){const preview=document.createElement('img');preview.src=image.url;preview.alt=image.name;media.append(preview)}e.append(media)}const content=document.createElement('div');content.className='user-text';content.textContent=text;e.append(content);return e}
+function renderAttachments(){attachments.replaceChildren();attachments.hidden=!pendingImages.length;pendingImages.forEach((image,index)=>{const item=document.createElement('div'),preview=document.createElement('img'),remove=document.createElement('button');item.className='attachment';preview.src=image.url;preview.alt=image.name;remove.type='button';remove.textContent='×';remove.title=`Remove ${image.name}`;remove.setAttribute('aria-label',remove.title);remove.addEventListener('click',()=>{pendingImages.splice(index,1);renderAttachments()});item.append(preview,remove);attachments.append(item)})}
+function readDataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error||new Error(`Could not read ${file.name}`));reader.readAsDataURL(file)})}
+function escapeHtml(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;')}
+function inlineMarkdown(source){
+  const held=[]; let value=escapeHtml(source);
+  const hold=match=>{const token=`MDHOLD${held.length}TOKEN`;held.push(match);return token};
+  value=value.replace(/`([^`\n]+)`/g,hold);
+  value=value.replace(/\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$(?!\s)[^$\n]+?\$/g,hold);
+  value=value.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,(_,label,url)=>/^(https?:\/\/|mailto:|\/|#)/i.test(url)?`<a href="${url}" target="_blank" rel="noreferrer">${label}</a>`:`${label} (${url})`);
+  value=value.replace(/\*\*([^*]+)\*\*|__([^_]+)__/g,(_,a,b)=>`<strong>${a||b}</strong>`);
+  value=value.replace(/~~([^~]+)~~/g,'<del>$1</del>');
+  value=value.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,!?:;])/g,'$1<em>$2</em>');
+  value=value.replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,!?:;])/g,'$1<em>$2</em>');
+  return held.reduce((text,item,index)=>text.replace(`MDHOLD${index}TOKEN`,item.startsWith('`')?`<code>${item.slice(1,-1)}</code>`:item),value);
+}
+function tableCells(line){
+  let value=line.trim();if(!value.includes('|'))return null;
+  if(value.startsWith('|'))value=value.slice(1);if(value.endsWith('|')&&!value.endsWith('\\|'))value=value.slice(0,-1);
+  const cells=[];let cell='',code=false;
+  for(let i=0;i<value.length;i++){const char=value[i];if(char==='\\'&&value[i+1]==='|'){cell+='|';i++;continue}if(char==='`')code=!code;if(char==='|'&&!code){cells.push(cell.trim());cell=''}else cell+=char}
+  cells.push(cell.trim());return cells;
+}
+function tableAlignment(cell){const marker=cell.replace(/\s/g,'');return marker.startsWith(':')&&marker.endsWith(':')?'align-center':marker.endsWith(':')?'align-right':''}
+function renderMarkdown(source){
+  const lines=source.replace(/\r/g,'').split('\n'),out=[]; let i=0;
+  while(i<lines.length){
+    const line=lines[i],trim=line.trim();
+    if(!trim){i++;continue}
+    if(trim.startsWith('```')){const language=trim.slice(3).trim().replace(/[^\w-]/g,'');const code=[];i++;while(i<lines.length&&!lines[i].trim().startsWith('```'))code.push(lines[i++]);if(i<lines.length)i++;out.push(`<pre><code${language?` class="language-${language}"`:''}>${escapeHtml(code.join('\n'))}</code></pre>`);continue}
+    if(trim==='$$'){const math=[];i++;while(i<lines.length&&lines[i].trim()!=='$$')math.push(lines[i++]);if(i<lines.length)i++;out.push(`<div>$$${escapeHtml(math.join('\n'))}$$</div>`);continue}
+    const header=tableCells(line),divider=i+1<lines.length?tableCells(lines[i+1]):null;
+    if(header&&header.length>1&&divider&&divider.length===header.length&&divider.every(cell=>/^:?-{3,}:?$/.test(cell.replace(/\s/g,'')))){const align=divider.map(tableAlignment),rows=[];i+=2;while(i<lines.length&&lines[i].trim()){const cells=tableCells(lines[i]);if(!cells||cells.length<2)break;rows.push(cells);i++}const rowHtml=cells=>header.map((_,column)=>`<td${align[column]?` class="${align[column]}"`:''}>${inlineMarkdown(cells[column]||'')}</td>`).join('');out.push(`<div class="table-wrap"><table><thead><tr>${header.map((cell,column)=>`<th${align[column]?` class="${align[column]}"`:''}>${inlineMarkdown(cell)}</th>`).join('')}</tr></thead><tbody>${rows.map(cells=>`<tr>${rowHtml(cells)}</tr>`).join('')}</tbody></table></div>`);continue}
+    const heading=line.match(/^\s*(#{1,3})\s+(.+)$/);if(heading){const level=heading[1].length;out.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`);i++;continue}
+    if(/^\s*((\*|-|_)\s*){3,}$/.test(line)){out.push('<hr>');i++;continue}
+    const list=line.match(/^\s*([-*+]|\d+\.)\s+(.+)$/);if(list){const ordered=/\d/.test(list[1]),tag=ordered?'ol':'ul',items=[];while(i<lines.length){const item=lines[i].match(/^\s*([-*+]|\d+\.)\s+(.+)$/);if(!item||(/\d/.test(item[1]))!==ordered)break;items.push(`<li>${inlineMarkdown(item[2])}</li>`);i++}out.push(`<${tag}>${items.join('')}</${tag}>`);continue}
+    if(/^\s*>/.test(line)){const quoted=[];while(i<lines.length&&/^\s*>/.test(lines[i]))quoted.push(lines[i++].replace(/^\s*>\s?/,''));out.push(`<blockquote>${inlineMarkdown(quoted.join(' '))}</blockquote>`);continue}
+    const paragraph=[trim];i++;while(i<lines.length&&lines[i].trim()&&!/^\s*(#{1,3})\s|^\s*```|^\s*([-*+]|\d+\.)\s+|^\s*>|^\s*\$\$$/.test(lines[i]))paragraph.push(lines[i++].trim());out.push(`<p>${inlineMarkdown(paragraph.join(' '))}</p>`);
+  }
+  return out.join('');
+}
+function renderRich(element,text){const follow=atChatBottom();element.innerHTML=renderMarkdown(text);if(window.renderMathInElement)renderMathInElement(element,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false},{left:'$',right:'$',display:false}],throwOnError:false});scrollChat(follow)}
+function parseSse(buffer,onData){let cut;while((cut=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,cut);buffer=buffer.slice(cut+2);for(const line of block.split('\n'))if(line.startsWith('data: '))onData(line.slice(6))}return buffer}
+function resizePrompt(){prompt.style.height='auto';prompt.style.height=Math.min(prompt.scrollHeight,160)+'px'}
+prompt.addEventListener('input',resizePrompt);
+window.addEventListener('scroll',updateScrollFades,{passive:true});
+window.addEventListener('resize',updateScrollFades);
+new ResizeObserver(updateScrollFades).observe(document.body);
+updateScrollFades();
+settingsToggle.addEventListener('click',()=>{settings.hidden=!settings.hidden;settingsToggle.setAttribute('aria-expanded',String(!settings.hidden))});
+attach.addEventListener('click',()=>imageInput.click());
+imageInput.addEventListener('change',async()=>{const files=[...imageInput.files];imageInput.value='';let error='';for(const file of files){if(pendingImages.length>=maxImages){error=`Attach at most ${maxImages} images`;break}if(!supportedImageTypes.has(file.type)){error=`Unsupported image type: ${file.type||file.name}`;continue}if(file.size>maxImageBytes){error=`${file.name} is larger than 8 MiB`;continue}if(pendingImages.reduce((total,image)=>total+image.size,0)+file.size>maxImageBytes){error='Attached images total more than 8 MiB';break}try{pendingImages.push({name:file.name,size:file.size,url:await readDataUrl(file)})}catch(err){error=err.message}}renderAttachments();stats.textContent=error});
+form.addEventListener('submit',async e=>{
+  e.preventDefault();if(send.disabled)return;const text=prompt.value.trim(),images=pendingImages;if(!text&&!images.length)return;
+  pendingImages=[];renderAttachments();prompt.value='';resizePrompt();send.disabled=true;attach.disabled=true;stats.textContent='';userTurn(text,images);
+  const content=images.length?[...images.map(image=>({type:'image_url',image_url:{url:image.url}})),...(text?[{type:'text',text}]:[])]:text;
+  const historyLength=history.length;history.push({role:'user',content});
+  const box=turn('assistant'),thinking=document.createElement('details'),summary=document.createElement('summary'),reasonBox=document.createElement('div');
+  reasonBox.className='markdown';thinking.className='pending';thinking.open=true;thinking.append(summary,reasonBox);box.before(thinking);
+  const requestStartedAt=performance.now();
+  const updatePending=()=>{if(thinking.isConnected&&thinking.classList.contains('pending'))summary.textContent=`Waiting for first token… ${((performance.now()-requestStartedAt)/1000).toFixed(1)}s`};
+  updatePending();const statusTimer=setInterval(updatePending,250);
+  let answer='',reason='',generationStartedAt=null,finishReason=null;
+  try {
+    const request={model:modelEl.textContent,messages:history,temperature:Number(temperature.value),top_p:Number(topP.value),max_completion_tokens:Number(maxOutputTokens.value),stream:true,stream_options:{include_usage:true}};
+    request.routed_dp_rank=conversationRank;
+    if(reasoningEffort.value)request.reasoning_effort=reasoningEffort.value;
+    const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});
+    if(!response.ok)throw new Error((await response.json()).error?.message||response.statusText);
+    const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',completed=false;
+    while(!completed){const {value,done}=await reader.read();buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});buffer=parseSse(buffer,data=>{
+      if(data==='[DONE]'){completed=true;return}const event=JSON.parse(data);if(event.error)throw new Error(event.error.message||'The inference request failed');const delta=event.choices?.[0]?.delta||{};
+      finishReason=event.choices?.[0]?.finish_reason||finishReason;
+      if(delta.reasoning_content||delta.content)generationStartedAt??=performance.now();
+      if(delta.reasoning_content){reason+=delta.reasoning_content;summary.textContent='Reasoning';thinking.classList.remove('pending');renderRich(reasonBox,reason);thinking.open=true}
+      if(delta.content){if(!reason)thinking.remove();answer+=delta.content;renderRich(box,answer)}
+      if(event.resin){const r=event.resin,now=performance.now();if(!reason&&!answer)thinking.remove();const generationMs=r.generation_elapsed_ms>0?r.generation_elapsed_ms:(generationStartedAt===null?r.elapsed_ms:now-generationStartedAt);const observedTtftMs=generationStartedAt===null?r.time_to_first_token_ms:generationStartedAt-requestStartedAt;const rate=generationMs>0?r.completion_tokens*1000/generationMs:0;const stopNote=finishReason==='length'?' · max output reached':'';stats.textContent=`${r.prompt_tokens} prompt + ${r.completion_tokens} generated tokens · ${rate.toFixed(1)} tok/s · ${(generationMs/1000).toFixed(2)} s generation · ${(observedTtftMs/1000).toFixed(2)} s TTFT${stopNote}`}
+    });if(done)break}
+    if(!completed)throw new Error('The inference stream ended before completion');
+    history.push({role:'assistant',content:answer,...(reason?{reasoning_content:reason}:{})});
+  } catch(err) {history.length=historyLength;if(!reason)thinking.remove();box.textContent='Error: '+err.message}
+  finally {clearInterval(statusTimer);if(thinking.classList.contains('pending'))thinking.remove();send.disabled=false;attach.disabled=false;prompt.focus()}
+});
+prompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
+</script>
+</body>
+</html>

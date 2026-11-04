@@ -1,0 +1,180 @@
+Resin
+
+The LFM2 PyTorch model implementation in
+models/torch/resin_models_torch/lfm2/model.py contains portions adapted from Hugging Face
+Transformers:
+
+  Copyright 2025 The HuggingFace Team
+  https://github.com/huggingface/transformers
+
+Hugging Face Transformers is licensed under the Apache License, Version 2.0.
+
+The GPT-OSS PyTorch model implementation in
+models/cuda/resin_models_cuda/gpt_oss/model.py contains portions adapted from OpenAI gpt-oss and
+Hugging Face Transformers:
+
+  Copyright 2025 OpenAI
+  https://github.com/openai/gpt-oss
+
+  Copyright 2025 The HuggingFace Team
+  https://github.com/huggingface/transformers
+
+OpenAI gpt-oss and Hugging Face Transformers are licensed under the Apache
+License, Version 2.0.
+
+The retained model primitives and expert kernels in
+models/cuda/resin_models_cuda/deepseek_v41 contain portions adapted from DeepSeek-V4:
+
+  Copyright (c) 2023 DeepSeek
+  https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
+
+DeepSeek-V4 is licensed under the MIT License.
+
+The DeepSeek-V4.1 architecture, quantization kernels, and Engram implementation in
+models/cuda/resin_models_cuda/deepseek_v41 contain portions adapted from:
+
+  Copyright (c) 2023 DeepSeek
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  revision 1bae0e1088993b9b82de08f59de5be5a34e42170
+
+The MIT notice is retained in that model directory's LICENSE.
+
+The prepared DeepSeek-V4.1 forward pass in
+models/cuda/resin_models_cuda/deepseek_v41 (attention, linear, HC, compressor,
+indexer, Engram prefetch, shared batch metadata and the upstream CUDA operators)
+contains portions adapted from DeepInfer:
+
+  https://github.com/deepseek-ai/DeepInfer
+  revision 774ce244b87cc0eb8d4b94ab9f5de2ab22049f01
+
+DeepInfer is licensed under the Apache License, Version 2.0. Its license is
+retained in deepseek_v41/upstream/LICENSE. Copied operators identify their
+source files and revision; adaptations bind them to Resin's paged storage.
+The native batch metadata, paged index expansion and selected-index conversion
+kernels adapt prepare_decode_metadata.py, get_kv_index.py and flash_mla_utils.py
+from deepinfer/model_executor/layers/tilelang_ops/cuda at that revision.
+The DeepSelect dependency is pinned to the matching DeepInfer submodule
+revision bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18.
+
+Model weights are not distributed with Resin. Users who download Liquid AI or
+OpenAI or DeepSeek checkpoints are responsible for the checkpoints' separate license terms.
+
+The native conversation formats in crates/resin-recipe follow the checkpoint
+chat templates for thinkingmachines/Inkling-Small-NVFP4, Qwen/Qwen3.5,
+RadixArk/Qwen3.8-27B-NVFP4, nvidia/Gemma-4-31B-IT-NVFP4, and
+LiquidAI/LFM2.5-230M. Source revisions and retained reference licenses are
+recorded in tests/recipe_fuzz/references/README.md and templates/README.md.
+The LFM2.5 template is provided under the Liquid AI LFM Open License.
+
+The GPT-OSS tool-schema formatting in crates/resin-recipe/src/gpt_oss/schema.rs
+is adapted from OpenAI Harmony (Copyright 2025 OpenAI), Apache License 2.0.
+https://github.com/openai/harmony
+
+The DeepSeek conversation format and tools prompt in crates/resin-recipe
+retain portions adapted from encoding/encoding_dsv4.py in DeepSeek-V4-Flash-0731 and
+DeepSeek-V4-Pro-0813, Copyright (c) 2023 DeepSeek, MIT License.
+The supported V4.1 format follows encoding/encoding.py in
+DeepSeek-V4.1-Flash-1017, revision 1bae0e1088993b9b82de08f59de5be5a34e42170,
+under the same copyright and MIT License.
+The image preprocessing in crates/resin-recipe/src/media/deepseek.rs follows
+inference/image_processor.py from that same V4.1 checkpoint revision.
+The vision tower in models/cuda/resin_models_cuda/deepseek_v41/vision.py
+follows its inference/vision.py, under the same copyright and MIT License.
+The MIT notice is retained at crates/resin-recipe/licenses/deepseek-MIT.txt.
+
+The image/video geometry, normalization, patch layouts and rotary positions in
+crates/resin-recipe/src/media/{gemma,inkling,qwen}.rs follow Hugging Face
+Transformers' model processors (Copyright The HuggingFace Team), Apache License 2.0.
+https://github.com/huggingface/transformers
+The Rust implementations use the image crate's resize filters.
+
+The shared-expert scale layout in resin/backend/cuda/mega_moe.py and the
+validation reference code in tests/test_mega_moe.py and
+models/cuda/tests/test_deepseek_v41_kernels_gpu.py are adapted
+from DeepGEMM at revision 1fc9c66975ee322d628b3288534ca0e9ce12a64d:
+https://github.com/deepseek-ai/DeepGEMM
+
+MIT License
+
+Copyright (c) 2025 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The native GLM-5.3-Flash conversation format and tools instructions in
+crates/resin-recipe/src/glm follow chat_template.jinja from
+nvidia/GLM-5.3-Flash-NVFP4, revision
+da920bb0b9f4a06727223a349e55468e38352348, based on zai-org/GLM-5.3-Flash.
+Copyright (c) 2026 Z.AI Co., Ltd, MIT License.
+The notice is retained at crates/resin-recipe/licenses/glm-MIT.txt.
+
+GLM image preprocessing in crates/resin-recipe/src/media/glm.rs and the vision
+tower in models/cuda/resin_models_cuda/glm5_3_flash/vision.py are adapted from
+Hugging Face Transformers, revision 50e35cc0ca18ec19b80653690de553e6decf74f5,
+src/transformers/models/glm5_next/{image_processing_glm5_next,modeling_glm5_next}.py.
+Copyright 2026 the HuggingFace Team, Apache License 2.0.
+https://github.com/huggingface/transformers/tree/50e35cc0ca18ec19b80653690de553e6decf74f5
+The native implementation uses its own float bicubic antialias filter with the
+upstream half-pixel convention and GLM canvas padding. Offline processor and
+small vision-tower reference fixtures were generated from this same revision.
+
+The fused mHC readout and RMS normalization kernel in
+models/cuda/resin_models_cuda/glm5_3_flash/mhc_cuda.py is adapted from SGLang,
+revision baa9befa381511cd4d56f83980951e5a45fffc6d,
+python/sglang/kernels/ops/layernorm/mhc.py.
+https://github.com/sgl-project/sglang/blob/baa9befa381511cd4d56f83980951e5a45fffc6d/python/sglang/kernels/ops/layernorm/mhc.py
+SGLang is licensed under the Apache License, Version 2.0. The adaptation keeps
+token count dynamic, uses a fixed reduction split, and disables PDL scheduling.
+
+The accepted-prefix KDA state kernel in
+models/cuda/resin_models_cuda/glm5_3_flash/kda_state_cuda.py is adapted from
+flash-linear-attention 0.5.2, fla/ops/kda/fused_recurrent.py.
+https://github.com/fla-org/flash-linear-attention/blob/v0.5.2/fla/ops/kda/fused_recurrent.py
+The MIT license and copyright notice are retained at
+models/cuda/resin_models_cuda/glm5_3_flash/LICENSE.fla. The adaptation computes
+only accepted recurrent state, with Resin's FP32 beta sigmoid and explicit
+preservation of empty rows; it does not produce attention outputs.
+
+Wright
+
+Wright is a modified version of Resin. It starts from Resin commit
+2638d8509b6661913a17642ef44e3f30e35f47e9, https://github.com/ekzhang/resin. MODIFICATIONS.md lists the
+Resin files that Wright changed. The Apache License 2.0 in LICENSE applies to Wright, except for the
+kernels below.
+
+The TPC-C kernels in models/gaudi/resin_models_gaudi/kernels/ are licensed under the PolyForm Noncommercial
+License 1.0.0, in models/gaudi/resin_models_gaudi/kernels/LICENSE. They are not licensed under the Apache
+License 2.0. The rest of the engine needs these kernels to run.
+
+Required Notice: Copyright Aaron Botsis
+
+The GGUF block formats in models/gaudi/resin_models_gaudi/gguf/ and
+models/gaudi/resin_models_gaudi/synapse/native/pack.c follow the format of ggml-quants.c in llama.cpp:
+
+  Copyright The ggml authors
+  https://github.com/ggml-org/llama.cpp
+
+llama.cpp is licensed under the MIT License.
+
+The DSpark drafter reference in models/gaudi/tools/ml4_dspark_ref.py, and the drafter in
+models/gaudi/resin_models_gaudi/mistral_large4/dspark.py, follow llama.cpp and SGLang:
+
+  https://github.com/ggml-org/llama.cpp
+  https://github.com/sgl-project/sglang
+
+SGLang is licensed under the Apache License, Version 2.0.

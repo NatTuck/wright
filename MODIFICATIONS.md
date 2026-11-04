@@ -1,0 +1,140 @@
+# Modifications
+
+Wright is a modified version of [Resin](https://github.com/ekzhang/resin), from commit
+`2638d8509b6661913a17642ef44e3f30e35f47e9`. Resin is licensed under the Apache License 2.0. This file is the notice that section 4(b)
+of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) and the
+[README](README.md#license) describe.
+
+## Upstream files that Wright changed
+
+- `.github/workflows/python-checks.yml`
+- `Cargo.toml`
+- `NOTICE`
+- `README.md`
+- `crates/resin-core/Cargo.toml`
+- `crates/resin-core/src/metrics.rs`
+- `crates/resin-http/Cargo.toml`
+- `crates/resin-http/src/anthropic.rs`
+- `crates/resin-http/src/lib.rs`
+- `crates/resin-http/src/metrics_encoder.rs`
+- `crates/resin-http/src/openai.rs`
+- `crates/resin-http/src/protocol.rs`
+- `crates/resin-http/tests/protocols.rs`
+- `crates/resin-py/Cargo.toml`
+- `crates/resin-py/src/http.rs`
+- `crates/resin-py/src/http_session.rs`
+- `crates/resin-py/src/metrics.rs`
+- `crates/resin-py/src/recipe.rs`
+- `crates/resin-recipe/Cargo.toml`
+- `crates/resin-recipe/README.md`
+- `crates/resin-recipe/src/lib.rs`
+- `deploy/README.md`
+- `deploy/checkpoint_cache.py`
+- `deploy/models.py`
+- `docs/architecture.md`
+- `docs/cache-pool.md`
+- `docs/distributed.md`
+- `docs/kernel-boundary.md`
+- `docs/kernel-cache.md`
+- `docs/logprobs.md`
+- `docs/metrics.md`
+- `docs/numa.md`
+- `docs/scheduler.md`
+- `docs/scripts.md`
+- `pyproject.toml`
+- `resin/_resin.pyi`
+- `resin/backend/__init__.py`
+- `resin/backend/metrics.py`
+- `resin/bench.py`
+- `resin/kernel_cache.py`
+- `resin/models/qwen3_5/config.py`
+- `resin/numa.py`
+- `resin/process.py`
+- `resin/server/__init__.py`
+- `scripts/bench.py`
+- `scripts/cloc.py`
+- `scripts/rust_build_and_types.py`
+- `tests/test_backend_plans.py`
+- `tests/test_bench.py`
+- `tests/test_bench_cli.py`
+- `tests/test_bench_preflight.py`
+- `tests/test_checkpoint_cache.py`
+- `tests/test_deploy_models.py`
+- `tests/test_distributed_http.py`
+- `tests/test_http_lifecycle.py`
+- `tests/test_kernel_cache.py`
+- `tests/test_lazy_imports.py`
+- `tests/test_numa.py`
+- `tests/test_parallelism.py`
+- `tests/test_sampling.py`
+- `tests/test_scheduler.py`
+- `uv.lock`
+
+## Upstream files that Wright removed
+
+A path that ends in `/` is a directory that Wright removed completely. These files held Resin's CUDA
+backend, its CUDA models, its Modal deployment, and their tests and documents.
+
+- `conftest.py`
+- `deploy/jit_cache.py`
+- `deploy/modal_bench.py`
+- `deploy/modal_image.py`
+- `deploy/modal_serve.py`
+- `docs/benchmarks.md`
+- `docs/cuda-graphs.md`
+- `docs/model-forward-pass.md`
+- `models/cuda/`
+- `resin/backend/cuda/`
+- `resin/backend/embedding.py`
+- `resin/backend/expert_parallel.py`
+- `resin/backend/paged_attention.py`
+- `resin/backend/quantization.py`
+- `resin/backend/torch.py`
+- `resin/backend/transformer.py`
+- `resin/models/deepseek_v41/`
+- `resin/models/gemma4/`
+- `resin/models/glm5_3_flash/README.md`
+- `resin/models/gpt_oss/`
+- `resin/models/inkling/`
+- `scripts/sync_type_libraries.py`
+- `skills/`
+- `tests/test_bench_trace.py`
+- `tests/test_composable_expert_parallel.py`
+- `tests/test_context_parallel.py`
+- `tests/test_context_parallel_gpu.py`
+- `tests/test_cuda_completion.py`
+- `tests/test_cuda_failures.py`
+- `tests/test_cuda_graph_pool_gpu.py`
+- `tests/test_cuda_graphs.py`
+- `tests/test_cuda_metrics.py`
+- `tests/test_cuda_plan_validation.py`
+- `tests/test_cuda_prefill_graphs.py`
+- `tests/test_cuda_slab.py`
+- `tests/test_cuda_staging.py`
+- `tests/test_cuda_tensor_graphs.py`
+- `tests/test_deepseek_attention_graphs.py`
+- `tests/test_deepseek_auxiliary_graphs.py`
+- `tests/test_deepseek_engram_graphs.py`
+- `tests/test_deepseek_hc_warmup.py`
+- `tests/test_deepseek_v41_codec.py`
+- `tests/test_deepseek_v41_media.py`
+- `tests/test_distributed_cuda_graphs.py`
+- `tests/test_expert_parallel.py`
+- `tests/test_expert_parallel_gpu.py`
+- `tests/test_expert_parallel_preparation_gpu.py`
+- `tests/test_glm53_expert_sharding.py`
+- `tests/test_glm53_model.py`
+- `tests/test_jit_cache.py`
+- `tests/test_mega_moe.py`
+- `tests/test_modal_serve.py`
+- `tests/test_quantization.py`
+- `tests/test_runner_metrics.py`
+- `tests/test_sampling_blocks_cuda.py`
+- `tests/test_sampling_cuda.py`
+- `tests/test_sampling_filters_cuda.py`
+- `tests/test_sampling_fused_cuda.py`
+- `tests/test_sampling_guard_cuda.py`
+- `tests/test_sharded_embedding.py`
+- `tests/test_sparse_expert_transport.py`
+- `tests/test_type_libraries.py`
+- `tests/test_vision_cache.py`

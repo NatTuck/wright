@@ -1,0 +1,30 @@
+# Run Wright as a service. Copy this file to /etc/systemd/system/wright.service, set User, the
+# paths and the ExecStart arguments, then run: systemctl daemon-reload && systemctl enable --now wright
+[Unit]
+Description=Wright inference server for Intel Gaudi 2
+After=network.target
+
+[Service]
+Type=simple
+User=wright
+WorkingDirectory=/opt/wright
+Environment=HABANA_SCAL_BIN_PATH=/opt/habanalabs/engines_fw
+Environment=HABANA_LOGS=/var/log/wright
+LogsDirectory=wright
+# Use the virtual environment directly: uv run would receive SIGTERM in place of the server.
+ExecStart=/opt/wright/.venv/bin/wright \
+    -m /opt/wright/models/Qwen3.8-27B-FP8 \
+    --drain-timeout 30
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+# SIGTERM goes to the main process, which asks rank 0 to drain and stop the other ranks.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=10
+# Loading can take many minutes, and the server only listens once it finishes.
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
