@@ -10,6 +10,7 @@
 ![Model: GLM-5.3-Flash FP8](https://img.shields.io/badge/model-GLM--5.3--Flash%20FP8-6E40C9?style=for-the-badge)
 ![Model: Qwen3.5 0.8B to 9B FP8](https://img.shields.io/badge/model-Qwen3.5%200.8B%20to%209B%20FP8-6E40C9?style=for-the-badge)
 ![License: Apache 2.0 and PolyForm Noncommercial](https://img.shields.io/badge/license-Apache%202.0%20%2B%20PolyForm%20Noncommercial-555555?style=for-the-badge)
+[![Discord: Unofficial Gaudi](https://img.shields.io/badge/discord-Unofficial%20Gaudi-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/SXJcQM79j4)
 
 <table>
 <tr><th colspan="4">Qwen3.8-27B, one HL-225 card</th></tr>
@@ -807,6 +808,8 @@ uv run scripts/check_server.py http://127.0.0.1:8080 --output check.json
   [Mistral-Large-4](#mistral-large-4).
 
 ## Contributing
+
+For questions and discussion, join the [Unofficial Gaudi Discord](https://discord.gg/SXJcQM79j4).
 
 Pull requests are welcome, including changes that an LLM helped to write. The person who opens the
 pull request must be able to defend the change. If a reviewer asks, you must be able to explain:
