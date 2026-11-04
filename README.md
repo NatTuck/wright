@@ -793,8 +793,12 @@ uv run scripts/check_server.py http://127.0.0.1:8080 --output check.json
   [Server flags](#server-flags).
 - **More than one model on a card.** Load several models on one card, and let the scheduler divide
   the card's time between them.
-- **More weight formats.** EXL3 and MXFP4, and possibly dequantization kernels for NVIDIA's
-  formats.
+- **Qwen3.8-27B on more than one card.** Split the model across cards, as Mistral-Large-4 and
+  GLM-5.3-Flash do. Today it runs on one card.
+- **Qwen3.8-27B in BF16.** Load the BF16 checkpoint. Today Wright runs only the FP8 checkpoint.
+- **A common weight loader.** One loader for all models that reads each supported quantization
+  format. Today each model has its own loader.
+- **More weight formats.** EXL3 and MXFP4, and possibly dequantization kernels for NVIDIA's formats.
 - **Faster Qwen weight load.** Convert the FP8 bytes of the Qwen checkpoints to the Gaudi 2 range on
   the card, as GLM-5.3-Flash does, and not on the CPU.
 - **Less duplicate code between models.** The model packages repeat code, for example in the
