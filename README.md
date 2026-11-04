@@ -806,6 +806,17 @@ uv run scripts/check_server.py http://127.0.0.1:8080 --output check.json
 - **Mistral-Large-4 GPQA Diamond.** Measure the full set of 198 questions. Refer to
   [Mistral-Large-4](#mistral-large-4).
 
+## Contributing
+
+Pull requests are welcome, including changes that an LLM helped to write. The person who opens the
+pull request must be able to defend the change. If a reviewer asks, you must be able to explain:
+
+- How the change works.
+- Why the change is necessary.
+- Why you made the change this way, and which other options you considered.
+- How you tested that the change is correct. Say which tests and measurements you ran, and on which
+  hardware.
+
 ## Acknowledgements
 
 Wright uses [Resin](https://github.com/ekzhang/resin) by Eric Zhang and the Resin contributors.
