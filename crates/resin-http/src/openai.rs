@@ -14,12 +14,12 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    AppState,
+    AppState, ModelMetadata,
     protocol::{
         ConversationRequest, GenerationEvent, RequestFailure, ResponseAccumulator, json_error,
     },
@@ -133,16 +133,25 @@ pub async fn health(State(state): State<AppState>) -> Response {
     }
 }
 
+#[derive(Serialize)]
+struct ModelEntry<'a> {
+    id: &'a str,
+    object: &'static str,
+    created: u64,
+    owned_by: &'static str,
+    #[serde(flatten)]
+    metadata: &'a ModelMetadata,
+}
+
 pub async fn models(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "object": "list",
-        "data": [{
-            "id": state.model.as_ref(),
-            "object": "model",
-            "created": 0,
-            "owned_by": "resin"
-        }]
-    }))
+    let entry = ModelEntry {
+        id: &state.model,
+        object: "model",
+        created: 0,
+        owned_by: "resin",
+        metadata: &state.metadata,
+    };
+    Json(json!({"object": "list", "data": [entry]}))
 }
 
 pub async fn chat_completions(

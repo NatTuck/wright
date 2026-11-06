@@ -7,6 +7,7 @@ mod ui;
 
 use std::{
     future::{Future, IntoFuture},
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -20,6 +21,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 pub use metrics::{
@@ -52,10 +54,71 @@ impl Default for RouteConfig {
     }
 }
 
+/// What `GET /v1/models` tells about the served model in addition to its id. The response
+/// does not include a field that is `None`. `Some(false)` tells that the model does not
+/// support the capability.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelMetadata {
+    /// The maximum number of prompt and generated tokens in one request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<NonZeroU32>,
+    /// The maximum number of generated tokens in one request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<NonZeroU32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_function_calling: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_prompt_caching: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
+}
+
+/// The model that the server serves: the id that requests must name, and its metadata.
+#[derive(Clone, Debug)]
+pub struct ServedModel {
+    pub id: Arc<str>,
+    pub metadata: ModelMetadata,
+}
+
+impl ServedModel {
+    pub fn new(id: impl Into<Arc<str>>, metadata: ModelMetadata) -> Self {
+        Self {
+            id: id.into(),
+            metadata,
+        }
+    }
+}
+
+impl From<&str> for ServedModel {
+    fn from(id: &str) -> Self {
+        Self::new(id, ModelMetadata::default())
+    }
+}
+
+impl From<String> for ServedModel {
+    fn from(id: String) -> Self {
+        Self::new(id, ModelMetadata::default())
+    }
+}
+
+impl From<Arc<str>> for ServedModel {
+    fn from(id: Arc<str>) -> Self {
+        Self::new(id, ModelMetadata::default())
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     jobs: mpsc::Sender<GenerationJob>,
     model: Arc<str>,
+    metadata: Arc<ModelMetadata>,
     next_id: Arc<AtomicU64>,
     routed_dp_size: usize,
 }
@@ -90,14 +153,16 @@ impl AppState {
 }
 
 pub fn router(
-    model: impl Into<Arc<str>>,
+    model: impl Into<ServedModel>,
     jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Router {
+    let model = model.into();
     let state = AppState {
         jobs,
-        model: model.into(),
+        model: model.id,
+        metadata: Arc::new(model.metadata),
         next_id: Arc::new(AtomicU64::new(1)),
         routed_dp_size: routes.routed_dp_size,
     };
@@ -131,7 +196,7 @@ pub fn router(
 
 pub async fn serve(
     listener: tokio::net::TcpListener,
-    model: impl Into<Arc<str>>,
+    model: impl Into<ServedModel>,
     jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
     metrics: Option<MetricsEndpoint>,
@@ -147,7 +212,7 @@ pub async fn serve(
 /// a client has stopped reading its response.
 pub async fn serve_with_shutdown(
     listener: tokio::net::TcpListener,
-    model: impl Into<Arc<str>>,
+    model: impl Into<ServedModel>,
     jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
     metrics: Option<MetricsEndpoint>,
@@ -164,7 +229,7 @@ pub async fn serve_with_shutdown(
 /// long drain lets requests in flight finish.
 pub async fn serve_with_drain(
     listener: tokio::net::TcpListener,
-    model: impl Into<Arc<str>>,
+    model: impl Into<ServedModel>,
     jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
     metrics: Option<MetricsEndpoint>,

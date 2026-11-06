@@ -4,8 +4,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use resin_http::{
-    FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, RouteConfig, TokenLogprob,
-    router,
+    FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, ModelMetadata,
+    RouteConfig, ServedModel, TokenLogprob, router,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -697,6 +697,56 @@ async fn anthropic_messages_returns_thinking_and_text_blocks() {
     assert_eq!(body["content"][0]["type"], "thinking");
     assert_eq!(body["content"][1], json!({"type": "text", "text": "hello"}));
     assert_eq!(body["usage"]["output_tokens"], 2);
+}
+
+#[tokio::test]
+async fn models_lists_the_metadata_that_is_known() {
+    let (jobs, _receiver) = mpsc::channel(32);
+    let (status, body) = json_response(
+        router("test-model", jobs, RouteConfig::default(), None),
+        Request::get("/v1/models").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({"object": "list", "data": [{
+            "id": "test-model", "object": "model", "created": 0, "owned_by": "resin"
+        }]})
+    );
+
+    let (jobs, _receiver) = mpsc::channel(32);
+    let model = ServedModel::new(
+        "test-model",
+        ModelMetadata {
+            max_context_tokens: 131_072.try_into().ok(),
+            max_output_tokens: 131_072.try_into().ok(),
+            supports_vision: Some(false),
+            supports_prompt_caching: Some(true),
+            input_modalities: Some(vec!["text".to_owned()]),
+            ..ModelMetadata::default()
+        },
+    );
+    let (status, body) = json_response(
+        router(model, jobs, RouteConfig::default(), None),
+        Request::get("/v1/models").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"],
+        json!([{
+            "id": "test-model",
+            "object": "model",
+            "created": 0,
+            "owned_by": "resin",
+            "max_context_tokens": 131_072,
+            "max_output_tokens": 131_072,
+            "supports_vision": false,
+            "supports_prompt_caching": true,
+            "input_modalities": ["text"],
+        }])
+    );
 }
 
 #[tokio::test]

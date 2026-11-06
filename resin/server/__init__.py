@@ -7,6 +7,7 @@ structural Python protocol.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from resin._resin import Engine, _HttpServer
@@ -15,6 +16,53 @@ from resin.recipe import ParserEvent, Recipe, RenderedPrompt
 
 if TYPE_CHECKING:
     from resin.backend.distributed import DistributedEngine
+
+
+@dataclass(frozen=True, kw_only=True)
+class ModelCapabilities:
+    """What the served model accepts and makes, for ``GET /v1/models``.
+
+    The response does not include a field that is None. False tells that the model does
+    not support the capability. The response tells that the model supports vision when
+    input_modalities includes "image". The engine gives the token limits and prompt
+    caching.
+    """
+
+    function_calling: bool | None = None
+    reasoning: bool | None = None
+    input_modalities: tuple[str, ...] | None = None
+    output_modalities: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("function_calling", "reasoning"):
+            value = getattr(self, name)
+            if value is not None and type(value) is not bool:
+                raise ValueError(f"{name} must be a bool or None")
+        for name in ("input_modalities", "output_modalities"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                type(value) is not tuple
+                or not value
+                or any(type(item) is not str or not item.strip() for item in value)
+            ):
+                raise ValueError(
+                    f"{name} must be a nonempty tuple of nonempty strings or None"
+                )
+
+    def to_wire(self) -> dict[str, object]:
+        """The fields that are not None, as the native server takes them."""
+        return {
+            name: list(value) if isinstance(value, tuple) else value
+            for name, value in (
+                ("function_calling", self.function_calling),
+                ("reasoning", self.reasoning),
+                ("input_modalities", self.input_modalities),
+                ("output_modalities", self.output_modalities),
+            )
+            if value is not None
+        }
 
 
 class HttpServer:
@@ -39,6 +87,10 @@ class HttpServer:
 
     OpenAI chat and Responses requests without an output-token limit use the
     engine's remaining context budget after rendering and tokenizing the prompt.
+
+    ``GET /v1/models`` gives the engine's context length as the context and output
+    limits, and tells whether the engine has a prefix cache. capabilities adds what
+    the engine cannot tell.
     """
 
     def __init__(
@@ -53,6 +105,7 @@ class HttpServer:
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         from resin.backend.distributed import (
             DistributedEngine,
@@ -89,6 +142,10 @@ class HttpServer:
                 raise ValueError("HTTP route flags must be booleans")
             if enable_demo and not enable_openai:
                 raise ValueError("enable_demo=True requires enable_openai=True")
+            if capabilities is not None and not isinstance(
+                capabilities, ModelCapabilities
+            ):
+                raise ValueError("capabilities must be a ModelCapabilities or None")
         except BaseException as exc:
             error = exc
         if isinstance(engine, DistributedEngine):
@@ -105,6 +162,7 @@ class HttpServer:
                     stream_interval,
                     request_queue_capacity,
                     engine.local.metrics_enabled,
+                    capabilities,
                 )
             )
             states = engine.worker._drivers(
@@ -152,6 +210,9 @@ class HttpServer:
                     enable_anthropic=enable_anthropic,
                     enable_demo=enable_demo,
                     distributed=self._coordinator,
+                    capabilities=None
+                    if capabilities is None
+                    else capabilities.to_wire(),
                 )
         except BaseException as exc:
             error = exc
@@ -202,6 +263,7 @@ class HttpServer:
 __all__ = [
     "Recipe",
     "HttpServer",
+    "ModelCapabilities",
     "ParserEvent",
     "RenderedPrompt",
     "ResponseParser",

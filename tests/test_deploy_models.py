@@ -117,6 +117,23 @@ def test_text_only_recipe_refuses_media():
         recipe.render(image)
 
 
+@pytest.mark.parametrize("name", sorted(MODEL_SPECS))
+def test_model_capabilities_follow_the_preset_media(name):
+    from deploy.models import model_capabilities
+
+    spec = MODEL_SPECS[name]
+    capabilities = model_capabilities(spec)
+    assert capabilities.function_calling and capabilities.reasoning
+    assert capabilities.input_modalities == (
+        ("text", "image") if spec.media else ("text",)
+    )
+    assert capabilities.output_modalities == ("text",)
+    assert model_capabilities(replace(spec, media=True)).input_modalities == (
+        "text",
+        "image",
+    )
+
+
 def make_checkpoint(path, required_files):
     path.mkdir(parents=True)
     for name in required_files:

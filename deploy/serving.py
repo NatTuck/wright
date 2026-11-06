@@ -33,6 +33,7 @@ from deploy.models import (
     create_runner,
     gaudi_supports_ranks,
     get_model,
+    model_capabilities,
     require_checkpoint,
     validate_gaudi_options,
     warm_engine,
@@ -390,6 +391,7 @@ def _serve_one(args, spec, device: str) -> None:
             request_queue_capacity=args.request_queue_capacity,
             drain_seconds=args.drain_timeout,
             enable_anthropic=spec.enable_anthropic,
+            capabilities=model_capabilities(spec),
         )
         signal.signal(signal.SIGTERM, _ignore_signal)
         try:
@@ -632,6 +634,7 @@ def _serve_claimed_rank(rank: int, options: dict, claim) -> None:
             request_queue_capacity=options["request_queue_capacity"],
             drain_seconds=options["drain_timeout"],
             enable_anthropic=spec.enable_anthropic,
+            capabilities=model_capabilities(spec),
         )
         signal.signal(signal.SIGTERM, _ignore_signal)
         try:

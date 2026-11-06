@@ -13,10 +13,10 @@ from output_helpers import forward_output
 from test_recipe import _byte_tokenizer, _FastTokenizer, _token_ids
 
 import resin
-from resin import BatchPhase, Engine
+from resin import BatchPhase, CacheGroupLayout, CacheLayout, Engine, RunnerConfig
 from resin.backend.distributed import DistributedExecutionError
 from resin.recipe import InklingResponseParser, RenderedPrompt, Tokenizer
-from resin.server import HttpServer
+from resin.server import HttpServer, ModelCapabilities
 
 
 class Recipe:
@@ -118,6 +118,69 @@ def post(base, body):
         headers={"Content-Type": "application/json"},
     )
     return urllib.request.urlopen(request, timeout=5)
+
+
+def get_json(base, path):
+    with urllib.request.urlopen(f"{base}{path}", timeout=5) as response:
+        return json.load(response)
+
+
+def test_models_lists_engine_limits_without_capabilities():
+    with running_server(Runner(), engine_options={"context_length": 2048}) as served:
+        models = get_json(served[4], "/v1/models")
+    assert models == {
+        "object": "list",
+        "data": [
+            {
+                "id": "test",
+                "object": "model",
+                "created": 0,
+                "owned_by": "resin",
+                "max_context_tokens": 2048,
+                "max_output_tokens": 2048,
+                "supports_prompt_caching": False,
+            }
+        ],
+    }
+
+
+class CachedRunner(Runner):
+    runner_config = RunnerConfig(
+        cache_layout=CacheLayout(parent_capacity=16, groups=[CacheGroupLayout(16)])
+    )
+
+    def bind_resources(self, binding):
+        pass
+
+
+def test_models_lists_given_capabilities_and_prefix_cache():
+    runner = CachedRunner()
+    capabilities = ModelCapabilities(
+        function_calling=True,
+        reasoning=False,
+        input_modalities=("text",),
+        output_modalities=("text",),
+    )
+    with running_server(
+        runner,
+        engine_options={"context_length": 4096, "prefix_cache": True},
+        capabilities=capabilities,
+    ) as served:
+        (model,) = get_json(served[4], "/v1/models")["data"]
+    assert model == {
+        "id": "test",
+        "object": "model",
+        "created": 0,
+        "owned_by": "resin",
+        "max_context_tokens": 4096,
+        "max_output_tokens": 4096,
+        "supports_vision": False,
+        "supports_function_calling": True,
+        "supports_reasoning": False,
+        "supports_prompt_caching": True,
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+    }
 
 
 def test_programmatic_shutdown_stops_idle_server_and_closes_engine():

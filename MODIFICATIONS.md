@@ -67,6 +67,7 @@ of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) a
 - `tests/test_deploy_models.py`
 - `tests/test_distributed_http.py`
 - `tests/test_http_lifecycle.py`
+- `tests/test_http_server.py`
 - `tests/test_kernel_cache.py`
 - `tests/test_lazy_imports.py`
 - `tests/test_numa.py`

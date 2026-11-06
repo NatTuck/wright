@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -11,8 +12,11 @@ use std::{
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
+    types::PyDict,
 };
-use resin_http::{GenerationJob, MetricsEndpoint, RouteConfig};
+use pythonize::depythonize;
+use resin_http::{GenerationJob, MetricsEndpoint, ModelMetadata, RouteConfig, ServedModel};
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
@@ -27,12 +31,68 @@ pub(crate) struct NativeHttpServer {
     distributed: Option<Py<PyAny>>,
     recipe: Py<PyAny>,
     model: String,
+    metadata: ModelMetadata,
     stream_interval: u32,
     request_queue_capacity: u32,
     drain_seconds: f64,
     routes: RouteConfig,
     running: AtomicBool,
     shutdown: Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// The capabilities that the caller tells and the engine cannot: the keyword arguments of
+/// resin.server.ModelCapabilities.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Capabilities {
+    function_calling: Option<bool>,
+    reasoning: Option<bool>,
+    input_modalities: Option<Vec<String>>,
+    output_modalities: Option<Vec<String>>,
+}
+
+impl Capabilities {
+    fn from_python(capabilities: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let Some(capabilities) = capabilities else {
+            return Ok(Self::default());
+        };
+        let capabilities: Self = depythonize(capabilities)
+            .map_err(|error| PyValueError::new_err(format!("invalid capabilities: {error}")))?;
+        for modalities in [
+            &capabilities.input_modalities,
+            &capabilities.output_modalities,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if modalities.is_empty() || modalities.iter().any(|name| name.trim().is_empty()) {
+                return Err(PyValueError::new_err(
+                    "capabilities modalities must be a nonempty list of nonempty names",
+                ));
+            }
+        }
+        Ok(capabilities)
+    }
+}
+
+/// The metadata of `GET /v1/models`. The engine gives the token limits and prompt caching. A
+/// request can generate tokens until its prompt and output fill the context, so the output
+/// limit is the context length.
+fn model_metadata(engine: &Engine, capabilities: Capabilities) -> ModelMetadata {
+    let context = NonZeroU32::new(engine.context_length());
+    ModelMetadata {
+        max_context_tokens: context,
+        max_output_tokens: context,
+        supports_vision: capabilities
+            .input_modalities
+            .as_ref()
+            .map(|modalities| modalities.iter().any(|name| name == "image")),
+        supports_function_calling: capabilities.function_calling,
+        supports_reasoning: capabilities.reasoning,
+        supports_prompt_caching: Some(engine.prefix_cache_stats().is_some()),
+        input_modalities: capabilities.input_modalities,
+        output_modalities: capabilities.output_modalities,
+    }
 }
 
 #[pymethods]
@@ -49,10 +109,12 @@ impl NativeHttpServer {
         enable_openai = true,
         enable_anthropic = true,
         enable_demo = true,
-        distributed = None
+        distributed = None,
+        capabilities = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         engine: Py<Engine>,
         recipe: Py<PyAny>,
         model: String,
@@ -63,6 +125,7 @@ impl NativeHttpServer {
         enable_anthropic: bool,
         enable_demo: bool,
         distributed: Option<Py<PyAny>>,
+        capabilities: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         if stream_interval == 0 {
             return Err(PyValueError::new_err("stream_interval must be positive"));
@@ -93,11 +156,14 @@ impl NativeHttpServer {
                 "enable_demo=True requires enable_openai=True",
             ));
         }
+        let capabilities = Capabilities::from_python(capabilities.as_ref())?;
+        let metadata = model_metadata(&engine.bind(py).borrow(), capabilities);
         Ok(Self {
             engine,
             distributed,
             recipe,
             model,
+            metadata,
             stream_interval,
             request_queue_capacity,
             drain_seconds,
@@ -131,7 +197,7 @@ impl NativeHttpServer {
         let engine = self.engine.clone_ref(py);
         let distributed = self.distributed.as_ref().map(|value| value.clone_ref(py));
         let recipe = self.recipe.clone_ref(py);
-        let model = self.model.clone();
+        let model = ServedModel::new(self.model.as_str(), self.metadata.clone());
         let routes = self.routes;
         let stream_interval = self.stream_interval;
         let request_queue_capacity = self.request_queue_capacity;
@@ -202,7 +268,7 @@ fn run_server(
     engine: Py<Engine>,
     distributed: Option<Py<PyAny>>,
     recipe: Py<PyAny>,
-    model: String,
+    model: ServedModel,
     routes: RouteConfig,
     stream_interval: u32,
     request_queue_capacity: u32,
@@ -219,9 +285,9 @@ fn run_server(
         .map_err(|error| format!("failed to bind {address}: {error}"))?;
     let (jobs, receiver) = mpsc::channel(request_queue_capacity as usize);
     let metrics = Python::attach(|py| engine.bind(py).borrow().metrics_enabled())
-        .then(|| MetricsEndpoint::new(&model));
+        .then(|| MetricsEndpoint::new(model.id.as_ref()));
     let actor_metrics = metrics.clone();
-    let actor_model = model.clone();
+    let actor_model = model.id.clone();
     let actor_shutdown = shutdown.subscribe();
     let (actor_finished, actor_done) = oneshot::channel();
     let actor = thread::Builder::new()

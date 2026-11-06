@@ -7,7 +7,7 @@ from output_helpers import forward_output
 
 import resin
 from resin import Engine
-from resin.server import HttpServer
+from resin.server import HttpServer, ModelCapabilities
 
 
 class IncrementingRunner:
@@ -89,5 +89,67 @@ def test_native_http_server_rejects_zero_settings(setting):
             model="test",
             stream_interval=0 if setting == "stream_interval" else 1,
             request_queue_capacity=0 if setting == "request_queue_capacity" else 1024,
+        )
+    engine.close()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"function_calling": 1},
+        {"reasoning": "yes"},
+        {"input_modalities": ["text"]},
+        {"input_modalities": ()},
+        {"output_modalities": ("text", " ")},
+        {"output_modalities": ("text", 1)},
+    ],
+)
+def test_model_capabilities_rejects_invalid_values(options):
+    with pytest.raises(ValueError, match="must be"):
+        ModelCapabilities(**options)
+
+
+def test_http_server_forwards_only_known_capabilities(monkeypatch):
+    import resin.server as serving
+
+    created = []
+
+    def native(*args, **kwargs):
+        created.append(kwargs)
+        return SimpleNamespace(running=False)
+
+    monkeypatch.setattr(serving, "_HttpServer", native)
+    engine = Engine(IncrementingRunner())
+    HttpServer(engine, recipe=_Recipe(), model="test")
+    HttpServer(
+        engine,
+        recipe=_Recipe(),
+        model="test",
+        capabilities=ModelCapabilities(reasoning=True, input_modalities=("text",)),
+    )
+    assert created[0]["capabilities"] is None
+    assert created[1]["capabilities"] == {
+        "reasoning": True,
+        "input_modalities": ["text"],
+    }
+    with pytest.raises(ValueError, match="capabilities must be"):
+        HttpServer(
+            engine,
+            recipe=_Recipe(),
+            model="test",
+            capabilities={"reasoning": True},  # ty: ignore[invalid-argument-type]
+        )
+    engine.close()
+
+
+def test_native_http_server_rejects_unknown_capabilities():
+    from resin._resin import _HttpServer
+
+    engine = Engine(IncrementingRunner())
+    with pytest.raises(ValueError, match="invalid capabilities"):
+        _HttpServer(engine, _Recipe(), model="test", capabilities={"vision": True})
+    with pytest.raises(ValueError, match="nonempty list"):
+        _HttpServer(
+            engine, _Recipe(), model="test", capabilities={"input_modalities": []}
         )
     engine.close()

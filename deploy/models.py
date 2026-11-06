@@ -794,6 +794,20 @@ class TextOnlyRecipe:
         return self._recipe.create_parser(prompt)
 
 
+def model_capabilities(model: str | ModelSpec):
+    """What ``GET /v1/models`` tells about a preset. Every chat recipe of MODEL_SPECS renders
+    tools and parses reasoning. A preset without media serves text only."""
+    from resin.server import ModelCapabilities
+
+    spec = get_model(model)
+    return ModelCapabilities(
+        function_calling=True,
+        reasoning=True,
+        input_modalities=("text", "image") if spec.media else ("text",),
+        output_modalities=("text",),
+    )
+
+
 def create_recipe(
     model: str | ModelSpec,
     checkpoint: str | Path | None = None,

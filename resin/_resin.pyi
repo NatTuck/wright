@@ -1460,6 +1460,7 @@ class _HttpServer:
         enable_anthropic: bool = True,
         enable_demo: bool = True,
         distributed: Any | None = None,
+        capabilities: dict[str, Any] | None = None,
     ) -> _HttpServer: ...
     def __repr__(self, /) -> str: ...
     @property
