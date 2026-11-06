@@ -72,6 +72,9 @@ pub struct ModelMetadata {
     pub supports_function_calling: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_reasoning: Option<bool>,
+    /// The `reasoning_effort` values that the model takes, from the least to the most effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_levels: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_prompt_caching: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

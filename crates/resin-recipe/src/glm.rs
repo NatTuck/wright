@@ -220,6 +220,10 @@ fn tool_block(
 }
 
 impl crate::Recipe for Glm53FlashRecipe {
+    /// Any other `reasoning_effort` selects Max.
+    fn reasoning_efforts(&self) -> &'static [&'static str] {
+        &["low", "high", "max"]
+    }
     fn media_config(&self) -> Option<crate::MediaConfig> {
         Some(crate::MediaConfig::Glm(
             self.params.media_config.clone().unwrap_or_default(),

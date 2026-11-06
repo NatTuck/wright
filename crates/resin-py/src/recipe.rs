@@ -651,6 +651,12 @@ impl NativeRecipe {
     fn stop_token_ids(&self) -> PyResult<Vec<u32>> {
         Ok(self.resolved_stop_token_ids()?.to_vec())
     }
+    /// The `reasoning_effort` names that select a different prompt, from the least to the
+    /// most effort. Empty when the recipe does not use `reasoning_effort`.
+    #[getter]
+    fn reasoning_efforts(&self) -> Vec<&'static str> {
+        self.recipe.reasoning_efforts().to_vec()
+    }
     pub(crate) fn create_parser(
         &self,
         py: Python<'_>,

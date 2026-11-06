@@ -25,6 +25,11 @@ pub trait Recipe: Send + Sync {
     fn media_config(&self) -> Option<MediaConfig> {
         None
     }
+    /// The `reasoning_effort` names that select a different prompt, from the least to the
+    /// most effort. Empty when the recipe does not use `reasoning_effort`.
+    fn reasoning_efforts(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Structural message requirements supplied by a concrete model recipe.

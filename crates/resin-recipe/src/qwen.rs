@@ -121,6 +121,14 @@ impl<const VARIANT35: bool> QwenRecipe<VARIANT35> {
     }
 }
 impl<const VARIANT35: bool> crate::Recipe for QwenRecipe<VARIANT35> {
+    /// The Qwen3.5 format ignores `reasoning_effort`.
+    fn reasoning_efforts(&self) -> &'static [&'static str] {
+        if VARIANT35 {
+            &[]
+        } else {
+            &["low", "medium", "xhigh"]
+        }
+    }
     fn render(&self, request: &Value) -> Result<Prompt, Error> {
         let request = crate::recipe::request("Qwen", &self.params, request)?;
         let request = &request;

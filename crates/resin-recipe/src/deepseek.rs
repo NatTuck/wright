@@ -334,6 +334,10 @@ impl DeepSeekV41Recipe {
     }
 }
 impl crate::Recipe for DeepSeekV41Recipe {
+    /// The names of the 50, 75, and 100 budgets; `settings` also takes an integer budget.
+    fn reasoning_efforts(&self) -> &'static [&'static str] {
+        &["low", "high", "max"]
+    }
     fn message_policy(&self) -> crate::MessagePolicy {
         crate::MessagePolicy {
             roles: &[

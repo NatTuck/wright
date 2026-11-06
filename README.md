@@ -851,8 +851,9 @@ A bar shows the weight loading progress on a terminal. In a log file, a line sho
 
 - `/health` tells you that the server is running. The server only listens after its weights load.
 - `/v1/models` gives the model ID, the context and output token limits, and the capabilities of
-  the model: tool calls, reasoning, prompt caching, vision, and the input and output modalities.
-  A client can use this data to configure itself.
+  the model: tool calls, reasoning, the `reasoning_effort` values that the model takes
+  (`thinking_levels`), prompt caching, vision, and the input and output modalities. A client can
+  use this data to configure itself.
 - `/metrics` gives Prometheus metrics, which include the draft accept rate. Read
   [`docs/metrics.md`](docs/metrics.md).
 

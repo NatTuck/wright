@@ -722,6 +722,8 @@ async fn models_lists_the_metadata_that_is_known() {
             max_context_tokens: 131_072.try_into().ok(),
             max_output_tokens: 131_072.try_into().ok(),
             supports_vision: Some(false),
+            supports_reasoning: Some(true),
+            thinking_levels: Some(vec!["low".to_owned(), "high".to_owned()]),
             supports_prompt_caching: Some(true),
             input_modalities: Some(vec!["text".to_owned()]),
             ..ModelMetadata::default()
@@ -743,6 +745,8 @@ async fn models_lists_the_metadata_that_is_known() {
             "max_context_tokens": 131_072,
             "max_output_tokens": 131_072,
             "supports_vision": false,
+            "supports_reasoning": true,
+            "thinking_levels": ["low", "high"],
             "supports_prompt_caching": true,
             "input_modalities": ["text"],
         }])

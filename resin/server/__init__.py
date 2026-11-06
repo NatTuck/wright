@@ -26,10 +26,15 @@ class ModelCapabilities:
     not support the capability. The response tells that the model supports vision when
     input_modalities includes "image". The engine gives the token limits and prompt
     caching.
+
+    thinking_levels are the reasoning_effort values that the model takes, from the least
+    to the most effort, for example ``NativeRecipe.reasoning_efforts``. They require
+    reasoning=True.
     """
 
     function_calling: bool | None = None
     reasoning: bool | None = None
+    thinking_levels: tuple[str, ...] | None = None
     input_modalities: tuple[str, ...] | None = None
     output_modalities: tuple[str, ...] | None = None
 
@@ -38,7 +43,7 @@ class ModelCapabilities:
             value = getattr(self, name)
             if value is not None and type(value) is not bool:
                 raise ValueError(f"{name} must be a bool or None")
-        for name in ("input_modalities", "output_modalities"):
+        for name in ("thinking_levels", "input_modalities", "output_modalities"):
             value = getattr(self, name)
             if value is None:
                 continue
@@ -50,6 +55,8 @@ class ModelCapabilities:
                 raise ValueError(
                     f"{name} must be a nonempty tuple of nonempty strings or None"
                 )
+        if self.thinking_levels is not None and self.reasoning is not True:
+            raise ValueError("thinking_levels must be None unless reasoning=True")
 
     def to_wire(self) -> dict[str, object]:
         """The fields that are not None, as the native server takes them."""
@@ -58,6 +65,7 @@ class ModelCapabilities:
             for name, value in (
                 ("function_calling", self.function_calling),
                 ("reasoning", self.reasoning),
+                ("thinking_levels", self.thinking_levels),
                 ("input_modalities", self.input_modalities),
                 ("output_modalities", self.output_modalities),
             )

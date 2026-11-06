@@ -825,6 +825,12 @@ class NativeRecipe(Recipe):
         *,
         prompt: RenderedPrompt,
     ) -> Any: ...
+    @property
+    def reasoning_efforts(self, /) -> list[str]:
+        """
+        The `reasoning_effort` names that select a different prompt, from the least to the
+        most effort. Empty when the recipe does not use `reasoning_effort`.
+        """
     def render(
         self,
         /,
@@ -1460,7 +1466,7 @@ class _HttpServer:
         enable_anthropic: bool = True,
         enable_demo: bool = True,
         distributed: Any | None = None,
-        capabilities: dict[str, Any] | None = None,
+        capabilities: dict | None = None,
     ) -> _HttpServer: ...
     def __repr__(self, /) -> str: ...
     @property

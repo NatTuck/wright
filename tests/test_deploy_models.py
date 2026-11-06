@@ -117,21 +117,32 @@ def test_text_only_recipe_refuses_media():
         recipe.render(image)
 
 
+THINKING_LEVELS = {
+    "qwen3_5": ("low", "medium", "xhigh"),
+    "glm5_3_flash": ("low", "high", "max"),
+    "deepseek_v41": ("low", "high", "max"),
+    "mistral_large4": ("low", "medium", "high"),
+}
+
+
 @pytest.mark.parametrize("name", sorted(MODEL_SPECS))
-def test_model_capabilities_follow_the_preset_media(name):
-    from deploy.models import model_capabilities
+def test_model_capabilities_come_from_the_preset_and_its_recipe(name, tmp_path):
+    from test_recipe import _byte_tokenizer
+
+    from deploy.models import create_recipe, model_capabilities
 
     spec = MODEL_SPECS[name]
-    capabilities = model_capabilities(spec)
+    _byte_tokenizer().save(str(tmp_path / "tokenizer.json"))
+    recipe = create_recipe(spec, tmp_path, tokenizer_checkpoint=tmp_path)
+    capabilities = model_capabilities(spec, recipe)
     assert capabilities.function_calling and capabilities.reasoning
-    assert capabilities.input_modalities == (
-        ("text", "image") if spec.media else ("text",)
-    )
+    # The dense Qwen3.5 recipe ignores reasoning_effort, thus it has no levels.
+    expected = None if spec.recipe == "qwen3_5" else THINKING_LEVELS[spec.family]
+    assert capabilities.thinking_levels == expected
+    assert capabilities.input_modalities == ("text",) and not spec.media
     assert capabilities.output_modalities == ("text",)
-    assert model_capabilities(replace(spec, media=True)).input_modalities == (
-        "text",
-        "image",
-    )
+    media = model_capabilities(replace(spec, media=True), recipe)
+    assert media.input_modalities == ("text", "image")
 
 
 def make_checkpoint(path, required_files):

@@ -102,6 +102,9 @@ def test_native_http_server_rejects_zero_settings(setting):
         {"input_modalities": ()},
         {"output_modalities": ("text", " ")},
         {"output_modalities": ("text", 1)},
+        {"reasoning": True, "thinking_levels": ()},
+        {"thinking_levels": ("low",)},
+        {"reasoning": False, "thinking_levels": ("low",)},
     ],
 )
 def test_model_capabilities_rejects_invalid_values(options):
@@ -148,8 +151,12 @@ def test_native_http_server_rejects_unknown_capabilities():
     engine = Engine(IncrementingRunner())
     with pytest.raises(ValueError, match="invalid capabilities"):
         _HttpServer(engine, _Recipe(), model="test", capabilities={"vision": True})
-    with pytest.raises(ValueError, match="nonempty list"):
+    with pytest.raises(ValueError, match="nonempty lists"):
         _HttpServer(
             engine, _Recipe(), model="test", capabilities={"input_modalities": []}
+        )
+    with pytest.raises(ValueError, match="require reasoning=True"):
+        _HttpServer(
+            engine, _Recipe(), model="test", capabilities={"thinking_levels": ["low"]}
         )
     engine.close()

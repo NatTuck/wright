@@ -31,7 +31,11 @@ of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) a
 - `crates/resin-py/src/recipe.rs`
 - `crates/resin-recipe/Cargo.toml`
 - `crates/resin-recipe/README.md`
+- `crates/resin-recipe/src/deepseek.rs`
+- `crates/resin-recipe/src/glm.rs`
 - `crates/resin-recipe/src/lib.rs`
+- `crates/resin-recipe/src/qwen.rs`
+- `crates/resin-recipe/src/recipe.rs`
 - `deploy/README.md`
 - `deploy/checkpoint_cache.py`
 - `deploy/models.py`

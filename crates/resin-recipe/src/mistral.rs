@@ -262,6 +262,10 @@ fn tool_call(prompt: &mut Prompt, call: &Value) -> Result<(), Error> {
 }
 
 impl crate::Recipe for MistralLarge4Recipe {
+    /// `effort` also takes the aliases minimal, xhigh, and max.
+    fn reasoning_efforts(&self) -> &'static [&'static str] {
+        &["low", "medium", "high"]
+    }
     fn message_policy(&self) -> crate::MessagePolicy {
         crate::MessagePolicy {
             roles: &["system", "user", "assistant", "tool"],

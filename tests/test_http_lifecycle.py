@@ -157,7 +157,8 @@ def test_models_lists_given_capabilities_and_prefix_cache():
     runner = CachedRunner()
     capabilities = ModelCapabilities(
         function_calling=True,
-        reasoning=False,
+        reasoning=True,
+        thinking_levels=("low", "high"),
         input_modalities=("text",),
         output_modalities=("text",),
     )
@@ -176,7 +177,8 @@ def test_models_lists_given_capabilities_and_prefix_cache():
         "max_output_tokens": 4096,
         "supports_vision": False,
         "supports_function_calling": True,
-        "supports_reasoning": False,
+        "supports_reasoning": True,
+        "thinking_levels": ["low", "high"],
         "supports_prompt_caching": True,
         "input_modalities": ["text"],
         "output_modalities": ["text"],

@@ -47,6 +47,7 @@ pub(crate) struct NativeHttpServer {
 struct Capabilities {
     function_calling: Option<bool>,
     reasoning: Option<bool>,
+    thinking_levels: Option<Vec<String>>,
     input_modalities: Option<Vec<String>>,
     output_modalities: Option<Vec<String>>,
 }
@@ -58,18 +59,24 @@ impl Capabilities {
         };
         let capabilities: Self = depythonize(capabilities)
             .map_err(|error| PyValueError::new_err(format!("invalid capabilities: {error}")))?;
-        for modalities in [
+        for names in [
+            &capabilities.thinking_levels,
             &capabilities.input_modalities,
             &capabilities.output_modalities,
         ]
         .into_iter()
         .flatten()
         {
-            if modalities.is_empty() || modalities.iter().any(|name| name.trim().is_empty()) {
+            if names.is_empty() || names.iter().any(|name| name.trim().is_empty()) {
                 return Err(PyValueError::new_err(
-                    "capabilities modalities must be a nonempty list of nonempty names",
+                    "capabilities levels and modalities must be nonempty lists of nonempty names",
                 ));
             }
+        }
+        if capabilities.thinking_levels.is_some() && capabilities.reasoning != Some(true) {
+            return Err(PyValueError::new_err(
+                "capabilities thinking_levels require reasoning=True",
+            ));
         }
         Ok(capabilities)
     }
@@ -89,6 +96,7 @@ fn model_metadata(engine: &Engine, capabilities: Capabilities) -> ModelMetadata 
             .map(|modalities| modalities.iter().any(|name| name == "image")),
         supports_function_calling: capabilities.function_calling,
         supports_reasoning: capabilities.reasoning,
+        thinking_levels: capabilities.thinking_levels,
         supports_prompt_caching: Some(engine.prefix_cache_stats().is_some()),
         input_modalities: capabilities.input_modalities,
         output_modalities: capabilities.output_modalities,
