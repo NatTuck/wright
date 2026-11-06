@@ -73,7 +73,7 @@ It just felt Wright.
 | Qwen3.8-27B | FP8 safetensors | 1 | 🟢 Lab Ready | Throughput sweep, GPQA Diamond |
 | Mistral-Large-4 | `UD-Q4_K_XL` GGUF | 8 | 🟢 Lab Ready | Throughput sweep, GPQA Diamond on 155 of 198 questions |
 | GLM-5.3-Flash | FP8 safetensors | 4 or 8 | 🟢 Lab Ready | Throughput sweep, GPQA Diamond |
-| DeepSeek-V4.1-Flash | FP4 and FP8 safetensors | 8 | 🟡 In Testing | Server check, throughput with 1 to 8 requests |
+| DeepSeek-V4.1-Flash | FP4 and FP8 safetensors | 8 | 🟡 In Testing | Server check, throughput with 1 to 8 requests, GPQA Diamond |
 | Qwen3.5-9B | FP8 safetensors from a third party | 1 | 🟡 In Testing | Server check, throughput with 1 and 8 requests |
 | Qwen3.5-4B | FP8 safetensors from a third party | 1 | 🟡 In Testing | Server check, throughput with 1 and 8 requests |
 | Qwen3.5-2B | FP8 safetensors from a third party | 1 | 🟡 In Testing | Server check, throughput with 1 and 8 requests |
@@ -368,6 +368,32 @@ the stress checks. It gave 13 passed, 0 failed, and 4 skipped checks.
   8.25 s. The same prompt got its first token in 0.29 s the second time.
 - **Skipped checks:** Images, reasoning effort, the HTTP compile counter, and the MMLU evaluation.
   The run had no MMLU question file.
+
+#### GPQA Diamond
+
+These results are from 2026-11-06. They use `inspect_evals` 0.27.0, one pass of the 198 questions,
+and Max reasoning.
+
+| Reasoning | Temperature | Top-p | Answer token limit | Correct | Score | Standard error |
+|---|---:|---:|---:|---:|---:|---:|
+| Max | 1.0 | 1.0 | 262,144 | 187 of 198 | **94.4%** | ±1.6 |
+
+- **Sampling:** The `README.md` of the checkpoint recommends temperature 1.0, top-p 1.0, and a limit
+  of 256K answer tokens or more. The run used these values.
+- **Cut-off answers:** No answer reached the limit. The model completed all 198 answers.
+- **Answer length:** The median answer used 7,830 tokens, and the longest answer used 93,622 tokens.
+  Of the 198 answers, 60 used more than 16,384 tokens. With a limit of 64,000 tokens, as in the
+  Qwen3.8-27B and GLM-5.3-Flash runs, 8 answers would reach the limit.
+- **Scorer:** One answer ended with `ANSWER: $B`. The scorer found no letter in this answer, and
+  counted it as incorrect. B was the correct letter. If the scorer accepted this answer, the score
+  would be 94.9%.
+- **Comparison:** Artificial Analysis and the `README.md` of the checkpoint give no GPQA Diamond
+  score for this model.
+- **Run settings:** The run used 8 cards, DSpark-3, and 2 requests at the same time. DSpark runs
+  only on decode steps of 2 sequences or fewer. Thus, it ran on each decode step. The server used
+  512,000 tokens of context, a batch of 8 (`-np 8`), and `--decode-share 25:99`.
+- **Duration:** The run took 4 h 48 min. On average, the 2 requests generated approximately
+  170 tok/s in total.
 
 ### Qwen3.5 0.8B to 9B
 
