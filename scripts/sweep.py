@@ -7,6 +7,7 @@ uv run --no-default-groups --group gaudi scripts/sweep.py \
     --mistral-drafter /path/to/Mistral-Large-4-drafter \
     --glm /path/to/GLM-5.3-Flash \
     --qwen35 /path/to/qwen35-checkpoints \
+    --deepseek /path/to/DeepSeek-V4.1-Flash-1017 \
     --output bench/sweep
 
 The script starts one server for each configuration, and runs llama-benchy with sampling at each
@@ -73,6 +74,9 @@ _GLM8: dict[str, Any] = dict(
 _GLM4: dict[str, Any] = dict(
     family="glm", preset="glm5_3_flash-gaudi2-tp4", body=LOW_REASONING
 )
+_DEEPSEEK: dict[str, Any] = dict(
+    family="deepseek", preset="deepseek_v41-gaudi2", body=LOW_REASONING
+)
 
 CONFIGS = (
     Config("qwen-mtp0", draft_tokens=0, **_QWEN),
@@ -87,6 +91,8 @@ CONFIGS = (
     # Mistral-Large-4 has no MTP layer. Its drafter takes only 3 draft tokens.
     Config("mistral-nodraft", draft_tokens=0, **_MISTRAL),
     Config("mistral-dspark3", draft_tokens=3, **_MISTRAL),
+    Config("deepseek-nodraft", draft_tokens=0, **_DEEPSEEK),
+    Config("deepseek-dspark3", draft_tokens=3, **_DEEPSEEK),
     *(
         Config(
             f"qwen35-{size.lower()}-mtp0",
@@ -128,6 +134,16 @@ GPQA = (
         16,
         None,
     ),
+    (
+        Config(
+            "deepseek-max",
+            "deepseek",
+            "deepseek_v41-gaudi2",
+            body={"reasoning_effort": "max"},
+        ),
+        16,
+        None,
+    ),
 )
 
 
@@ -137,6 +153,8 @@ def checkpoint_paths(config: Config, args) -> tuple[Path, Path]:
         return args.qwen, args.qwen
     if config.family == "glm":
         return args.glm, args.glm
+    if config.family == "deepseek":
+        return args.deepseek, args.deepseek
     if config.family == "qwen35":
         path = args.qwen35 / config.folder
         return path, path
@@ -179,6 +197,7 @@ def server_command(config: Config, args, context: int | None = None) -> list[str
         line += ["--max-batch-size", str(args.max_batch_size)]
     if args.gpu:
         line += ["--gpu", args.gpu]
+    line += shlex.split(args.server_args)
     if config.family == "mistral":
         line += ["--tokenizer", str(tokenizer)]
         if config.draft_tokens:
@@ -231,7 +250,8 @@ def draft_counters(base: str) -> dict[str, float]:
 
 
 def server_counters(base: str) -> dict[str, float]:
-    """Requests that run now, and requests that have lost their cache since the server started."""
+    """Requests that run now, requests that have lost their cache since the server started, and
+    the highest share of the cache in use on any rank."""
     values: dict[str, float] = {}
     for line in fetch(f"{base}/metrics").splitlines():
         if line.startswith("#") or " " not in line:
@@ -244,6 +264,8 @@ def server_counters(base: str) -> dict[str, float]:
         ):
             if part in key:
                 values[short] = values.get(short, 0.0) + float(value)
+        if key.endswith("token_usage"):
+            values["usage"] = max(values.get("usage", 0.0), float(value))
     return values
 
 
@@ -265,6 +287,7 @@ class Watcher(threading.Thread):
         self.base = base
         self.finished = threading.Event()
         self.peak_running = 0.0
+        self.peak_usage = 0.0
         self.retracted = 0.0
 
     def run(self) -> None:
@@ -275,6 +298,7 @@ class Watcher(threading.Thread):
             except OSError:
                 continue
             self.peak_running = max(self.peak_running, values.get("running", 0.0))
+            self.peak_usage = max(self.peak_usage, values.get("usage", 0.0))
             first = values.get("retracted", 0.0) if first is None else first
             self.retracted = values.get("retracted", 0.0) - first
 
@@ -288,11 +312,11 @@ def measure(
     base: str,
     model: str,
 ) -> dict:
-    """One llama-benchy cell. The prompt leaves room for the reply. A cell that repeats its prompts
-    many times costs minutes, so large cells run once, with no warmup."""
+    """One llama-benchy cell. The prompt leaves room for the reply and the chat template. A cell
+    that repeats its prompts many times costs minutes, so large cells run once, with no warmup."""
     _, tokenizer = checkpoint_paths(config, args)
     body = {**(config.sampling or sampling(tokenizer)), **config.body}
-    prompt = context - args.output_tokens - 16
+    prompt = context - args.output_tokens - 64
     runs = max(1, min(args.runs, args.run_budget // (context * concurrency)))
     with tempfile.TemporaryDirectory() as directory:
         result = Path(directory) / "result.json"
@@ -352,6 +376,7 @@ def measure(
             "seconds": time.monotonic() - started,
             "returncode": run.returncode,
             "peak_running": watcher.peak_running,
+            "peak_usage": watcher.peak_usage,
             "retracted": watcher.retracted,
         }
         if result.exists():
@@ -365,11 +390,15 @@ def measure(
 
 def did_not_fit(record: dict) -> bool:
     """The cache could not hold every request at once. Below this size, a low peak is only a short
-    run that the poll missed."""
+    run that the poll missed. When the server divides time between prefill and decode, the first
+    requests can end before the last ones start. A low peak then means a full cache only if the
+    cache was almost full. Records without the cache peak use the request peak alone."""
     if record.get("retracted"):
         return True
     size = record["context"] * record["concurrency"]
-    return size >= 1 << 18 and record.get("peak_running", 0) < record["concurrency"]
+    if size < 1 << 18 or record.get("peak_running", 0) >= record["concurrency"]:
+        return False
+    return record.get("peak_usage", 1.0) >= 0.9
 
 
 def run_config(config: Config, args) -> bool:
@@ -732,6 +761,7 @@ def main() -> None:
     parser.add_argument("--mistral-tokenizer", type=Path)
     parser.add_argument("--mistral-drafter", type=Path)
     parser.add_argument("--glm", type=Path)
+    parser.add_argument("--deepseek", type=Path)
     parser.add_argument(
         "--qwen35",
         type=Path,
@@ -772,6 +802,11 @@ def main() -> None:
         help="module IDs that the server may use, such as 0,1 (default: the server's)",
     )
     parser.add_argument("--max-batch-size", type=int)
+    parser.add_argument(
+        "--server-args",
+        default="",
+        help="more server options, such as '--decode-share 0' (default: none)",
+    )
     parser.add_argument("--load-timeout", type=float, default=3600.0)
     parser.add_argument("--run-timeout", type=float, default=3600.0)
     parser.add_argument("--only", help="comma-separated configuration names")

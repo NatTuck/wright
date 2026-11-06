@@ -31,11 +31,10 @@ void main(tensor X, tensor coef, tensor w, tensor h16, tensor h32, float eps, in
     scalar_cache_reset();
     DECL_IDX(IDX)
     for (int t = off[1]; t < end[1]; t++) {
-        float pre[NS];
-        for (int s = 0; s < NS; s++) {
-            int5 c = {t, s, 0, 0, 0};
-            pre[s] = mode == 1 ? 0.25f : s_f32_ld_g(gen_addr(c, coef));
-        }
+        float64 pre[NS];
+        #pragma unroll
+        for (int s = 0; s < NS; s++)
+            pre[s] = mode == 1 ? (float64)0.25f : TOKEN_COEF(coef, t, s);
         float64 acc = 0.0f, acc2 = 0.0f;
         for (int i = 0; i < H; i += 128) {
             float64 xa[NS], xb[NS];
@@ -80,8 +79,8 @@ void main(tensor X, tensor coef, tensor w, tensor h16, tensor h32, float eps, in
 #ifdef Q8
         float64 amax;
         NL_REDUCE_MAX(am, IDX, amax);
-        const float64 sc = v_f32_max_b(amax, 1e-30f) * (1.0f / FP8_MAX);
-        const float64 inv = nl_recip(sc);
+        const float64 sc = token_scale(amax);
+        const float64 inv = token_inv(sc);
         for (int i = 0; i < H; i += 256) {
             int5 c = {i, t, 0, 0, 0};
             v_f8_st_tnsr(c, q, pack_tau(CV_[i >> 6] * inv, CV_[(i >> 6) + 1] * inv, CV_[(i >> 6) + 2] * inv,

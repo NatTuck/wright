@@ -8,6 +8,15 @@
 #define BCAST_DG(a, dg) v_f32_mov_dual_group_all_b(a, 0xFFFFFFFF, dg, dg, dg, dg, WR_ALL, a)
 // shuffle control (uniform across lanes): element e (0..15) of each dual group
 #define SHUF_IDX(e) ((unsigned char)(0x80 | (((e) >> 3) << 5) | ((e) & 7)))
+// every lane <- lane l (0..63) of v
+static inline float64 lane_bcast(float64 v, int l)
+{
+    const float64 b = v_f32_shuffle_b(v, (uchar256)SHUF_IDX(l & 15), 0, v);
+    const int dg = l >> 4;
+    return dg == 0 ? BCAST_DG(b, 0) : dg == 1 ? BCAST_DG(b, 1) : dg == 2 ? BCAST_DG(b, 2) : BCAST_DG(b, 3);
+}
+// element (t, k) of a (T, K) f32 tensor in every lane: a vector read of 64 tokens and a broadcast
+#define TOKEN_COEF(tensor_, t, k) lane_bcast(v_f32_ld_tnsr_b((int5){(t) & ~63, (k), 0, 0, 0}, tensor_), (t) & 63)
 // swap the two 32-lane halves of a vector (dual groups 0,1 <-> 2,3)
 #define SWAP_HALVES(a) v_f32_mov_dual_group_all_b(a, 0xFFFFFFFF, 2, 3, 0, 1, WR_ALL, a)
 
@@ -236,6 +245,23 @@ static inline void scalar_cache_reset() { cache_invalidate(SW_D | SW_RST_D_PREF)
 #define STORE_TOKEN_SCALE(s_t, t, v) { int5 c_ = {0, (t), 0, 0, 0}; v_f32_st_tnsr(c_, s_t, v); }
 
 #define FP8_MAX 240.0f
+
+// The per-token FP8 scale for a largest magnitude amax, and its reciprocal: amax / 240, or with POW2 the
+// smallest power of two s with amax <= 240 s (its reciprocal is then exact).
+#ifdef POW2
+static inline float64 token_scale(float64 amax)
+{
+    const float64 a = v_f32_max_b(amax, 1e-30f);
+    float64 r = as_float64((as_int64(a * (1.0f / FP8_MAX)) + 0x007FFFFF) & 0x7F800000);
+    r = v_f32_sel_grt_f32_b(a, r * FP8_MAX, r * 2.0f, r);
+    r = v_f32_sel_leq_f32_b(a, r * (0.5f * FP8_MAX), r * 0.5f, r);
+    return r;
+}
+static inline float64 token_inv(float64 s) { return as_float64(0x7F000000 - as_int64(s)); }
+#else
+#define token_scale(amax) (v_f32_max_b((amax), 1e-30f) * (1.0f / FP8_MAX))
+#define token_inv(s) nl_recip(s)
+#endif
 
 // SwiGLU input clamps of the *_lim kernel builds (GLM-5.3-Flash: gate <= lim, |up| <= lim; `lim` is the
 // kernel's last parameter); identity otherwise

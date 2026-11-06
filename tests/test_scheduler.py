@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -157,7 +158,7 @@ class TestSchedulerConfigContract:
         default = SchedulerConfig()
         assert (
             repr(default)
-            == "SchedulerConfig(max_batch_tokens=None, prefill_chunk_size=8192, schedule_conservativeness=1.0)"
+            == "SchedulerConfig(max_batch_tokens=None, prefill_chunk_size=8192, schedule_conservativeness=1.0, decode_share=None)"
         )
 
         with pytest.raises(TypeError):
@@ -167,13 +168,12 @@ class TestSchedulerConfigContract:
         assert (limited.max_batch_tokens, limited.prefill_chunk_size) == (17, 5)
         assert (
             repr(limited)
-            == "SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5, schedule_conservativeness=1.0)"
+            == "SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5, schedule_conservativeness=1.0, decode_share=None)"
         )
-        for field in ("max_batch_tokens", "prefill_chunk_size"):
-            with (
-                pytest.raises(ValueError, match=f"{field} must be positive"),
-            ):
-                SchedulerConfig(**{field: 0})
+        with pytest.raises(ValueError, match="max_batch_tokens must be positive"):
+            SchedulerConfig(max_batch_tokens=0)
+        with pytest.raises(ValueError, match="prefill_chunk_size must be positive"):
+            SchedulerConfig(prefill_chunk_size=0)
         for value in (-0.1, float("inf"), float("nan")):
             with (
                 pytest.raises(
@@ -184,6 +184,16 @@ class TestSchedulerConfigContract:
                 SchedulerConfig(schedule_conservativeness=value)
         aggressive = SchedulerConfig(schedule_conservativeness=0.0)
         assert aggressive.schedule_conservativeness == 0.0
+        shared = SchedulerConfig(decode_share=(0.5, 0.9))
+        assert shared.decode_share == (0.5, 0.9)
+        assert repr(shared).endswith("decode_share=(0.5, 0.9))")
+        assert SchedulerConfig().decode_share is None
+        for share in ((0.6, 0.5), (-0.1, 0.5), (0.5, 1.0), (float("nan"), 0.5)):
+            with pytest.raises(ValueError, match="decode_share must satisfy"):
+                SchedulerConfig(decode_share=share)
+        shared_engine = Engine(RecordingRunner(), scheduler_config=shared)
+        assert shared_engine.scheduler_config.decode_share == (0.5, 0.9)
+        shared_engine.close()
         default_engine = Engine(RecordingRunner())
         assert default_engine.new_token_ratio == 0.7
         default_engine.close()
@@ -740,6 +750,44 @@ class TestNativePolicyIntegration:
         assert runner.plans[-1].token_ids.tolist() == [11]
         assert [event.request_id for event in events] == [decoding]
         assert runner.released == [partial, decoding]
+
+    @pytest.mark.parametrize("decode_share", [None, (0.5, 0.5)])
+    def test_decode_share_interleaves_decode_between_prefill_chunks(
+        self, decode_share: tuple[float, float] | None
+    ) -> None:
+        class TimedRunner(ContinuationRecordingRunner):
+            def forward(self, plan: BatchPlan) -> ForwardOutput:
+                time.sleep(0.02 if plan.phase == BatchPhase.PREFILL else 0.002)
+                return super().forward(plan)
+
+        runner = TimedRunner()
+        engine = Engine(
+            runner,
+            max_running_requests=2,
+            scheduler_config=SchedulerConfig(
+                max_batch_tokens=4,
+                prefill_chunk_size=4,
+                decode_share=decode_share,
+            ),
+        )
+        engine.submit([1], sampling_params=SamplingParams(max_output_tokens=500))
+        engine.step()
+        engine.step()
+        start = len(runner.plans)
+        engine.submit(
+            list(range(10, 26)), sampling_params=SamplingParams(max_output_tokens=1)
+        )
+        for _ in range(40):
+            engine.step()
+        phases = [plan.phase for plan in runner.plans[start:]]
+        prefills = [i for i, phase in enumerate(phases) if phase == BatchPhase.PREFILL]
+        assert len(prefills) == 4
+        between = prefills[-1] - prefills[0] - 3
+        if decode_share is None:
+            assert between == 0
+        else:
+            assert between >= 3
+        engine.close()
 
     def test_partial_prefill_survivor_finishes_before_waiting_request(self) -> None:
         runner = ContinuationRecordingRunner()

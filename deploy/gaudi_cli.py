@@ -19,6 +19,22 @@ def positive_int(text: str) -> int:
     return value
 
 
+def decode_share(text: str) -> tuple[float, float] | None:
+    """MIN[:MAX] in percent as fractions, or None for 0 (each whole prefill runs first)."""
+    parts = text.split(":")
+    try:
+        if len(parts) > 2:
+            raise ValueError
+        low, high = float(parts[0]), float(parts[-1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected MIN or MIN:MAX in percent, got {text}"
+        ) from None
+    if not 0 <= low <= high < 100:
+        raise argparse.ArgumentTypeError(f"expected 0 <= MIN <= MAX < 100, got {text}")
+    return None if high == 0 else (low / 100, high / 100)
+
+
 def nonnegative_int(text: str) -> int:
     value = int(text)
     if value < 0:

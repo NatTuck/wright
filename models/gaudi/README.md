@@ -12,9 +12,10 @@ kernels. For the commands and the results, read the [root README](../../README.m
 | `resin_models_gaudi/qwen3_5/` | The Qwen3.8-27B runner, cache arena, and checkpoint preparation |
 | `resin_models_gaudi/mistral_large4/` | The Mistral-Large-4 runner, cache arena, DSpark drafter, and weight preparation |
 | `resin_models_gaudi/glm5_3_flash/` | The GLM-5.3-Flash runner, cache arena, and weight preparation |
+| `resin_models_gaudi/deepseek_v41/` | The DeepSeek-V4.1-Flash runner, cache arena, and weight preparation |
 | `resin_models_gaudi/gguf/` | The GGUF reader and block formats |
 | `tests/` | The tests. Most need a card |
-| `tools/` | Reference models of the numerics, and the reference for the DSpark drafter |
+| `tools/` | Reference models of the numerics, the reference for the DSpark drafter, and DeepSeek-V4.1-Flash development tools |
 
 ## How it runs
 
@@ -35,6 +36,8 @@ kernels. For the commands and the results, read the [root README](../../README.m
   one pass, and emits the target's sample at each position. The checkpoint supplies the MTP layer.
 - **DSpark (Mistral-Large-4).** A separate drafter makes blocks of 3 tokens, for a maximum of 4 rows. A larger
   batch runs without drafts.
+- **DSpark (DeepSeek-V4.1-Flash).** The DSpark layers of the checkpoint make a maximum of 5 draft tokens, for a
+  maximum of 2 rows. A larger batch runs without drafts.
 
 Greedy and seeded decoding gives the same tokens as decoding without drafts, because each emitted token is
 the target's sample at its position. A rejected draft costs time, and does not change the output.
@@ -48,7 +51,8 @@ turn off speculation on the draft build.
 |---|---|---|
 | Kernel and runner tests | Each kernel against a reference, and batches against rows alone | `uv run --no-default-groups --group gaudi-dev python -m pytest models/gaudi/tests` |
 | Server check | The HTTP APIs, stops, logprobs, context limits, prefix cache, and a seeded MMLU sample | `uv run scripts/check_server.py URL` |
-| Reference models | The numerics of GLM-5.3-Flash on a CPU | `tools/glm_ref_hf.py`, `tools/glm_np.py` |
+| Reference models | The numerics of GLM-5.3-Flash and DeepSeek-V4.1-Flash on a CPU | `tools/glm_ref_hf.py`, `tools/glm_np.py`, `tools/ds41_ref.py` |
 
-The tests that need a checkpoint read `RESIN_GAUDI_QWEN35`, `RESIN_ML4_GGUF` and `RESIN_ML4_TOKENIZER`. The test
+The tests that need a checkpoint read `RESIN_GAUDI_QWEN35`, `RESIN_ML4_GGUF`, `RESIN_ML4_TOKENIZER` and
+`DS41_CHECKPOINT`. The test
 `test_gguf.py` reads `RESIN_GGUF_PY` for the `gguf` package of llama.cpp. A test skips if its variable is not set.

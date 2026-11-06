@@ -1238,8 +1238,15 @@ class SchedulerConfig:
         max_batch_tokens: int | None = None,
         prefill_chunk_size: int = 8192,
         schedule_conservativeness: float = 1.0,
+        decode_share: tuple[float, float] | None = None,
     ) -> SchedulerConfig: ...
     def __repr__(self, /) -> str: ...
+    @property
+    def decode_share(self, /) -> tuple[float, float] | None:
+        """
+        The `(min, max)` share of contended execution time for decode, or
+        `None` to run every admitted prefill chunk before decode.
+        """
     @property
     def max_batch_tokens(self, /) -> int | None: ...
     @property

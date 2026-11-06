@@ -16,6 +16,7 @@ qualification. Model-specific configuration belongs in `deploy/models.py`.
 | [merge_bench_traces.py](../scripts/merge_bench_traces.py) | Merge per-rank prefill/decode traces, align timestamp bases and isolate process/flow IDs for Perfetto. |
 | [serve_local.py](../scripts/serve_local.py) | Serve one registry model by preset name (`--model KEY`) through the native HTTP server. The `wright` command finds the preset from the checkpoint instead. |
 | [check_server.py](../scripts/check_server.py) | Qualify an existing HTTP endpoint: JSON/SSE, logprobs, concurrency, prefix hits, context/TTFT, optional media/reasoning, MMLU subset and stress/recovery. Writes a pass/fail/skip report. |
+| [gap_bench.py](../scripts/gap_bench.py) | Start streams that decode on a real server. Send one long prompt. Record the longest gap of each stream and the TTFT of the prompt, for each `--decode-share` and `-b` setting. |
 | [stress_http.py](../scripts/stress_http.py) | Standalone bounded HTTP load/protocol/disconnect/recovery checks, plus the reusable client/parser/reporting machinery used by `check_server.py`. |
 | [qwen35_mtp_fp8.py](../scripts/qwen35_mtp_fp8.py) | Add the MTP weights of a dense Qwen3.5 checkpoint to its FP8 directory. |
 | [bench_startup.py](../scripts/bench_startup.py) | Measure cold `resin` and Torch backend imports in separate fresh processes. This measures Python startup, not model loading or inference. |

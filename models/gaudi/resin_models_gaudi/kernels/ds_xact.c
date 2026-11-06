@@ -10,8 +10,10 @@
 // params: R, lim, t, psh.  index space: [S, ceil(w/128)] (slot = t * R + k).  w0 % 128 == 0, w <= 4096.
 // Prefill pages (R = 0): S = rows of 2^psh-row pages, ids = pe (P,) (expert of page s >> psh), sx (1, S) per row, 0
 // on rows no pair uses, which are skipped. A member then owns a whole slot (index space [S]).
+// LIN (ds_xact_lin.c): hq in natural order, and the tail rows come from y: y (2w, 1, S) holds
+// [gate 0..w0 | up 0..w0 | gate w0..w | up w0..w] (yt is not read; t <= 64).
+#define LIM  // before common.h: it selects the clamped CLAMP_G / CLAMP_U
 #include "common.h"
-#define LIM
 
 __local__ float64 HB[66];
 
@@ -42,6 +44,19 @@ void main(tensor y, tensor yt, tensor c, tensor sx, tensor ids, tensor hq, tenso
             HB[i / 64] = h;
             amax = v_f32_max_b(amax, v_f32_abs_b(h));
         }
+#ifdef LIN
+        if (t) {
+            // the tail chunk as one vector: h[w0 .. w0 + t) in lanes < t
+            int5 yc = {2 * w0, 0, s, 0, 0}, cc = {2 * w0, e, 0, 0, 0};
+            const float64 gt = v_f32_ld_tnsr_b(yc, y) * v_f32_ld_tnsr_b(cc, c) * xs;
+            yc[0] = 2 * w0 + t; cc[0] = 2 * w0 + t;
+            const float64 up = v_f32_ld_tnsr_b(yc, y) * v_f32_ld_tnsr_b(cc, c) * xs;
+            const float64 h = v_f32_sel_less_f32_b(lanef, (float)t, nl_silus(CLAMP_G(gt)) * CLAMP_U(up), 0.0f);
+            HB[w0 / 64] = h;
+            HB[w0 / 64 + 1] = 0.0f;
+            amax = v_f32_max_b(amax, v_f32_abs_b(h));
+        }
+#else
         if (t) {
             // pack halves of the tail chunk: a = h[w0 .. w0 + t/2), b = h[w0 + t/2 .. w0 + t) (lanes < t/2 valid)
             #pragma unroll 1
@@ -56,16 +71,24 @@ void main(tensor y, tensor yt, tensor c, tensor sx, tensor ids, tensor hq, tenso
                 amax = v_f32_max_b(amax, v_f32_abs_b(h));
             }
         }
+#endif
         NL_REDUCE_MAX(amax, IDX, amax);
-        const float64 sc = v_f32_max_b(amax, 1e-30f) * (1.0f / FP8_MAX);
-        const float64 inv = nl_recip(sc);
+        const float64 sc = token_scale(amax);
+        const float64 inv = token_inv(sc);
         const int q0 = R ? off[1] : 0, q1 = R ? end[1] : (w + 127) >> 7;
         for (int q = q0; q < q1; q++) {
             int5 qc = {128 * q, 0, s, 0, 0};
+#ifdef LIN
+            if (128 * q < w0)
+                v_f8_st_tnsr_partial(qc, hq, pack_lin(HB[2 * q] * inv, HB[2 * q + 1] * inv, 0.0f, 0.0f), 127, 0);
+            else
+                v_f8_st_tnsr_partial(qc, hq, pack_lin(HB[w0 / 64] * inv, 0.0f, 0.0f, 0.0f), t - 1, 0);
+#else
             if (128 * q < w0)
                 v_f8_st_tnsr_partial(qc, hq, pack_nat128(HB[2 * q] * inv, HB[2 * q + 1] * inv), 127, 0);
             else
                 v_f8_st_tnsr_partial(qc, hq, pack_nat128(HB[w0 / 64] * inv, HB[w0 / 64 + 1] * inv), t - 1, 0);
+#endif
             if (q == 0)
                 STORE_TOKEN_SCALE(hs, s, sc)
         }

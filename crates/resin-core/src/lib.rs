@@ -6,6 +6,7 @@
 //! - [`Scheduler`] chooses a phase-homogeneous, key-homogeneous cohort.
 //! - [`schedule_ready_prefix`] freezes each row's current token range.
 //! - [`resources`] owns allocator state and just-in-time batch leases.
+//! - [`timeshare`] divides contended execution time between prefill and decode.
 //!
 //! The KV coordinator is deliberately single-dispatch, so it cannot plan or
 //! lock a future batch before the current lease is released.
@@ -22,9 +23,11 @@ pub mod parallelism;
 mod planning;
 pub mod resources;
 mod scheduler;
+pub mod timeshare;
 
 pub use batch::{SequenceStep, TokenRange};
 pub use ids::RequestId;
 pub use parallelism::{Parallelism, ParallelismError};
 pub use planning::{PlanningConfig, PlanningError, RequestProgress, schedule_ready_prefix};
 pub use scheduler::{Phase, Schedulable, Scheduler, Selection};
+pub use timeshare::{BusySeconds, Clock, DecodeShare, DecodeShareError};

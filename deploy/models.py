@@ -230,6 +230,30 @@ MODEL_SPECS = {
             ("glm5_3_flash-gaudi2-256k", 8, 262_144),
         )
     },
+    # Text only: no vision tower. 8 cards; DSpark drafting with --draft-tokens 1..5.
+    "deepseek_v41-gaudi2": ModelSpec(
+        name="deepseek_v41-gaudi2",
+        family="deepseek_v41",
+        accelerator="gaudi2",
+        checkpoint=Checkpoint(
+            repo_id="deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            revision="1bae0e1088993b9b82de08f59de5be5a34e42170",
+            directory="",
+            required_files=("config.json", "tokenizer.json", "tokenizer_config.json"),
+            patterns=("*.json", "model*.safetensors"),
+        ),
+        model_mount="/models/deepseek-v41-flash-1017",
+        model_volume="resin-deepseek-v41-flash-1017-models-v1",
+        gpu="HL-225",
+        label="deepseek_v41-gaudi2",
+        world_size=8,
+        attn_tp=8,
+        context_length=131_072,
+        max_batch_size=16,
+        draft_tokens=0,
+        prefill_chunk_size=2048,
+        media=False,
+    ),
     # Text only: the GGUF has no Pixtral tower; the tokenizer and chat template come from
     # the official release (its vocabulary equals the GGUF's, id for id).
     "mistral_large4-gaudi2": ModelSpec(
@@ -492,13 +516,14 @@ def _create_gaudi_runner(
     """One Gaudi card per rank, selected by ``hpu:N`` (its accel index) or the first free one."""
     if spec.family == "glm5_3_flash":
         from resin_models_gaudi.glm5_3_flash.runner import (
-            PREFILL_CHUNK_SIZE,
+            PREFILL_CHUNK_SIZES,
             Glm53FlashGaudiRunner,
         )
 
-        if prefill_chunk_size != PREFILL_CHUNK_SIZE:
+        # The runner keeps its compiled prefill widths. The Engine takes the smaller chunk.
+        if prefill_chunk_size not in PREFILL_CHUNK_SIZES:
             raise ValueError(
-                f"{spec.name} prefills in {PREFILL_CHUNK_SIZE}-token chunks"
+                f"{spec.name} prefills in chunks of {', '.join(map(str, PREFILL_CHUNK_SIZES))} tokens"
             )
         # a speculative step near the end of a context writes 2K - 1 positions past it
         lookahead = 2 * draft_tokens - 1 if draft_tokens else 0
@@ -510,6 +535,25 @@ def _create_gaudi_runner(
             max_seq_len=context_length + lookahead,
             num_layers=num_layers,
             mtp=draft_tokens,
+        )
+    if spec.family == "deepseek_v41":
+        from resin_models_gaudi.deepseek_v41.runner import (
+            PREFILL_CHUNK_SIZE,
+            DeepSeekV41GaudiRunner,
+        )
+
+        if prefill_chunk_size != PREFILL_CHUNK_SIZE:
+            raise ValueError(
+                f"{spec.name} prefills in {PREFILL_CHUNK_SIZE}-token chunks"
+            )
+        return DeepSeekV41GaudiRunner(
+            str(checkpoint),
+            groups=groups,
+            card=_gaudi_card(spec, device),
+            max_batch_size=max_batch_size,
+            max_seq_len=context_length + draft_tokens,
+            num_layers=num_layers,
+            draft_tokens=draft_tokens,
         )
     if spec.family == "mistral_large4":
         return _create_mistral_large4_runner(
@@ -525,14 +569,17 @@ def _create_gaudi_runner(
             num_layers=num_layers,
         )
     from resin_models_gaudi.qwen3_5.runner import (
-        PREFILL_CHUNK_SIZE,
+        PREFILL_CHUNK_SIZES,
         Qwen3_5GaudiRunner,
     )
 
     if groups is not None and groups.topology.world_size != 1:
         raise ValueError(f"{spec.name} currently runs on one Gaudi card")
-    if prefill_chunk_size != PREFILL_CHUNK_SIZE:
-        raise ValueError(f"{spec.name} prefills in {PREFILL_CHUNK_SIZE}-token chunks")
+    # The runner keeps its compiled prefill widths. The Engine takes the smaller chunk.
+    if prefill_chunk_size not in PREFILL_CHUNK_SIZES:
+        raise ValueError(
+            f"{spec.name} prefills in chunks of {', '.join(map(str, PREFILL_CHUNK_SIZES))} tokens"
+        )
     card = None
     if device not in (None, "hpu"):
         kind, _, index = str(device).partition(":")
@@ -565,6 +612,10 @@ def gaudi_supports_ranks(spec: ModelSpec) -> bool:
         from resin_models_gaudi.mistral_large4.runner import (
             MistralLarge4GaudiRunner as runner,
         )
+    elif spec.family == "deepseek_v41":
+        from resin_models_gaudi.deepseek_v41.runner import (
+            DeepSeekV41GaudiRunner as runner,
+        )
     else:
         return False
     return runner.parallelism_capabilities.attn_tp
@@ -578,6 +629,11 @@ def check_gaudi_ranks(spec: ModelSpec, checkpoint: Path, ranks: int) -> None:
 
         raw = json.loads((checkpoint / "config.json").read_text())
         RankSlices.of(Glm53Config.from_dict(raw), 0, ranks)
+    elif spec.family == "deepseek_v41":
+        from resin.models.deepseek_v41 import DeepSeekV41Config
+
+        raw = json.loads((checkpoint / "config.json").read_text())
+        DeepSeekV41Config.from_hugging_face(raw).validate_tensor_parallel(ranks)
     else:
         from resin.models.mistral_large4.config import MistralLarge4Config
         from resin_models_gaudi.gguf.reader import GgufModel
@@ -628,9 +684,16 @@ def validate_gaudi_options(
 ) -> None:
     """Raise ValueError for a setting that the preset's runner rejects after the card opens."""
     if spec.family == "glm5_3_flash":
-        from resin_models_gaudi.glm5_3_flash.runner import MAX_BATCH, PREFILL_CHUNK_SIZE
+        from resin_models_gaudi.glm5_3_flash.runner import (
+            MAX_BATCH,
+            PREFILL_CHUNK_SIZES,
+        )
 
-        drafts, chunks = range(4), (PREFILL_CHUNK_SIZE,)
+        drafts, chunks = range(4), PREFILL_CHUNK_SIZES
+    elif spec.family == "deepseek_v41":
+        from resin_models_gaudi.deepseek_v41.runner import MAX_BATCH, PREFILL_CHUNK_SIZE
+
+        drafts, chunks = range(6), (PREFILL_CHUNK_SIZE,)  # DSpark drafts blocks of 5
     elif spec.family == "mistral_large4":
         from resin_models_gaudi.mistral_large4.dspark import DEPTH
         from resin_models_gaudi.mistral_large4.runner import MAX_BATCH
@@ -643,10 +706,10 @@ def validate_gaudi_options(
             )
     else:
         from resin_models_gaudi.qwen3_5.model import DECODE_BUCKETS
-        from resin_models_gaudi.qwen3_5.runner import PREFILL_CHUNK_SIZE
+        from resin_models_gaudi.qwen3_5.runner import PREFILL_CHUNK_SIZES
 
         MAX_BATCH = DECODE_BUCKETS[-1]
-        drafts, chunks = range(4), (PREFILL_CHUNK_SIZE,)
+        drafts, chunks = range(4), PREFILL_CHUNK_SIZES
     if max_batch_size > MAX_BATCH:
         raise ValueError(f"{spec.name} takes a --max-batch-size of {MAX_BATCH} or less")
     if draft_tokens not in drafts:
@@ -654,7 +717,10 @@ def validate_gaudi_options(
             f"{spec.name} takes --draft-tokens {', '.join(map(str, drafts))}, got {draft_tokens}"
         )
     if chunks is not None and prefill_chunk_size not in chunks:
-        raise ValueError(f"{spec.name} takes --prefill-chunk-size {chunks[0]}")
+        raise ValueError(
+            f"{spec.name} takes --prefill-chunk-size {', '.join(map(str, chunks))}, "
+            f"got {prefill_chunk_size}"
+        )
 
 
 def _gaudi_card(spec: ModelSpec, device) -> int | None:

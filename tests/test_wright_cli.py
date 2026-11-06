@@ -160,11 +160,26 @@ def test_llama_flags_reach_the_server(monkeypatch, tmp_path):
     assert "--no-prefix-cache" in argv
 
 
+def test_decode_share_reaches_the_server(monkeypatch, tmp_path):
+    result, argv = run(monkeypatch, tmp_path, "--decode-share", "60:95")
+    assert result.exit_code == 0, result.output
+    assert value(argv, "--decode-share") == "60:95"
+    args = serving.argument_parser().parse_args(argv)
+    assert args.decode_share == (0.6, 0.95)
+
+
 def test_defaults_leave_the_preset_in_charge(monkeypatch, tmp_path):
     result, argv = run(monkeypatch, tmp_path)
     assert result.exit_code == 0, result.output
-    for flag in ("--context-length", "--max-batch-size", "--draft-tokens", "--gpu"):
+    for flag in (
+        "--context-length",
+        "--max-batch-size",
+        "--draft-tokens",
+        "--gpu",
+        "--decode-share",
+    ):
         assert flag not in argv
+    assert serving.argument_parser().parse_args(argv).decode_share == (0.5, 0.9)
     assert value(argv, "--port") == "8080"
     assert "--prefix-cache" in argv
 

@@ -13,6 +13,7 @@ _GGUF_DIRECTORY = "UD-Q4_K_XL"
 _ARCHITECTURES = {
     "qwen3_5": ("qwen3_5-gaudi2", "Qwen3.8-27B"),
     "glm5_next": ("glm5_3_flash-gaudi2", "GLM-5.3-Flash"),
+    "deepseek_v41": ("deepseek_v41-gaudi2", "DeepSeek-V4.1-Flash"),
 }
 # (hidden size, layers) of the dense Qwen3.5 sizes.
 _QWEN_SIZES = {
@@ -42,7 +43,7 @@ class Detected:
 def _safetensors(path: Path, config: dict) -> Detected:
     kind = config.get("model_type") or config.get("text_config", {}).get("model_type")
     if kind not in _ARCHITECTURES:
-        supported = "dense Qwen3.5 and Qwen3.8, GLM-5.3-Flash and Mistral-Large-4"
+        supported = "dense Qwen3.5 and Qwen3.8, GLM-5.3-Flash, DeepSeek-V4.1-Flash and Mistral-Large-4"
         raise DetectionError(
             f"{path}: model type {kind!r} has no Gaudi runner. Wright runs {supported}"
         )

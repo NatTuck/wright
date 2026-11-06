@@ -48,6 +48,7 @@ for `--device`, so we recommend it.
 | Qwen3.8-27B weights | 29 GB |
 | GLM-5.3-Flash weights | 306 GiB |
 | Mistral-Large-4 weights | 564 GiB |
+| DeepSeek-V4.1-Flash weights | 475 GiB |
 
 ## Install
 

@@ -38,6 +38,8 @@ from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params, plan_seeds
 from resin_models_gaudi.synapse.runtime import open_device
 
 PREFILL_CHUNK_SIZE = 4096
+# tokens per Engine prefill step that run as whole launches of the compiled prefill widths
+PREFILL_CHUNK_SIZES = (512, 1024, 2048, PREFILL_CHUNK_SIZE)
 
 
 def score_requests(plan, vocab: int) -> list[ScoreRequest | None]:

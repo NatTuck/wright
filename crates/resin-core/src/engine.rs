@@ -10,6 +10,7 @@ use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources};
+use crate::timeshare::{Clock, DecodeShare, TimeShare};
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
     Selection, SequenceStep, TokenRange, schedule_ready_prefix,
@@ -124,6 +125,9 @@ pub struct SchedulerConfig {
     pub max_batch_tokens: Option<NonZeroU32>,
     pub prefill_chunk_size: NonZeroU32,
     pub schedule_conservativeness: f64,
+    /// Interleave prefill and decode launches while both have work. `None`
+    /// runs every admitted prefill chunk before decode.
+    pub decode_share: Option<DecodeShare>,
 }
 const DEFAULT_PREFILL_CHUNK_SIZE: NonZeroU32 = NonZeroU32::new(8192).unwrap();
 const INITIAL_NEW_TOKEN_RATIO: f64 = 0.7;
@@ -136,6 +140,7 @@ impl Default for SchedulerConfig {
             max_batch_tokens: None,
             prefill_chunk_size: DEFAULT_PREFILL_CHUNK_SIZE,
             schedule_conservativeness: 1.0,
+            decode_share: None,
         }
     }
 }
@@ -474,6 +479,8 @@ impl<P> Schedulable for Request<P> {
 }
 
 type ScheduledRow = SequenceStep;
+/// Selected requests, their identity, and the target decode share under contention.
+type Cohort<'a, P> = (Vec<&'a Request<P>>, Selection, Option<f64>);
 
 struct BatchRow<P> {
     request: Request<P>,
@@ -492,6 +499,8 @@ struct Batch<P> {
     rows: Vec<BatchRow<P>>,
     resources: Option<WriterAccessLease>,
     prepared_at: Option<Instant>,
+    /// The target decode share of a prefill launch that runs against decoding rows.
+    launch_share: Option<f64>,
 }
 
 pub struct EngineCore<P> {
@@ -502,6 +511,7 @@ pub struct EngineCore<P> {
     runner_config: RunnerConfig,
     scheduler: Scheduler<Request<P>>,
     scheduler_config: SchedulerConfig,
+    timeshare: TimeShare,
     new_token_ratio: f64,
     minimum_new_token_ratio: f64,
     new_token_ratio_decay: f64,
@@ -570,6 +580,7 @@ impl<P: Clone> EngineCore<P> {
             runner_config,
             scheduler: Scheduler::new(max_running_requests),
             scheduler_config,
+            timeshare: TimeShare::new(scheduler_config.decode_share),
             new_token_ratio,
             minimum_new_token_ratio,
             new_token_ratio_decay,
@@ -602,6 +613,11 @@ impl<P: Clone> EngineCore<P> {
         Ok(())
     }
 
+    /// Replace the time source of prefill/decode time sharing.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.timeshare.set_clock(clock);
+    }
+
     pub fn metrics_enabled(&self) -> bool {
         self.metrics.is_some()
     }
@@ -626,6 +642,24 @@ impl<P: Clone> EngineCore<P> {
                 .flat_map(|batch| &batch.rows)
                 .filter(|row| !row.terminal)
                 .count();
+        let busy = self.timeshare.busy();
+        snapshot.prefill_busy_seconds = busy.prefill;
+        snapshot.decode_busy_seconds = busy.decode;
+        snapshot.decode_share_target = self.timeshare.share().map(|share| {
+            let decoding = self
+                .scheduler
+                .iter()
+                .filter(|request| request.running && request.phase() == Phase::Decode)
+                .count()
+                + self.in_flight.as_ref().map_or(0, |batch| {
+                    batch
+                        .rows
+                        .iter()
+                        .filter(|row| !row.terminal && row.scheduled.phase == Phase::Decode)
+                        .count()
+                });
+            share.target(decoding, self.scheduler.max_running_requests())
+        });
         Some(snapshot)
     }
     pub fn next_request_id(&self) -> u64 {
@@ -951,6 +985,7 @@ impl<P: Clone> EngineCore<P> {
         let Some((batch, plan)) = self.prepare_batch(runner, phase)? else {
             return Ok(None);
         };
+        self.timeshare.launched(plan.phase, batch.launch_share);
         self.in_flight = Some(batch);
         Ok(Some(plan))
     }
@@ -960,7 +995,7 @@ impl<P: Clone> EngineCore<P> {
     }
 
     pub fn has_continuation(&self) -> bool {
-        self.continuation.is_some() && self.scheduler.is_empty()
+        self.continuation.is_some() && self.queue_allows_continuation()
     }
 
     /// Harvest an enqueued result using the same atomic commit as synchronous execution.
@@ -975,6 +1010,7 @@ impl<P: Clone> EngineCore<P> {
         let Some(mut batch) = self.in_flight.take() else {
             return Err(Error::internal("Engine has no in-flight step to complete"));
         };
+        self.timeshare.returned(output.is_ok());
         // A rejection promises that persistent state is unchanged. Every other
         // execution failure keeps the exact requests and writer lease quarantined.
         let output = match output {
@@ -1001,11 +1037,14 @@ impl<P: Clone> EngineCore<P> {
     /// The caller separately checks that its device runtime supports feedback.
     pub fn retain_continuation(&mut self, plan: &ExecutionPlan<P>) -> bool {
         let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
+        if self.in_flight.is_none() {
+            return false;
+        }
+        let queue_allows = plan.phase == Phase::Decode && self.observe_continuation();
         let Some(batch) = &self.in_flight else {
             return false;
         };
-        let allowed = self.scheduler.is_empty()
-            && plan.phase == Phase::Decode
+        let allowed = queue_allows
             && batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
                 !row.terminal
@@ -1037,7 +1076,7 @@ impl<P: Clone> EngineCore<P> {
     /// the runtime substitutes exact GPU token/position feedback before launch.
     pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
         self.raise_if_open()?;
-        if !self.scheduler.is_empty() {
+        if self.continuation.is_none() || !self.observe_continuation() {
             return Ok(None);
         }
         let Some(template) = &self.continuation else {
@@ -1068,6 +1107,7 @@ impl<P: Clone> EngineCore<P> {
                 *offset = position % layout.block_tokens().get();
             }
         }
+        self.timeshare.launched(Phase::Decode, None);
         Ok(Some(plan))
     }
 
@@ -1088,6 +1128,7 @@ impl<P: Clone> EngineCore<P> {
             .in_flight
             .take()
             .ok_or_else(|| Error::internal("Engine has no in-flight step to continue"))?;
+        self.timeshare.returned(output.is_ok());
         let output = match output {
             // A next forward was already accepted: even a previous-step
             // rejection cannot justify returning its shared writer lease.
@@ -1099,7 +1140,9 @@ impl<P: Clone> EngineCore<P> {
         self.complete_batch(runner, batch, output, make_event, Some(template))
     }
 
-    fn selected_cohort(&self) -> Result<(Vec<&Request<P>>, Selection)> {
+    /// The cohort to dispatch and, when prefill would stop decoding rows, the
+    /// target decode share. Decode runs instead while it is owed time.
+    fn selected_cohort(&self) -> Result<Cohort<'_, P>> {
         let (mut requests, mut selection) = self.scheduler.selected();
         let admitted = self.admission_prefix_len(&requests)?;
         if admitted == 0 {
@@ -1108,7 +1151,67 @@ impl<P: Clone> EngineCore<P> {
             requests.truncate(admitted);
             selection.truncate(admitted);
         }
-        Ok((requests, selection))
+        let target = self.contended_target(&requests);
+        if target.is_some() && self.timeshare.decode_owed() {
+            (requests, selection) = self.scheduler.selected_running_phase(Phase::Decode);
+        }
+        Ok((requests, selection, target))
+    }
+
+    /// The target decode share when the default order would run prefill while
+    /// admitted rows decode.
+    fn contended_target(&self, selected: &[&Request<P>]) -> Option<f64> {
+        let share = self.timeshare.share()?;
+        if selected.first()?.phase() != Phase::Prefill {
+            return None;
+        }
+        let decoding = self
+            .scheduler
+            .iter()
+            .filter(|request| request.is_running() && request.phase() == Phase::Decode)
+            .count();
+        (decoding != 0).then(|| share.target(decoding, self.scheduler.max_running_requests()))
+    }
+
+    /// Whether prefill could run beside an in-flight decode batch: an admitted
+    /// partial prefill, or a waiting request with a free running slot.
+    fn overlap_contended(&self) -> bool {
+        let in_flight = self.in_flight.as_ref().map_or(0, |batch| {
+            batch.rows.iter().filter(|row| !row.terminal).count()
+        });
+        let mut running = in_flight;
+        let mut waiting = false;
+        for request in self.scheduler.iter() {
+            if !request.is_running() {
+                waiting = true;
+            } else if request.phase() == Phase::Prefill {
+                return true;
+            } else {
+                running += 1;
+            }
+        }
+        waiting && running < self.scheduler.max_running_requests()
+    }
+
+    /// Whether queued requests let an in-flight decode batch continue. Without
+    /// a decode share, any queued request drains it. With one, decode continues
+    /// until prefill is due.
+    fn queue_allows_continuation(&self) -> bool {
+        if self.scheduler.is_empty() {
+            return true;
+        }
+        if self.timeshare.share().is_none() {
+            return false;
+        }
+        !self.overlap_contended() || self.timeshare.decode_owed()
+    }
+
+    fn observe_continuation(&mut self) -> bool {
+        if self.timeshare.share().is_some() {
+            let contended = self.overlap_contended();
+            self.timeshare.observe(contended);
+        }
+        self.queue_allows_continuation()
     }
 
     /// Read-only proposal using the same admission fallback as actual dispatch.
@@ -1134,8 +1237,8 @@ impl<P: Clone> EngineCore<P> {
             return Ok(None);
         }
 
-        let (scheduled_rows, selection) = {
-            let (selected_requests, mut selection) = self.selected_cohort()?;
+        let (scheduled_rows, selection, contended, launch_share) = {
+            let (selected_requests, mut selection, target) = self.selected_cohort()?;
             if selected_requests.is_empty() {
                 return Ok(None);
             }
@@ -1164,8 +1267,12 @@ impl<P: Clone> EngineCore<P> {
                 ));
             }
             selection.truncate(scheduled_rows.len());
-            (scheduled_rows, selection)
+            let launch_share = target.filter(|_| selected_requests[0].phase() == Phase::Prefill);
+            (scheduled_rows, selection, target.is_some(), launch_share)
         };
+        if self.timeshare.share().is_some() {
+            self.timeshare.observe(contended);
+        }
         let batch_id = self.next_batch_id;
         self.next_batch_id = self
             .next_batch_id
@@ -1279,6 +1386,7 @@ impl<P: Clone> EngineCore<P> {
         };
         let batch = Batch {
             prepared_at: self.metrics.as_ref().map(|_| Instant::now()),
+            launch_share,
             rows: scheduled
                 .into_iter()
                 .zip(scheduled_rows)
@@ -1905,6 +2013,7 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn quarantine<T>(&mut self, batch: Batch<P>, stage: &str, error: Error) -> Result<T> {
+        self.timeshare.clear_launches();
         self.quarantined = Some(batch);
         self.poison(stage, &error);
         Err(error)

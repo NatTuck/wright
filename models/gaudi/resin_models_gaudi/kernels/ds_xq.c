@@ -5,6 +5,7 @@
 //   s_t = max|x_t| / 240;  q = fp8(x_t / s_t).
 // Each member takes 256 elements of one token (and reads the whole token for the max).
 // tensors: 0 x (H, T) f32 | 1 q (H, 1, R*T) fp8  2 s (1, T) f32.  params: R.  index space: [H/256, T]
+// LIN (ds_xq_lin.c): q in natural order.
 #include "common.h"
 
 void main(tensor x, tensor q, tensor s, int R)
@@ -22,13 +23,17 @@ void main(tensor x, tensor q, tensor s, int R)
         }
         float64 amax;
         NL_REDUCE_MAX(v_f32_max_b(a0, a1), IDX, amax);
-        const float64 sc = v_f32_max_b(amax, 1e-30f) * (1.0f / FP8_MAX);
-        const float64 inv = nl_recip(sc);
+        const float64 sc = token_scale(amax);
+        const float64 inv = token_inv(sc);
         for (int b = off[0]; b < end[0]; b++) {
             for (int i = 256 * b; i < 256 * b + 256; i += 128) {
                 c[0] = i;       const float64 va = v_f32_ld_tnsr_b(c, x) * inv;
                 c[0] = i + 64;  const float64 vb = v_f32_ld_tnsr_b(c, x) * inv;
+#ifdef LIN
+                const minifloat256 p = pack_lin(va, vb, 0.0f, 0.0f);
+#else
                 const minifloat256 p = pack_nat128(va, vb);
+#endif
                 for (int k = 0; k < R; k++) {
                     int5 qc = {i, 0, t * R + k, 0, 0};
                     v_f8_st_tnsr_partial(qc, q, p, 127, 0);

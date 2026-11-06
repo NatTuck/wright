@@ -22,6 +22,8 @@ static inline float64 score_fn(float64 x)
 #endif
 #define GONE -3.0e38f
 
+__local__ float64 SG[NV];
+
 void main(tensor lg, tensor bias, tensor meta, tensor ids, tensor wts, int K, int E, float scale)
 {
     const int5 off = get_index_space_offset();
@@ -39,10 +41,14 @@ void main(tensor lg, tensor bias, tensor meta, tensor ids, tensor wts, int K, in
     const float Ef = (float)E;
     for (int t = off[0]; t < end[0]; t++) {
         float64 sg[NV], v[NV];
-        #pragma unroll
+        #pragma unroll 1
         for (int j = 0; j < NV; j++) {
             int5 c = {64 * j, t, 0, 0, 0};
-            sg[j] = score_fn(v_f32_ld_tnsr_b(c, lg));
+            SG[j] = score_fn(v_f32_ld_tnsr_b(c, lg));
+        }
+        #pragma unroll
+        for (int j = 0; j < NV; j++) {
+            sg[j] = SG[j];
             v[j] = v_f32_sel_less_f32_b(lanef + (float)(64 * j), Ef, sg[j] + bv[j], (float64)GONE);
         }
         float64 selw = 0.0f, seli = 0.0f;

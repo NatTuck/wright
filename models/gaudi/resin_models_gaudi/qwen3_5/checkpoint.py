@@ -157,6 +157,8 @@ def tau_perm(n: int) -> np.ndarray:
 
 def _permute_k(w: np.ndarray, groups: int, inner: int) -> np.ndarray:
     m, k = w.shape
+    if k % (groups * inner):
+        raise ValueError(f"K {k} is not a multiple of {groups * inner}: pad it first")
     out = np.empty((m, k), w.dtype)
     rows, step = _row_chunks(m)
 

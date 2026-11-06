@@ -34,18 +34,25 @@ void main(tensor score, tensor vis, tensor thr, int KS)
             for (int it = 0; it < 32; it++) {
                 const uint64 d = hi - lo;
                 const uint64 mid = lo + v_u32_shr_b(d, (int64)1) + (d & (uint64)1);
-                float64 c0 = 0.0f, c1 = 0.0f;
-                for (int j = 0; j < lim; j += 128) {
+                // four vectors per iteration (the counts are integers, exact in any order)
+                float64 c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+                for (int j = 0; j < lim; j += 256) {
                     int5 sc = {j, c, 0, 0, 0};
                     const uint64 k0 = mkey(v_f32_ld_tnsr_b(sc, score));
                     sc[0] = j + 64;
                     const uint64 k1 = mkey(v_f32_ld_tnsr_b(sc, score));
-                    const float64 r0 = lanef + (float)j, r1 = r0 + 64.0f;
+                    sc[0] = j + 128;
+                    const uint64 k2 = mkey(v_f32_ld_tnsr_b(sc, score));
+                    sc[0] = j + 192;
+                    const uint64 k3 = mkey(v_f32_ld_tnsr_b(sc, score));
+                    const float64 r0 = lanef + (float)j;
                     c0 += v_f32_sel_less_f32_b(r0, limf, as_float64(v_u32_sel_less_u32_b(k0, mid, (uint64)0, one)), 0.0f);
-                    c1 += v_f32_sel_less_f32_b(r1, limf, as_float64(v_u32_sel_less_u32_b(k1, mid, (uint64)0, one)), 0.0f);
+                    c1 += v_f32_sel_less_f32_b(r0 + 64.0f, limf, as_float64(v_u32_sel_less_u32_b(k1, mid, (uint64)0, one)), 0.0f);
+                    c2 += v_f32_sel_less_f32_b(r0 + 128.0f, limf, as_float64(v_u32_sel_less_u32_b(k2, mid, (uint64)0, one)), 0.0f);
+                    c3 += v_f32_sel_less_f32_b(r0 + 192.0f, limf, as_float64(v_u32_sel_less_u32_b(k3, mid, (uint64)0, one)), 0.0f);
                 }
                 float64 tot;
-                NL_REDUCE_ADD(c0 + c1, IDX, tot);
+                NL_REDUCE_ADD((c0 + c1) + (c2 + c3), IDX, tot);
                 const float64 ok = v_f32_sel_less_f32_b(tot, (float)KS, 0.0f, 1.0f);  // >= KS at or above mid
                 lo = as_uint64(v_f32_sel_eq_f32_b(ok, 1.0f, as_float64(mid), as_float64(lo)));
                 hi = as_uint64(v_f32_sel_eq_f32_b(ok, 1.0f, as_float64(hi), as_float64(mid - (uint64)1)));

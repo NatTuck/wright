@@ -526,7 +526,10 @@ def test_ix_list(device, recipes, NM):
         want = np.concatenate([pos[k > th], pos[k == th]])[:KS]
         n = len(want)
         np.testing.assert_array_equal(out["list"][c, :n], want, err_msg=f"column {c}")
-        rec = [0 if vis[c] else -1, H * c, KS, 0, n, c, 0, 0]
+        # lane 7 (one member per column): the position of the last tie listed, every tie, or none
+        st, ties = int((k > th).sum()), pos[k == th]
+        cut = 0x7FFFFFFF if st + len(ties) <= KS else -1 if st >= KS else int(ties[KS - st - 1])
+        rec = [0 if vis[c] else -1, H * c, KS, 0, n, c, 0, cut if NM == 1 else 0]
         np.testing.assert_array_equal(out["slots"][c], rec, err_msg=f"column {c}")
 
 

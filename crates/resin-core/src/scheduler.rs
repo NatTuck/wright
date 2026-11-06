@@ -37,6 +37,8 @@ struct SelectedIdentity {
 pub struct Selection {
     epoch: u64,
     selected: Vec<SelectedIdentity>,
+    /// `Some` for a running cohort of one phase that a time-share policy chose.
+    phase: Option<Phase>,
 }
 
 impl Selection {
@@ -94,16 +96,27 @@ impl<T: Schedulable> Scheduler<T> {
 
     pub fn selected(&self) -> (Vec<&T>, Selection) {
         let selected = self.selected_identities();
-        self.selection(selected)
+        self.selection(selected, None)
     }
 
     /// Select already-admitted work without considering waiting requests.
     pub fn selected_running(&self) -> (Vec<&T>, Selection) {
         let selected = self.running_identities();
-        self.selection(selected)
+        self.selection(selected, None)
     }
 
-    fn selection(&self, selected: Vec<SelectedIdentity>) -> (Vec<&T>, Selection) {
+    /// Select the admitted cohort of one phase, even when the default order
+    /// would run the other phase first.
+    pub fn selected_running_phase(&self, phase: Phase) -> (Vec<&T>, Selection) {
+        let selected = self.running_phase_identities(phase);
+        self.selection(selected, Some(phase))
+    }
+
+    fn selection(
+        &self,
+        selected: Vec<SelectedIdentity>,
+        phase: Option<Phase>,
+    ) -> (Vec<&T>, Selection) {
         let items = selected
             .iter()
             .map(|identity| &self.ready[identity.index])
@@ -113,6 +126,7 @@ impl<T: Schedulable> Scheduler<T> {
             Selection {
                 epoch: self.epoch,
                 selected,
+                phase,
             },
         )
     }
@@ -122,14 +136,16 @@ impl<T: Schedulable> Scheduler<T> {
             selection.epoch, self.epoch,
             "ready queue changed after its dispatch cohort was selected"
         );
-        let current = self.selected_identities();
-        let running = self.running_identities();
         let matches = |candidate: &[SelectedIdentity]| {
             selection.selected.len() <= candidate.len()
                 && selection.selected == candidate[..selection.selected.len()]
         };
+        let matched = match selection.phase {
+            Some(phase) => matches(&self.running_phase_identities(phase)),
+            None => matches(&self.selected_identities()) || matches(&self.running_identities()),
+        };
         assert!(
-            matches(&current) || matches(&running),
+            matched,
             "selected dispatch cohort no longer matches the ready queue"
         );
 
@@ -345,6 +361,29 @@ impl<T: Schedulable> Scheduler<T> {
                 item.is_running() && item.batch_key() == anchor_key && item.phase() == anchor_phase
             })
             .take(limit)
+            .map(|(index, item)| SelectedIdentity {
+                index,
+                turn: item.turn_ordinal(),
+            })
+            .collect()
+    }
+
+    fn running_phase_identities(&self, phase: Phase) -> Vec<SelectedIdentity> {
+        let Some(anchor) = self
+            .ready
+            .iter()
+            .find(|item| item.is_running() && item.phase() == phase)
+        else {
+            return Vec::new();
+        };
+        let anchor_key = anchor.batch_key();
+        self.ready
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.is_running() && item.batch_key() == anchor_key && item.phase() == phase
+            })
+            .take(self.max_running_requests.get())
             .map(|(index, item)| SelectedIdentity {
                 index,
                 turn: item.turn_ordinal(),
@@ -694,6 +733,71 @@ mod tests {
 
         scheduler.restore_rejected(taken);
         assert_eq!(ready_id_turns(&scheduler), original);
+    }
+
+    #[test]
+    fn decode_cohort_can_run_ahead_of_an_admitted_partial_prefill() {
+        let mut decoding = item(0, 0, None, Phase::Decode);
+        decoding.running = true;
+        let mut partial = item(1, 0, None, Phase::Prefill);
+        partial.running = true;
+        let mut other = item(2, 0, None, Phase::Decode);
+        other.running = true;
+        let mut scheduler = scheduler(
+            4,
+            vec![decoding, partial, other, item(3, 0, None, Phase::Prefill)],
+        );
+        assert_eq!(selected_ids(&scheduler), vec![1, 3]);
+        let original = ready_id_turns(&scheduler);
+
+        let (selected, selection) = scheduler.selected_running_phase(Phase::Decode);
+        assert_eq!(
+            selected.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        let taken = scheduler.take_selected(selection);
+        assert_eq!(ready_ids(&scheduler), vec![1, 3]);
+        scheduler.restore_rejected(taken);
+        assert_eq!(ready_id_turns(&scheduler), original);
+
+        let (_, selection) = scheduler.selected_running_phase(Phase::Decode);
+        let survivors = scheduler.take_selected(selection);
+        scheduler.requeue_survivors(survivors);
+        assert_eq!(ready_ids(&scheduler), vec![0, 1, 2, 3]);
+        assert_eq!(selected_ids(&scheduler), vec![1, 3]);
+    }
+
+    #[test]
+    fn phase_selection_keeps_one_batch_key() {
+        let mut first = item(0, 0, Some(1), Phase::Decode);
+        first.running = true;
+        let mut second = item(1, 0, Some(2), Phase::Decode);
+        second.running = true;
+        let mut third = item(2, 0, Some(1), Phase::Decode);
+        third.running = true;
+        let scheduler = scheduler(4, vec![first, second, third]);
+        let (selected, _) = scheduler.selected_running_phase(Phase::Decode);
+        assert_eq!(
+            selected.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!(
+            scheduler
+                .selected_running_phase(Phase::Prefill)
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "selected dispatch cohort no longer matches")]
+    fn phase_selection_is_checked_against_its_own_phase() {
+        let mut decoding = item(0, 0, None, Phase::Decode);
+        decoding.running = true;
+        let mut scheduler = scheduler(2, vec![decoding, item(1, 0, None, Phase::Prefill)]);
+        let (_, mut selection) = scheduler.selected();
+        selection.phase = Some(Phase::Decode);
+        let _ = scheduler.take_selected(selection);
     }
 
     #[test]

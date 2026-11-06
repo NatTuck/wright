@@ -212,21 +212,32 @@ class LayerGraph:
     def site(self, X: Tensor, tag: str) -> Tensor:
         """this sub-layer's mHC coefficients ``c_out`` (T, 24)"""
         H, T = self.d.hidden, self.T
-        mix = self.tensor((T, 32), F32)
         fn = self.input(tag + "_fn", (NS * H, 32), F32)
+        C = 5  # K chunks of the one-token projection
+        if T == 1 and self._rt is None and (NS * H) % (256 * C) == 0:
+            # one token: the projection in K chunks, then the comb matrix in lanes
+            mixp, ssp = self.tensor((32, C), F32), self.tensor((C,), F32)
+            self.node("rg_mhc_mixp_f32", [fn, X], [mixp, ssp])
+            coef = self.input("c_out", (24,), F32)
+            self.node(
+                "rg_mhc_coef1_f32",
+                [mixp, ssp, self.input(tag + "_base", (24,), F32), self.input(tag + "_scale", (3,), F32)],
+                [coef],
+                struct.pack("iffi", self.d.hc_iters, self.d.hc_eps, self.d.eps, NS * H),
+            )
+            return coef
+        mix = self.tensor((T, 32), F32)
         if self._rt is not None:
             rt = self._rt
             self.node("gemm", [fn, X], [mix], GEMM_NT)
         else:
             rt = self.tensor((64, T), F32)
-            self.node("rg_mhc_mix_f32", [fn, X], [mix, rt], struct.pack("f", self.d.eps))
+            mix_guid = "rg_mhc_mix1_f32" if T <= 2 else "rg_mhc_mix_f32"  # T <= 2: the small build
+            self.node(mix_guid, [fn, X], [mix, rt], struct.pack("f", self.d.eps))
+        params = struct.pack("if", self.d.hc_iters, self.d.hc_eps)
+        base, scale = self.input(tag + "_base", (24,), F32), self.input(tag + "_scale", (3,), F32)
         coef = self.input("c_out", (T, 24), F32)
-        self.node(
-            "rg_mhc_coef_f32",
-            [mix, rt, self.input(tag + "_base", (24,), F32), self.input(tag + "_scale", (3,), F32)],
-            [coef],
-            struct.pack("if", self.d.hc_iters, self.d.hc_eps),
-        )
+        self.node("rg_mhc_coef_f32", [mix, rt, base, scale], [coef], params)
         return coef
 
     def collapse(self, X: Tensor, coef: Tensor, ln: str, q8: int = 0, mode: int = 0):

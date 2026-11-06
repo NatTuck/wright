@@ -111,6 +111,7 @@ def server_arguments(
     port: int = 8080,
     cache_prompt: bool = True,
     overlap: bool = True,
+    decode_share: str | None = None,
     drain_timeout: float = 30.0,
     stream_interval: int = 1,
     request_queue_capacity: int = 1024,
@@ -137,6 +138,7 @@ def server_arguments(
         ("--load-threads", load_threads),
         ("--gpu-memory-utilization", gpu_memory_utilization),
         ("--spin-wait", spin_wait),
+        ("--decode-share", decode_share),
     ):
         if value is not None:
             line += [flag, str(value)]
@@ -209,7 +211,8 @@ def serve(
             "-b",
             "--batch-size",
             metavar="N",
-            help="Tokens per prefill chunk. (default: the model's)",
+            help="Tokens per prefill chunk. A smaller chunk stops decode for a shorter time. "
+            "(default: the model's)",
             rich_help_panel=_LOAD,
         ),
     ] = None,
@@ -349,6 +352,16 @@ def serve(
             rich_help_panel=_WRIGHT,
         ),
     ] = True,
+    decode_share: Annotated[
+        str | None,
+        typer.Option(
+            metavar="MIN[:MAX]",
+            help="Percent of card time for decode while a prompt prefills: MIN with no "
+            "sequence in decode, up to MAX when every batch position decodes. One number "
+            "fixes it. 0 runs each prompt's whole prefill before decode. (default: 50:90)",
+            rich_help_panel=_WRIGHT,
+        ),
+    ] = None,
     drain_timeout: Annotated[
         float,
         typer.Option(
@@ -428,6 +441,7 @@ def serve(
         port=port,
         cache_prompt=cache_prompt,
         overlap=overlap,
+        decode_share=decode_share,
         drain_timeout=drain_timeout,
         stream_interval=stream_interval,
         request_queue_capacity=request_queue_capacity,

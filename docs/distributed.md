@@ -312,8 +312,8 @@ groups.close()
 
 Gaudi runners have no Torch device and no NCCL. The default world and every group run on
 Gloo: `ParallelGroups.create(topology, device_backend="gloo")`. The runner owns its device
-communicator. `resin_models_gaudi.mistral_large4` and `glm5_3_flash` make one HCCL communicator per attention
-replica. Rank 0 of the replica creates the HCCL id and broadcasts it over the replica's Gloo
+communicator. `resin_models_gaudi.mistral_large4`, `glm5_3_flash`, and `deepseek_v41` make one HCCL communicator per
+attention replica. Rank 0 of the replica creates the HCCL id and broadcasts it over the replica's Gloo
 group. The ranks join their partial results between the step's launches.
 
 - **Plain `forward(plan)`.** The runner is TP-only, so every rank receives the same plan,

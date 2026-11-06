@@ -18,6 +18,7 @@ from deploy.gaudi_cli import (
     add_gaudi_arguments,
     apply_gaudi_arguments,
     check_listen_address,
+    decode_share,
     describe_settings,
     nonnegative_int,
     positive_int,
@@ -47,6 +48,12 @@ EXIT_STOPPED = 79
 _WORKSPACE_BYTES = 3 << 30
 # Rank 0 and its followers need this long to shut down after the drain.
 _SHUTDOWN_SECONDS = 60.0
+
+
+def batch_tokens(runner, prefill_chunk_size: int) -> int:
+    """Prefill tokens per step, for all rows together: no more than one chunk."""
+    limit = getattr(runner.runner_config, "max_batch_tokens", None)
+    return prefill_chunk_size if limit is None else min(limit, prefill_chunk_size)
 
 
 def current_device_free() -> int:
@@ -198,8 +205,10 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prefill-chunk-size",
         type=positive_int,
-        help="tokens per prefill chunk (default: the preset's; Mistral-Large-4 on Gaudi takes "
-        "a power of two >= 1024, its widest launch, sized at startup)",
+        help="tokens per prefill chunk. A smaller chunk stops decode for a shorter time "
+        "(default: the preset's; Qwen3.8-27B takes 512, 1024, 2048 or 4096, GLM-5.3-Flash "
+        "1024, 2048 or 4096, Mistral-Large-4 a power of two >= 1024, its widest launch, sized "
+        "at startup)",
     )
     parser.add_argument(
         "--draft-tokens",
@@ -222,6 +231,15 @@ def argument_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="start the next decode step while the card runs the current step",
+    )
+    parser.add_argument(
+        "--decode-share",
+        type=decode_share,
+        default="50:90",
+        metavar="MIN[:MAX]",
+        help="percent of card time for decode while a prompt prefills: MIN with no sequence "
+        "in decode, up to MAX when every batch position decodes. One number fixes it. 0 runs "
+        "each prompt's whole prefill before decode (default: %(default)s)",
     )
     parser.add_argument(
         "--prefix-cache",
@@ -355,10 +373,9 @@ def _serve_one(args, spec, device: str) -> None:
             prefix_cache=args.prefix_cache,
             enable_overlap=args.overlap,
             scheduler_config=SchedulerConfig(
-                max_batch_tokens=getattr(
-                    runner.runner_config, "max_batch_tokens", prefill_chunk_size
-                ),
+                max_batch_tokens=batch_tokens(runner, prefill_chunk_size),
                 prefill_chunk_size=prefill_chunk_size,
+                decode_share=args.decode_share,
             ),
         )
         report_kv_pool(runner, engine, 1, context_length, max_batch_size)
@@ -447,6 +464,7 @@ def serve_gaudi_ranks(parser, args, spec) -> None:
         prefill_chunk_size=args.prefill_chunk_size or spec.prefill_chunk_size,
         draft_tokens=draft_tokens,
         overlap=args.overlap,
+        decode_share=args.decode_share,
         prefix_cache=args.prefix_cache,
         stream_interval=args.stream_interval,
         request_queue_capacity=args.request_queue_capacity,
@@ -588,12 +606,9 @@ def _serve_claimed_rank(rank: int, options: dict, claim) -> None:
             enable_overlap=options["overlap"]
             and callable(getattr(runner, "enqueue", None)),
             scheduler_config=SchedulerConfig(
-                max_batch_tokens=getattr(
-                    runner.runner_config,
-                    "max_batch_tokens",
-                    options["prefill_chunk_size"],
-                ),
+                max_batch_tokens=batch_tokens(runner, options["prefill_chunk_size"]),
                 prefill_chunk_size=options["prefill_chunk_size"],
+                decode_share=options["decode_share"],
             ),
         )
         report_kv_pool(

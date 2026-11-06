@@ -8,6 +8,7 @@
 ![Model: Qwen3.8-27B FP8](https://img.shields.io/badge/model-Qwen3.8--27B%20FP8-6E40C9?style=for-the-badge)
 ![Model: Mistral-Large-4 GGUF](https://img.shields.io/badge/model-Mistral--Large--4%20GGUF-6E40C9?style=for-the-badge)
 ![Model: GLM-5.3-Flash FP8](https://img.shields.io/badge/model-GLM--5.3--Flash%20FP8-6E40C9?style=for-the-badge)
+![Model: DeepSeek-V4.1-Flash FP4 and FP8](https://img.shields.io/badge/model-DeepSeek--V4.1--Flash%20FP4%20and%20FP8-6E40C9?style=for-the-badge)
 ![Model: Qwen3.5 0.8B to 9B FP8](https://img.shields.io/badge/model-Qwen3.5%200.8B%20to%209B%20FP8-6E40C9?style=for-the-badge)
 ![License: Apache 2.0 and PolyForm Noncommercial](https://img.shields.io/badge/license-Apache%202.0%20%2B%20PolyForm%20Noncommercial-555555?style=for-the-badge)
 [![Discord: Unofficial Gaudi](https://img.shields.io/badge/discord-Unofficial%20Gaudi-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/SXJcQM79j4)
@@ -32,6 +33,13 @@
 <td align="center"><h3>130 tok/s</h3>decode, 1 request<br><sub>MTP-1, 1K context</sub></td>
 <td align="center"><h3>387 tok/s</h3>decode, 16 requests<br><sub>no drafts, 1K context</sub></td>
 <td align="center"><h3>4.3K tok/s</h3>prefill<br><sub>4K prompt</sub></td>
+<td align="center"><h3>0</h3>compilations after startup<br><sub>from the server log</sub></td>
+</tr>
+<tr><th colspan="4">DeepSeek-V4.1-Flash, 8 HL-225 cards</th></tr>
+<tr>
+<td align="center"><h3>126 tok/s</h3>decode, 1 request<br><sub>DSpark-3, 1K prompt</sub></td>
+<td align="center"><h3>257 tok/s</h3>decode, 8 requests<br><sub>mostly no drafts, 1K prompt</sub></td>
+<td align="center"><h3>4.0K tok/s</h3>prefill<br><sub>4K prompt</sub></td>
 <td align="center"><h3>0</h3>compilations after startup<br><sub>from the server log</sub></td>
 </tr>
 </table>
@@ -65,6 +73,7 @@ It just felt Wright.
 | Qwen3.8-27B | FP8 safetensors | 1 | 🟢 Lab Ready | Throughput sweep, GPQA Diamond |
 | Mistral-Large-4 | `UD-Q4_K_XL` GGUF | 8 | 🟢 Lab Ready | Throughput sweep, GPQA Diamond on 155 of 198 questions |
 | GLM-5.3-Flash | FP8 safetensors | 4 or 8 | 🟢 Lab Ready | Throughput sweep, GPQA Diamond |
+| DeepSeek-V4.1-Flash | FP4 and FP8 safetensors | 8 | 🟡 In Testing | Server check, throughput with 1 to 8 requests |
 | Qwen3.5-9B | FP8 safetensors from a third party | 1 | 🟡 In Testing | Server check, throughput with 1 and 8 requests |
 | Qwen3.5-4B | FP8 safetensors from a third party | 1 | 🟡 In Testing | Server check, throughput with 1 and 8 requests |
 | Qwen3.5-2B | FP8 safetensors from a third party | 1 | 🟡 In Testing | Server check, throughput with 1 and 8 requests |
@@ -80,15 +89,15 @@ It just felt Wright.
 
 Wright supports inference on the models in [Supported models](#supported-models).
 
-| Item | Qwen3.8-27B | Mistral-Large-4 | GLM-5.3-Flash | Qwen3.5 0.8B to 9B |
-|---|---|---|---|---|
-| **Preset** | `qwen3_5-gaudi2` | `mistral_large4-gaudi2` | `glm5_3_flash-gaudi2`, `-tp4`, `-256k` | `qwen3_5-0.8b-gaudi2`, `-2b-`, `-4b-`, `-9b-` |
-| **Weights** | FP8 safetensors | `UD-Q4_K_XL` GGUF | FP8 safetensors | FP8 safetensors from `surogate` |
-| **Cards** | 1 | 8 | 8, or 4 with `-tp4` | 1 |
-| **Default maximum batch** | 32 sequences | 16 sequences | 16 sequences | 32 sequences |
-| **Default context** | 32,768 tokens | 65,536 tokens | 65,536 tokens, 32,768 with `-tp4`, 262,144 with `-256k` | 32,768 tokens |
-| **Speculative decoding** | MTP with 2 draft tokens, on by default | DSpark with 3 draft tokens, off by default | MTP with up to 3 draft tokens, off by default | MTP, off by default. Needs the MTP weights from the official checkpoint |
-| **Chat recipe** | `qwen3_8` | `mistral_large4` | `glm5_3_flash` | `qwen3_5`. 0.8B and 2B start with thinking off |
+| Item | Qwen3.8-27B | Mistral-Large-4 | GLM-5.3-Flash | DeepSeek-V4.1-Flash | Qwen3.5 0.8B to 9B |
+|---|---|---|---|---|---|
+| **Preset** | `qwen3_5-gaudi2` | `mistral_large4-gaudi2` | `glm5_3_flash-gaudi2`, `-tp4`, `-256k` | `deepseek_v41-gaudi2` | `qwen3_5-0.8b-gaudi2`, `-2b-`, `-4b-`, `-9b-` |
+| **Weights** | FP8 safetensors | `UD-Q4_K_XL` GGUF | FP8 safetensors | FP4 and FP8 safetensors | FP8 safetensors from `surogate` |
+| **Cards** | 1 | 8 | 8, or 4 with `-tp4` | 8 | 1 |
+| **Default maximum batch** | 32 sequences | 16 sequences | 16 sequences | 16 sequences | 32 sequences |
+| **Default context** | 32,768 tokens | 65,536 tokens | 65,536 tokens, 32,768 with `-tp4`, 262,144 with `-256k` | 131,072 tokens | 32,768 tokens |
+| **Speculative decoding** | MTP with 2 draft tokens, on by default | DSpark with 3 draft tokens, off by default | MTP with up to 3 draft tokens, off by default | DSpark from the checkpoint with up to 5 draft tokens on batches of up to 2 sequences, off by default | MTP, off by default. Needs the MTP weights from the official checkpoint |
+| **Chat recipe** | `qwen3_8` | `mistral_large4` | `glm5_3_flash` | `deepseek_v41` | `qwen3_5`. 0.8B and 2B start with thinking off |
 
 Wright uses the Synapse graph compiler and custom TPC-C kernels directly. The models do not run on
 PyTorch. The multi-card presets use CPU-only `torch` for one thing: the Gloo control plane between
@@ -111,8 +120,8 @@ Wright has these features:
 | **One compile phase** | Wright compiles all graphs at startup. Context lengths, device addresses, and sampling values are not part of a graph. |
 | **KV cache** | Sequences keep key and value (KV) rows in pages of one paged device arena. |
 | **Prefix cache** | A new request can reuse a cached prefix at each prefix cache boundary of the model. |
-| **Speculative decoding** | The Qwen models and GLM-5.3-Flash use multi-token prediction (MTP). Mistral-Large-4 can use a DSpark drafter. Greedy and seeded decoding gives the same tokens as decoding without drafts. |
-| **Multiple cards** | Mistral-Large-4 and GLM-5.3-Flash run one process on each card. All processes run the same batch and sample the same tokens. |
+| **Speculative decoding** | The Qwen models and GLM-5.3-Flash use multi-token prediction (MTP). Mistral-Large-4 can use a DSpark drafter. DeepSeek-V4.1-Flash uses the DSpark layers of its checkpoint. Greedy and seeded decoding gives the same tokens as decoding without drafts. |
+| **Multiple cards** | Mistral-Large-4, GLM-5.3-Flash, and DeepSeek-V4.1-Flash run one process on each card. All processes run the same batch and sample the same tokens. |
 | **Card selection** | Each process takes a free card from the `--device` list, and skips busy cards. |
 | **Clean stop** | On SIGTERM, the server stops new connections, and requests in flight can finish. |
 | **Overlap** | The host starts the next decode step while the card runs the current step. |
@@ -126,6 +135,7 @@ Wright has these limits:
 - The Qwen models run on one card. Wright does not split these models across cards.
 - The full Mistral-Large-4 model needs 8 cards. On 4 cards, its weights do not fit in card memory.
 - GLM-5.3-Flash needs 4 or 8 cards.
+- DeepSeek-V4.1-Flash needs 8 cards.
 - A different number of cards can give different tokens for one request. A different set of cards
   with the same number gives the same tokens.
 - A sampled token can have a maximum of 64 top logprobs.
@@ -141,8 +151,9 @@ runs [llama-benchy](https://github.com/eugr/llama-benchy) against it at each con
 number of requests. The prompts are English text from a public domain book. The sampling uses the
 values of each checkpoint, with thinking off or low reasoning. The Qwen3.5 dense checkpoints have
 no sampling values, so they use the values of their model cards. Each request generates 256 tokens, the prompt
-fills the rest of the context, and the prefix cache is off. The results use HL-225 cards,
-Synapse 1.24.1, and the pinned checkpoints. The dates are in UTC−7.
+fills the rest of the context, and the prefix cache is off. For the DeepSeek-V4.1-Flash results,
+llama-benchy sent prompts of fixed lengths to a server that started before the run. The
+DeepSeek-V4.1-Flash section gives the settings. The results use HL-225 cards, Synapse 1.24.1, and the pinned checkpoints. The dates are in UTC−7.
 
 - **Prefill** is the prompt tokens per second of one request, up to its first token.
 - **Decode** is the total of generated tokens per second for all requests together.
@@ -157,8 +168,10 @@ Synapse 1.24.1, and the pinned checkpoints. The dates are in UTC−7.
 >
 > In agentic workloads, each turn adds to a context that the server has already seen. This is
 > generally not a problem there: the prefix cache holds the earlier context, so each turn prefills
-> little more than the new tokens. Work is under way to let the scheduler divide time between
-> prefill and decode in smaller slices.
+> little more than the new tokens. The sweep ran before Wright divided the card time between
+> prefill and decode. Its results are the same as with `--decode-share 0`. The DeepSeek-V4.1-Flash
+> results use `--decode-share 25:99`. Refer to
+> [Prefill stops decode for one chunk](#prefill-stops-decode-for-one-chunk).
 
 [`docs/performance.md`](docs/performance.md) has all the results and the commands that make them.
 
@@ -317,6 +330,45 @@ and the model's default reasoning, which is Max. The last column shows the
 - **Run settings:** Both runs used 8 cards, no drafts, 16 requests at the same time, and 131,072
   tokens of context.
 
+### DeepSeek-V4.1-Flash
+
+#### Throughput
+
+These results are from 2026-11-05, on 8 cards, with DSpark-3. The server used 512,000 tokens of
+context, a batch of 8 (`-np 8`), and `--decode-share 25:99`. Each prompt has 1K, 4K, or 32K tokens.
+Each request generates a maximum of 1,024 tokens.
+
+| Prompt | Prefill | Decode, 1 request, DSpark-3 | Decode, 8 requests | Peak, 8 requests |
+|---:|---:|---:|---:|---:|
+| 1K | 3,157 | 126 | 257 | 395 |
+| 4K | 4,021 | 128 | 158 | 277 |
+| 32K | 3,277 | 119 | 37 | 129 |
+
+- The values are tok/s. DSpark runs only on decode steps of 2 sequences or fewer. A larger step
+  runs without drafts. Thus, with 8 requests, most steps have no drafts.
+- The model accepted 45% of the draft tokens in total, and 41% to 57% in each cell. These results
+  do not include a run with no drafts at the same settings.
+- A request stops when the model ends its answer. Thus, some requests generate fewer than 1,024
+  tokens. Wright does not support `min_tokens` or `ignore_eos`.
+- With 8 requests, prefill decreases to approximately 1,500 tok/s, because decode gets up to 99% of
+  the card time.
+- At 32K, a prefill takes approximately 10 s, and a reply takes less time. Thus, the 8 requests
+  decode mostly one after the other, not at the same time.
+- [`docs/performance.md`](docs/performance.md#deepseek-v41-flash-8-cards) has the results for 2 and
+  4 requests, and for replies of up to 512 tokens.
+
+#### Server check
+
+The last full run of `scripts/check_server.py` was on 2026-11-05, with 131,072 tokens of context and
+the stress checks. It gave 13 passed, 0 failed, and 4 skipped checks.
+
+- **Compile stability:** The server did 0 graph compilations after startup.
+- **Context limit:** The check of the exact context limit of 131,072 tokens passed.
+- **Prefix cache:** The check passed. In a separate test, a 29K-token prompt got its first token in
+  8.25 s. The same prompt got its first token in 0.29 s the second time.
+- **Skipped checks:** Images, reasoning effort, the HTTP compile counter, and the MMLU evaluation.
+  The run had no MMLU question file.
+
 ### Qwen3.5 0.8B to 9B
 
 #### Throughput
@@ -358,27 +410,52 @@ For more detail, read [`models/gaudi/README.md`](models/gaudi/README.md).
 
 ## Caveats
 
-### Prefill stops decode
+### Prefill stops decode for one chunk
 
-If a batch position is free, a new prompt stops decode for all sequences until the prefill of that
-prompt ends. The stop is as long as the full prefill, not one launch. The Resin scheduler runs prefill
-before the sequences in decode, and request priority does not change this. If no batch position
-is free, decode continues and the new prompt waits.
+A launch does prefill or decode, not both. While a new prompt prefills, the sequences in decode stop.
+If no batch position is free, decode continues and the new prompt waits.
 
-The table shows the longest gap between two chunks of one stream on Mistral-Large-4, with 8 cards and
-2048-token prefill launches. The gap stays the same with 1, 4, or 15 streams. With no prefill, the
-median gap is 20 to 58 ms.
+Wright divides the card time between prefill and decode. After each prefill chunk, decode runs for
+its share of the time before the next chunk starts. Thus, a stream stops for one prefill chunk at a
+time, not for the full prefill.
 
-| Prompt length | Longest gap |
-|---:|---:|
-| 6.4K tokens | 3.7 s |
-| 13K tokens | 7.3 s |
-| 26K tokens | 17 s |
+- `--decode-share MIN:MAX` sets the share of decode. The share is MIN with no sequence in decode.
+  It increases to MAX when all batch positions decode. A larger share keeps the streams fast, but
+  the new prompt gets its first token later.
+- `-b` sets the tokens per prefill chunk. A smaller chunk gives a shorter stop, but prefill is
+  slower.
+
+With `--decode-share 0`, Wright runs the full prefill of a new prompt before decode continues.
+Request priority does not change this order. The stop is then as long as the full prefill.
+
+The table shows the results of `scripts/gap_bench.py` on Qwen3.8-27B with one card. 15 streams decode
+with MTP-2, and then one prompt arrives. With 15 of 32 batch positions in decode, `50:90` gives decode
+69% of the card time. The longest gap is the longest time between two chunks of one stream while the
+prompt prefills. With no prefill, the median gap is 40 to 53 ms.
+
+| Prompt length | Setting | Longest gap | Time to first token |
+|---:|---|---:|---:|
+| 6.4K tokens | `--decode-share 0 -b 4096` | 1.4 s | 1.4 s |
+| 6.4K tokens | `--decode-share 50:90 -b 4096` | 0.92 s | 3.3 s |
+| 6.4K tokens | `--decode-share 50:90 -b 1024` | 0.37 s | 4.5 s |
+| 13K tokens | `--decode-share 0 -b 4096` | 2.9 s | 3.1 s |
+| 13K tokens | `--decode-share 50:90 -b 4096` | 1.1 s | 9.0 s |
+| 13K tokens | `--decode-share 50:90 -b 1024` | 0.42 s | 9.3 s |
+| 26K tokens | `--decode-share 0 -b 4096` | 6.6 s | 6.9 s |
+| 26K tokens | `--decode-share 50:90 -b 4096` | 1.4 s | 20 s |
+| 26K tokens | `--decode-share 50:90 -b 1024` | 0.62 s | 21 s |
+
+While the prompt prefills, each stream continues at 11 to 14 tok/s with `50:90`, and below 2 tok/s
+with `0`. A fixed load of 15 streams with 1500 tokens each and three 13K prompts took 37.4 s with
+`50:90` and 36.4 s with `0`. Thus, the time division costs approximately 3% of the total throughput.
+At `-b 1024`, the same load took 37.9 s and 36.9 s.
+
+On Mistral-Large-4 with 8 cards, 2048-token prefill launches, and `--decode-share 0`, the longest gap
+was 3.7 s, 7.3 s, and 17 s for 6.4K, 13K, and 26K tokens.
 
 With more than one request, the decode results in [Performance](#performance) include these stops,
 because llama-benchy sends all requests at the same time. The results for one request and the
-`scripts/bench.py` results below do not include them. We did not measure the stops on Qwen3.8-27B or
-GLM-5.3-Flash.
+`scripts/bench.py` results below do not include them.
 
 ### Drafts can decrease throughput
 
@@ -559,6 +636,30 @@ PyTorch packages.
 
 5. Send a request with the model name `zai-org/GLM-5.3-Flash`.
 
+### Start DeepSeek-V4.1-Flash
+
+1. Get the source code. Use step 1 of [Start Qwen3.8-27B](#start-qwen38-27b).
+
+2. Download the pinned checkpoint. It is 475 GiB:
+
+   ```bash
+   uv run --no-default-groups --group gaudi hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+     --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+     --local-dir ~/models/DeepSeek-V4.1-Flash-1017
+   ```
+
+3. Start the server. For DSpark speculative decoding, add `--spec-draft-n-max 3`:
+
+   ```bash
+   uv run --no-default-groups --group gaudi wright -m ~/models/DeepSeek-V4.1-Flash-1017
+   ```
+
+4. Wait for the `deepseek_v41-gaudi2 on 8 cards is ready at http://127.0.0.1:8080` line.
+   Startup takes approximately 13 minutes from an NVMe disk. The server shows the progress of the
+   weight load.
+
+5. Send a request with the model name `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
+
 ### Start a Qwen3.5 dense model
 
 These steps use Qwen3.5-9B. For a different size, change `9B` in the commands to `4B`, `2B`, or `0.8B`.
@@ -658,8 +759,8 @@ The flags have the same names as the flags of `llama-server`, for the options th
 | `-a`, `--alias NAME` | The repository name | Sets the model name in the API |
 | `-c`, `--ctx-size N` | The value of the model | Sets the maximum tokens per sequence. In `llama-server`, the slots share this value. In Wright, each sequence can use all of it. |
 | `-np`, `--parallel N` | The value of the model | Sets the maximum number of sequences in a batch |
-| `-b`, `--batch-size N` | The value of the model | Sets the tokens per prefill chunk. On Mistral-Large-4, `N` is a power of two, with a minimum of 1024. A wider chunk gives less cache. The other models accept only their default. |
-| `--spec-draft-n-max N` | `2` for Qwen3.8-27B, `0` for the other models | Sets the number of draft tokens. `0` stops speculative decoding. Mistral-Large-4 accepts only `0` and `3`. The others accept `0` to `3`. |
+| `-b`, `--batch-size N` | The value of the model | Sets the tokens per prefill chunk. A smaller chunk stops decode for a shorter time. Qwen3.8-27B accepts 512, 1024, 2048, or 4096. GLM-5.3-Flash accepts 1024, 2048, or 4096. On Mistral-Large-4, `N` is a power of two, with a minimum of 1024. A wider chunk gives less cache. DeepSeek-V4.1-Flash accepts only 2048. |
+| `--spec-draft-n-max N` | `2` for Qwen3.8-27B, `0` for the other models | Sets the number of draft tokens. `0` stops speculative decoding. Mistral-Large-4 accepts only `0` and `3`. DeepSeek-V4.1-Flash accepts `0` to `5`. The others accept `0` to `3`. |
 | `-md`, `--model-draft DIR` | None | Sets the drafter directory of Mistral-Large-4 |
 | `-dev`, `--device LIST` | All operational cards | Sets the cards that the server can use |
 | `--list-devices` | | Shows the cards and stops |
@@ -675,9 +776,10 @@ These flags have no match in `llama-server`:
 | Flag | Default | Description |
 |---|---|---|
 | `--tokenizer DIR` | None | Sets the tokenizer directory of Mistral-Large-4 |
-| `--ranks N` | The value of the model | Sets the number of cards for GLM-5.3-Flash (4 or 8). The full Mistral-Large-4 model needs 8. A new number needs a cold compile. |
+| `--ranks N` | The value of the model | Sets the number of cards for GLM-5.3-Flash (4 or 8). The full Mistral-Large-4 model and DeepSeek-V4.1-Flash need 8. A new number needs a cold compile. |
 | `--gpu-memory-utilization F` | The value of the model | Sets the share of free card memory for the KV cache on the one-card models, above 0 and below 1. A new value recompiles recipes at startup. |
 | `--no-overlap` | Overlap on | Stops overlap |
+| `--decode-share MIN[:MAX]` | `50:90` | Sets the percent of card time for decode while a prompt prefills. The share is MIN with no sequence in decode, and MAX when all batch positions decode. One number sets a fixed share. `0` runs the full prefill of each prompt before decode. Refer to [Prefill stops decode for one chunk](#prefill-stops-decode-for-one-chunk). |
 | `--request-queue-capacity N` | `1024` | Sets the number of requests that can wait before HTTP 429 |
 | `--stream-interval N` | `1` | Sets the number of generated tokens in each streamed chunk |
 | `--drain-timeout S` | `30` | Sets the time for requests in flight to finish after SIGTERM |
@@ -777,6 +879,7 @@ uv run scripts/check_server.py http://127.0.0.1:8080 --output check.json
 | [`models/gaudi/resin_models_gaudi/qwen3_5/`](models/gaudi/resin_models_gaudi/qwen3_5/) | The Qwen3.8-27B runner, cache arena, and checkpoint preparation |
 | [`models/gaudi/resin_models_gaudi/mistral_large4/`](models/gaudi/resin_models_gaudi/mistral_large4/) | The Mistral-Large-4 runner, cache arena, and weight preparation |
 | [`models/gaudi/resin_models_gaudi/glm5_3_flash/`](models/gaudi/resin_models_gaudi/glm5_3_flash/) | The GLM-5.3-Flash runner, cache arena, and weight preparation |
+| [`models/gaudi/resin_models_gaudi/deepseek_v41/`](models/gaudi/resin_models_gaudi/deepseek_v41/) | The DeepSeek-V4.1-Flash runner, cache arena, and weight preparation |
 | [`models/gaudi/resin_models_gaudi/gguf/`](models/gaudi/resin_models_gaudi/gguf/) | The GGUF reader |
 | [`models/gaudi/resin_models_gaudi/kernels/`](models/gaudi/resin_models_gaudi/kernels/) | The TPC-C kernels |
 | [`models/gaudi/resin_models_gaudi/synapse/`](models/gaudi/resin_models_gaudi/synapse/) | The Synapse runtime, the graphs, and the build |
@@ -785,9 +888,6 @@ uv run scripts/check_server.py http://127.0.0.1:8080 --output check.json
 
 ## TODO
 
-- **Finer prefill and decode scheduling.** Let the scheduler divide time between prefill and decode
-  in smaller slices, so that a new prompt does not stop decode for its full prefill. Refer to
-  [Prefill stops decode](#prefill-stops-decode).
 - **Draft tokens that follow the batch size.** Change the number of draft tokens with the batch size
   while the server runs. Refer to [Drafts can decrease throughput](#drafts-can-decrease-throughput).
 - **Configurable KV cache type.** Today the KV cache type of each model is fixed. Refer to
@@ -797,9 +897,13 @@ uv run scripts/check_server.py http://127.0.0.1:8080 --output check.json
 - **Qwen3.8-27B on more than one card.** Split the model across cards, as Mistral-Large-4 and
   GLM-5.3-Flash do. Today it runs on one card.
 - **Qwen3.8-27B in BF16.** Load the BF16 checkpoint. Today Wright runs only the FP8 checkpoint.
+- **DeepSeek-V4.1-Flash on 4 cards.** Keep the Engram tables in host memory, on an NVMe disk, or
+  both. Copy to the cards only the rows that each step reads. The tables are 189 GiB of the
+  475 GiB checkpoint. Without them, the other weights fit on 4 cards. Today the model needs 8 cards.
 - **A common weight loader.** One loader for all models that reads each supported quantization
   format. Today each model has its own loader.
-- **More weight formats.** EXL3 and MXFP4, and possibly dequantization kernels for NVIDIA's formats.
+- **More weight formats.** EXL3, MXFP4 for models other than DeepSeek-V4.1-Flash, and possibly
+  dequantization kernels for NVIDIA's formats.
 - **Faster Qwen weight load.** Convert the FP8 bytes of the Qwen checkpoints to the Gaudi 2 range on
   the card, as GLM-5.3-Flash does, and not on the CPU.
 - **Less duplicate code between models.** The model packages repeat code, for example in the

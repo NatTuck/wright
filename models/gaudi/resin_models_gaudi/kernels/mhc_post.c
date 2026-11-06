@@ -19,15 +19,13 @@ void main(tensor X, tensor y, tensor coef, tensor Xo, tensor rt, float eps, int 
     scalar_cache_reset();
     DECL_IDX(IDX)
     for (int t = off[1]; t < end[1]; t++) {
-        float post[NS], cm[16];
-        for (int s = 0; s < NS; s++) {
-            int5 c = {t, 4 + s, 0, 0, 0};
-            post[s] = mode == 1 ? 1.0f : s_f32_ld_g(gen_addr(c, coef));
-        }
-        for (int m = 0; m < 16; m++) {
-            int5 c = {t, 8 + m, 0, 0, 0};
-            cm[m] = mode == 1 ? 0.0f : s_f32_ld_g(gen_addr(c, coef));
-        }
+        float64 post[NS], cm[16];
+        #pragma unroll
+        for (int s = 0; s < NS; s++)
+            post[s] = mode == 1 ? (float64)1.0f : TOKEN_COEF(coef, t, 4 + s);
+        #pragma unroll
+        for (int m = 0; m < 16; m++)
+            cm[m] = mode == 1 ? (float64)0.0f : TOKEN_COEF(coef, t, 8 + m);
         const float fx = mode == 1 ? 0.0f : 1.0f;
         float64 acc = 0.0f, acc2 = 0.0f;
         for (int i = 0; i < H; i += 64) {

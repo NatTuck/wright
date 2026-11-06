@@ -15,6 +15,7 @@ engine = Engine(
         max_batch_tokens=4096,
         prefill_chunk_size=8192,
         schedule_conservativeness=1.0,
+        decode_share=(0.5, 0.9),  # default None: prefill first
     ),
 )
 
@@ -64,6 +65,10 @@ Selection is deterministic:
    `batch_key` cohort.
 5. Never exceed `max_running_requests` admitted requests.
 
+With a `decode_share`, steps 1 and 2 wait for the resident decode batch while
+decode has a time debt. Refer to
+[Prefill and decode time sharing](#prefill-and-decode-time-sharing).
+
 Waiting admission chooses the highest compatible priority, while already
 admitted requests retain their slots. A batch may therefore contain admitted
 rows of different priorities. It never mixes keys or phases. `batch_key=None`
@@ -82,6 +87,35 @@ one-token continuation prefill therefore remains unambiguously prefill.
 Prefill can pause resident decoders, but does not evict them: their KV and
 admission remain live. A full admitted set is not displaced merely to accept a
 new prefill.
+
+## Prefill and decode time sharing
+
+Without a `decode_share`, every chunk of an admitted prompt runs before the
+resident decoders continue. Thus, a long prompt stops all streams in decode for
+its full prefill.
+
+`SchedulerConfig(decode_share=(min, max))` divides the time between the two
+phases when both phases have work. Both limits are fractions with
+`0 <= min <= max < 1`.
+
+- The Engine measures each collected step from its launch to its return. When a
+  decode step overlaps the previous step, its time starts when the previous step
+  returns.
+- The target share is `s = min + (max - min) * decoding / max_running_requests`,
+  where `decoding` counts the admitted rows in decode.
+- If rows are in decode, a prefill step of `P` seconds gives decode a time debt
+  of `P * s / (1 - s)` seconds. Decode steps run until they use the debt. Then
+  the next prefill chunk runs.
+- If the decode steps use more time than the debt, the extra time decreases the
+  next debt.
+- The debt goes back to zero when the prompt completes or when no slot is free.
+  In both cases, no prefill can run beside the decoders.
+- If only one phase has work, the scheduler runs that phase with no limit.
+
+The longest stop of a stream is one prefill step. `prefill_chunk_size` and
+`max_batch_tokens` set the maximum length of that step. The share sets how the
+other time divides between the speed of the streams and the TTFT of the new
+prompt. A `max` of `0` keeps the prefill-first order.
 
 Native turn ordinals never cross the Python boundary. A pre-accept rejection
 restores the selected requests and their exact order.
@@ -194,7 +228,9 @@ Overlap requires a stable decode cohort, enough remaining output and context
 budget, and both steps' write spans inside the same owned blocks in every cache
 group. The Engine retains the requests and a single writer lease across
 continuations. New arrivals, cancellation, close, and cache
-page boundaries drain pending work before changing ownership. Other steps,
+page boundaries drain pending work before changing ownership. With a
+`decode_share`, a waiting request drains the pipeline only when its prefill is
+due. Thus, overlap continues while decode has a time debt. Other steps,
 including prefill, use the synchronous path. `enable_overlap=False` disables
 overlap for the Engine; `step(allow_overlap=False)` drains pending work or runs
 the next batch synchronously.

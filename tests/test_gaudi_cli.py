@@ -19,6 +19,7 @@ from deploy.gaudi_cli import (
     add_gaudi_arguments,
     apply_gaudi_arguments,
     check_listen_address,
+    decode_share,
     positive_int,
 )
 from deploy.models import get_model, validate_gaudi_options
@@ -131,7 +132,16 @@ def test_listen_address_checks() -> None:
     [
         ("qwen3_5-gaudi2", {"max_batch_size": 64}, "max-batch-size of 32"),
         ("qwen3_5-gaudi2", {"draft_tokens": 9}, "draft-tokens"),
-        ("qwen3_5-gaudi2", {"prefill_chunk_size": 2048}, "prefill-chunk-size 4096"),
+        (
+            "qwen3_5-gaudi2",
+            {"prefill_chunk_size": 256},
+            "prefill-chunk-size 512, 1024, 2048, 4096",
+        ),
+        (
+            "glm5_3_flash-gaudi2",
+            {"prefill_chunk_size": 512},
+            "prefill-chunk-size 1024, 2048, 4096",
+        ),
         ("mistral_large4-gaudi2", {"draft_tokens": 2}, "draft-tokens 0, 3"),
         ("mistral_large4-gaudi2", {"prefill_chunk_size": 1500}, "power of two"),
         ("glm5_3_flash-gaudi2", {"draft_tokens": 4}, "draft-tokens"),
@@ -147,6 +157,39 @@ def test_gaudi_options_rejected_before_the_card_opens(model, options, match) -> 
     }
     with pytest.raises(ValueError, match=match):
         validate_gaudi_options(spec, **{**settings, **options})
+
+
+@pytest.mark.parametrize(
+    "model, chunk",
+    [
+        ("qwen3_5-gaudi2", 512),
+        ("qwen3_5-gaudi2", 2048),
+        ("glm5_3_flash-gaudi2", 1024),
+        ("mistral_large4-gaudi2", 1024),
+    ],
+)
+def test_smaller_prefill_chunks_are_accepted(model, chunk) -> None:
+    spec = get_model(model)
+    validate_gaudi_options(
+        spec,
+        max_batch_size=spec.max_batch_size,
+        prefill_chunk_size=chunk,
+        draft_tokens=spec.draft_tokens,
+    )
+
+
+@pytest.mark.parametrize(
+    "text, share",
+    [("50:90", (0.5, 0.9)), ("80", (0.8, 0.8)), ("0", None), ("0:0", None)],
+)
+def test_decode_share_parses_percent(text, share) -> None:
+    assert decode_share(text) == share
+
+
+@pytest.mark.parametrize("text", ["90:50", "100", "-1", "50:100", "a", "1:2:3", ""])
+def test_decode_share_rejects_bad_values(text) -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        decode_share(text)
 
 
 @pytest.mark.parametrize(

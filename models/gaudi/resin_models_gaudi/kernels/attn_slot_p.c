@@ -13,6 +13,9 @@
 // page; 0 in every table that has no window)
 // tensors: 0 sc (C, M, S) f32  1 slots | 2 P (C, M, S) bf16  3 mx (Mp, S) f32  4 l (Mp, S) f32
 // (Mp = M rounded up to 64; lane r of stats column block b is column 64 b + r)
+// WINDOW builds (ds_slot_pw.c, with P_LINEAR): slot field 7 is a window W (0: none); column m sees only keys
+// at positions >= its position - W + 1.
+// PER_COLUMN builds (ds_slot_pw1.c, ds_slot_p1.c): one member per column, index space [M, S].
 // params: scale, hpg. index space: [ceil(M / 64), S]
 #include "common.h"
 
@@ -36,21 +39,36 @@ void main(tensor sc, tensor slots, tensor P, tensor mx, tensor l, float scale, i
 #ifdef P_LINEAR
         fc[0] = 6;
         const int kmin = s_i32_ld_g(gen_addr(fc, slots));
+#ifdef WINDOW
+        const float lof0 = (float)(kmin > key0 ? kmin - key0 : 0);  // first visible key
+        fc[0] = 7;
+        const int win = s_i32_ld_g(gen_addr(fc, slots));
+#else
         const float lof = (float)(kmin > key0 ? kmin - key0 : 0);  // first visible key
+#endif
 #else
         const float lof = 0.0f;
 #endif
         for (int cb = off[0]; cb < end[0]; cb++) {
+#ifdef PER_COLUMN
+            const int c0 = cb, nc = 1;                    // one column per member
+#else
+            const int c0 = cb * 64, nc = 64;
+#endif
             float64 mv = NINF * scale, lv = 0.0f;
             // token / head of the block's first column
-            int t = 0, h = cb * 64;
+            int t = 0, h = c0;
             while (h >= hpg) { h -= hpg; t++; }
-            for (int r = 0; r < 64 && cb * 64 + r < M; r++) {
-                const int m = cb * 64 + r;
+            for (int r = 0; r < nc && c0 + r < M; r++) {
+                const int m = c0 + r;
                 int lim = qpos0 + t + 1 < klen ? qpos0 + t + 1 : klen;
                 lim -= key0;
                 lim = lim < 0 ? 0 : (lim > C ? C : lim);
                 const float limf = (float)lim;
+#ifdef WINDOW
+                const int wfirst = qpos0 + t - win + 1 - key0;
+                const float lof = (float)(win > 0 && wfirst > (int)lof0 ? wfirst : (int)lof0);
+#endif
                 int5 c = {0, m, s, 0, 0};
                 // pass 1: max over the visible keys
                 float64 m0 = NINF, m1 = NINF, m2 = NINF, m3 = NINF;
@@ -95,9 +113,14 @@ void main(tensor sc, tensor slots, tensor P, tensor mx, tensor l, float scale, i
                 lv = v_f32_sel_less_f32_b(lanef, (float)r - 0.5f, lv, tot);
                 if (++h == hpg) { h = 0; t++; }
             }
-            int5 stc = {cb * 64, s, 0, 0, 0};
+            int5 stc = {c0, s, 0, 0, 0};
+#ifdef PER_COLUMN
+            v_f32_st_tnsr_partial(stc, mx, mv, 0, 0);
+            v_f32_st_tnsr_partial(stc, l, lv, 0, 0);
+#else
             v_f32_st_tnsr(stc, mx, mv);
             v_f32_st_tnsr(stc, l, lv);
+#endif
         }
     }
 }

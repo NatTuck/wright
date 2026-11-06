@@ -465,14 +465,15 @@ def test_kda_decode_matches_recurrence(device, recipes, nh):
 
 
 # ------------------------------------------------------------------ mHC
-def test_mhc_chain_matches_numpy(device, recipes):
+@pytest.mark.parametrize("T", [1, 3, 16])
+def test_mhc_chain_matches_numpy(device, recipes, T):
     from glm_np import mhc, mhc_update
 
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import BF16, F32
 
     rng = np.random.default_rng(5)
-    H, T, eps, hc_eps, iters = 512, 3, 1e-5, 1e-6, 20
+    H, eps, hc_eps, iters = 512, 1e-5, 1e-6, 20
     X = rng.standard_normal((T, 4, H)).astype(np.float32)
     fn = (rng.standard_normal((24, 4 * H)) * 0.05).astype(np.float32)
     pad = np.zeros((32, 4 * H), np.float32)
@@ -484,7 +485,7 @@ def test_mhc_chain_matches_numpy(device, recipes):
     g = Graph(device, "t_mhc")
     xin = g.input("X", (4 * H, T), F32)
     mix, rt = g.tensor((T, 32), F32), g.tensor((64, T), F32)
-    g.node("rg_mhc_mix_f32", [g.input("fn", (4 * H, 32), F32), xin], [mix, rt], struct.pack("f", eps))
+    g.node("rg_mhc_mix1_f32" if T <= 2 else "rg_mhc_mix_f32", [g.input("fn", (4 * H, 32), F32), xin], [mix, rt], struct.pack("f", eps))
     coef = g.input("coef", (T, 24), F32)
     g.node(
         "rg_mhc_coef_f32",
@@ -654,3 +655,36 @@ def test_expand_keeps_own_key_past_top_pools(device, recipes):
     assert keys[0, : 4 * KS].tolist() == want.tolist()
     assert keys[0, 4 * KS : 4 * KS + 3].tolist() == [3600, 3601, 3602]  # own key last
     assert keys[1, :21].tolist() == [*range(16), 28, 29, 30, 31, 32]
+
+
+def test_mhc_coef1_matches_mhc_coef(device, recipes):
+    """One token: mhc_mixp (the projection in K chunks, four rows per member) + mhc_coef1 (the comb matrix in
+    lanes) against mhc_mix1 + mhc_coef."""
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F32
+
+    rng = np.random.default_rng(9)
+    K, C, iters, hc_eps, eps = 4 * 640, 5, 20, 1e-6, 1e-5
+    for trial in range(4):
+        inputs = {
+            "fn": (rng.standard_normal((32, K)) * 0.05).astype(np.float32),
+            "X": (rng.standard_normal((1, K)) * rng.uniform(0.5, 4)).astype(np.float32),
+            "base": rng.standard_normal(24).astype(np.float32),
+            "scale": rng.uniform(0.1, 2.0, 3).astype(np.float32),
+        }
+        g = Graph(device, "t_coef_ref")
+        mix, rt = g.tensor((1, 32), F32), g.tensor((64, 1), F32)
+        g.node("rg_mhc_mix1_f32", [g.input("fn", (K, 32), F32), g.input("X", (K, 1), F32)], [mix, rt],
+               struct.pack("f", eps))
+        g.node("rg_mhc_coef_f32", [mix, rt, g.input("base", (24,), F32), g.input("scale", (3,), F32)],
+               [g.input("coef", (1, 24), F32)], struct.pack("if", iters, hc_eps))
+        want = Run(device, recipes, g)(inputs, ["coef"])["coef"].reshape(-1)
+        g.destroy()
+        g = Graph(device, "t_coef1")
+        mixp, ssp = g.tensor((32, C), F32), g.tensor((C,), F32)
+        g.node("rg_mhc_mixp_f32", [g.input("fn", (K, 32), F32), g.input("X", (K, 1), F32)], [mixp, ssp])
+        g.node("rg_mhc_coef1_f32", [mixp, ssp, g.input("base", (24,), F32), g.input("scale", (3,), F32)],
+               [g.input("coef", (24,), F32)], struct.pack("iffi", iters, hc_eps, eps, K))
+        got = Run(device, recipes, g)(inputs, ["coef"])["coef"].reshape(-1)
+        g.destroy()
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)

@@ -91,8 +91,11 @@ class RankSlices:
 class Safetensors:
     """The release's shards, read with ``os.preadv``, never through a memory map."""
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self, path: str | os.PathLike[str], dtypes: dict[str, type] = _DTYPES
+    ) -> None:
         self.path = Path(path)
+        self.dtypes = dtypes
         index = json.loads((self.path / "model.safetensors.index.json").read_text())
         self.weight_map: dict[str, str] = index["weight_map"]
         self._headers: dict[str, tuple[dict, int]] = {}
@@ -118,7 +121,7 @@ class Safetensors:
     def read(self, name: str, rows: slice | None = None) -> np.ndarray:
         """A tensor (or a range of its first dimension) as a fresh array in its own dtype."""
         fd, e, base = self._entry(name)
-        dtype, shape = np.dtype(_DTYPES[e["dtype"]]), tuple(e["shape"])
+        dtype, shape = np.dtype(self.dtypes[e["dtype"]]), tuple(e["shape"])
         start = base + e["data_offsets"][0]
         if rows is not None:
             row_bytes = int(np.prod(shape[1:])) * dtype.itemsize
@@ -177,8 +180,7 @@ def block_f32(w: np.ndarray, s: np.ndarray) -> np.ndarray:
     M, K = w.shape
     values = np.nan_to_num(E4M3[w])
     return (
-        values.reshape(M // BLOCK, BLOCK, K // BLOCK, BLOCK)
-        * s[:, None, :, None]
+        values.reshape(M // BLOCK, BLOCK, K // BLOCK, BLOCK) * s[:, None, :, None]
     ).reshape(M, K)
 
 

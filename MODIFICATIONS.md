@@ -12,7 +12,10 @@ of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) a
 - `NOTICE`
 - `README.md`
 - `crates/resin-core/Cargo.toml`
+- `crates/resin-core/src/engine.rs`
+- `crates/resin-core/src/lib.rs`
 - `crates/resin-core/src/metrics.rs`
+- `crates/resin-core/src/scheduler.rs`
 - `crates/resin-http/Cargo.toml`
 - `crates/resin-http/src/anthropic.rs`
 - `crates/resin-http/src/lib.rs`
@@ -23,6 +26,7 @@ of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) a
 - `crates/resin-py/Cargo.toml`
 - `crates/resin-py/src/http.rs`
 - `crates/resin-py/src/http_session.rs`
+- `crates/resin-py/src/lib.rs`
 - `crates/resin-py/src/metrics.rs`
 - `crates/resin-py/src/recipe.rs`
 - `crates/resin-recipe/Cargo.toml`
@@ -47,6 +51,7 @@ of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) a
 - `resin/backend/metrics.py`
 - `resin/bench.py`
 - `resin/kernel_cache.py`
+- `resin/models/deepseek_v41/config.py`
 - `resin/models/qwen3_5/config.py`
 - `resin/numa.py`
 - `resin/process.py`
@@ -91,7 +96,6 @@ backend, its CUDA models, its Modal deployment, and their tests and documents.
 - `resin/backend/quantization.py`
 - `resin/backend/torch.py`
 - `resin/backend/transformer.py`
-- `resin/models/deepseek_v41/`
 - `resin/models/gemma4/`
 - `resin/models/glm5_3_flash/README.md`
 - `resin/models/gpt_oss/`
@@ -116,8 +120,6 @@ backend, its CUDA models, its Modal deployment, and their tests and documents.
 - `tests/test_deepseek_auxiliary_graphs.py`
 - `tests/test_deepseek_engram_graphs.py`
 - `tests/test_deepseek_hc_warmup.py`
-- `tests/test_deepseek_v41_codec.py`
-- `tests/test_deepseek_v41_media.py`
 - `tests/test_distributed_cuda_graphs.py`
 - `tests/test_expert_parallel.py`
 - `tests/test_expert_parallel_gpu.py`

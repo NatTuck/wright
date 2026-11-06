@@ -115,6 +115,25 @@ impl MetricsEncoder {
             r.scheduler_idle_seconds,
             &[],
         );
+        for (phase, value) in [
+            ("prefill", r.prefill_busy_seconds),
+            ("decode", r.decode_busy_seconds),
+        ] {
+            self.counter(
+                "scheduler_busy_seconds_total",
+                "Launch-to-return time of collected steps; overlapped steps start at the previous return.",
+                value,
+                &[("phase", phase)],
+            );
+        }
+        if let Some(target) = r.decode_share_target {
+            self.gauge(
+                "scheduler_decode_share_target",
+                "Target share of contended execution time for decode launches.",
+                target,
+                &[],
+            );
+        }
         for (name, help, histogram) in [
             (
                 "prompt_tokens_histogram",

@@ -51,6 +51,8 @@ from resin_models_gaudi.synapse.progress import info
 from resin_models_gaudi.synapse.runtime import open_device
 
 PREFILL_CHUNK_SIZE = 4096
+# tokens per Engine prefill step that run as whole launches of the compiled prefill widths
+PREFILL_CHUNK_SIZES = (1024, 2048, PREFILL_CHUNK_SIZE)
 MAX_BATCH = 64
 
 

@@ -178,3 +178,15 @@ models/gaudi/resin_models_gaudi/mistral_large4/dspark.py, follow llama.cpp and S
   https://github.com/sgl-project/sglang
 
 SGLang is licensed under the Apache License, Version 2.0.
+
+The DeepSeek-V4.1 Engram hash in resin/models/deepseek_v41/engram.py adapts inference/engram.py of
+DeepSeek-V4.1-Flash-1017, revision 1bae0e1088993b9b82de08f59de5be5a34e42170. The device hash in
+models/gaudi/resin_models_gaudi/kernels/eg_hash.c follows the same code. The CPU reference in
+models/gaudi/tools/ds41_ref.py runs inference/model.py of that checkpoint. It replaces the functions
+of its inference/kernel.py with PyTorch versions.
+
+  Copyright (c) 2023 DeepSeek
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+
+DeepSeek-V4.1 is licensed under the MIT License. resin/models/deepseek_v41/LICENSE keeps the MIT
+notice.

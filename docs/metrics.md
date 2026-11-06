@@ -167,6 +167,8 @@ collectives. Ordinary runners need neither method. `forward`,
 | -------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Device time by phase             | `resin:forward_execution_seconds_total{category="prefill\|target_verify\|draft\|decode\|idle"}`          |
 | No-work engine time              | `resin:scheduler_idle_seconds_total`                                                                     |
+| Engine step time by phase        | `resin:scheduler_busy_seconds_total{phase="prefill\|decode"}`                                            |
+| Target decode share              | `resin:scheduler_decode_share_target`                                                                    |
 | Blocking host DP coordination    | `resin:dp_attention_sync_wait_seconds`                                                                   |
 
 Phase durations are exclusive within an observed execution. Detailed draft and
@@ -178,6 +180,15 @@ successor remains busy until the successor retires.
 
 Runners without timing instrumentation omit those observations rather than
 fabricating zero work.
+
+The Engine measures `scheduler_busy_seconds_total` itself, for every runner. The
+time of each collected step starts at its launch. If the step overlaps the
+previous step, its time starts when the previous step returns. Its time stops
+when its own result returns. The time includes host work inside the runner call.
+`scheduler_decode_share_target` is present only with a
+`SchedulerConfig.decode_share`. It is the share of decode at the current number
+of rows in decode. Refer to
+[Prefill and decode time sharing](scheduler.md#prefill-and-decode-time-sharing).
 
 The unaccounted fraction of a wall-time chart is **unattributed time**, not a
 measurement of CPU overhead. Untimed device work can occur outside the spans;

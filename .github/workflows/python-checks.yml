@@ -53,6 +53,8 @@ jobs:
           --ignore=tests/test_backend_plans.py
           --ignore=tests/test_bench_cli.py
           --ignore=tests/test_bench_plots.py
+          --ignore=tests/test_deepseek_v41_codec.py
+          --ignore=tests/test_deepseek_v41_media.py
           --ignore=tests/test_demo_ui.py
           --ignore=tests/test_distributed_http.py
           --ignore=tests/test_glm_media.py

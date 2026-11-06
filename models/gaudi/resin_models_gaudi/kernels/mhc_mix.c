@@ -3,7 +3,7 @@
 // mHC site projection on the TPC: mixT[t, j] = fn_j . X_t.
 // Member 0 also writes rt[:, t] = 1 / rms(X_t) (all lanes; eps as mhc_post), the site's r.
 // tensors: 0 fn (K, 32) f32 (row j contiguous)  1 X (K, T) f32 | 2 mixT (T, 32) f32  3 rt (64, T) f32
-// params: eps.  index space: T <= 16: [32] (one row per member); else [8, ceil(T/4)] (4 rows x 4 tokens per member).
+// params: eps.  index space: T <= 2: [32] (one row per member); else [8, ceil(T/4)] (4 rows x 4 tokens per member).
 #include "common.h"
 
 void main(tensor fn, tensor X, tensor mixT, tensor rt, float eps)
@@ -13,13 +13,15 @@ void main(tensor fn, tensor X, tensor mixT, tensor rt, float eps)
     const int K = get_dim_size(X, 0), T = get_dim_size(X, 1);
     const float64 lanef = v_convert_i32_to_f32_b((int64)read_lane_id_4b_b(), SW_RHNE, 0, 1, 0);
     DECL_IDX(IDX)
-    if (T > 16) {
+#ifndef ROWS_ONLY
+    if (T > 2) {
         for (int rt4 = off[0]; rt4 < end[0]; rt4++)
             for (int tt = off[1]; tt < end[1]; tt++) {
                 const int t0 = 4 * tt, nt = T - t0 < 4 ? T - t0 : 4;
                 float64 acc[4][4], q[4];
                 #pragma unroll
                 for (int i = 0; i < 4; i++) { q[i] = 0.0f; for (int u = 0; u < 4; u++) acc[i][u] = 0.0f; }
+                #pragma unroll 4
                 for (int k = 0; k < K; k += 64) {
                     float64 f[4];
                     #pragma unroll
@@ -55,6 +57,7 @@ void main(tensor fn, tensor X, tensor mixT, tensor rt, float eps)
             }
         return;
     }
+#endif
     for (int j = off[0]; j < end[0]; j++)
         for (int tb = 0; tb < T; tb += 64) {               // results of 64 tokens per output vector
             float64 out = 0.0f;

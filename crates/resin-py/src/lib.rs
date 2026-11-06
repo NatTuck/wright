@@ -59,6 +59,7 @@ struct SchedulerConfig {
     max_batch_tokens: Option<NonZeroU32>,
     prefill_chunk_size: NonZeroU32,
     schedule_conservativeness: f64,
+    decode_share: Option<resin_core::DecodeShare>,
 }
 
 const DEFAULT_PREFILL_CHUNK_SIZE: NonZeroU32 = NonZeroU32::new(8192).unwrap();
@@ -69,6 +70,7 @@ impl Default for SchedulerConfig {
             max_batch_tokens: None,
             prefill_chunk_size: DEFAULT_PREFILL_CHUNK_SIZE,
             schedule_conservativeness: 1.0,
+            decode_share: None,
         }
     }
 }
@@ -80,12 +82,14 @@ impl SchedulerConfig {
         *,
         max_batch_tokens = None,
         prefill_chunk_size = 8192,
-        schedule_conservativeness = 1.0
+        schedule_conservativeness = 1.0,
+        decode_share = None
     ))]
     fn new(
         max_batch_tokens: Option<u32>,
         prefill_chunk_size: u32,
         schedule_conservativeness: f64,
+        decode_share: Option<(f64, f64)>,
     ) -> PyResult<Self> {
         if !schedule_conservativeness.is_finite() || schedule_conservativeness < 0.0 {
             return Err(PyValueError::new_err(
@@ -102,6 +106,12 @@ impl SchedulerConfig {
             prefill_chunk_size: NonZeroU32::new(prefill_chunk_size)
                 .ok_or_else(|| PyValueError::new_err("prefill_chunk_size must be positive"))?,
             schedule_conservativeness,
+            decode_share: decode_share
+                .map(|(min, max)| {
+                    resin_core::DecodeShare::new(min, max)
+                        .map_err(|error| PyValueError::new_err(error.to_string()))
+                })
+                .transpose()?,
         })
     }
 
@@ -120,13 +130,24 @@ impl SchedulerConfig {
         self.schedule_conservativeness
     }
 
+    /// The `(min, max)` share of contended execution time for decode, or
+    /// `None` to run every admitted prefill chunk before decode.
+    #[getter]
+    fn decode_share(&self) -> Option<(f64, f64)> {
+        self.decode_share.map(|share| (share.min(), share.max()))
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "SchedulerConfig(max_batch_tokens={}, prefill_chunk_size={}, schedule_conservativeness={:?})",
+            "SchedulerConfig(max_batch_tokens={}, prefill_chunk_size={}, schedule_conservativeness={:?}, decode_share={})",
             self.max_batch_tokens()
                 .map_or_else(|| "None".to_owned(), |value| value.to_string()),
             self.prefill_chunk_size(),
             self.schedule_conservativeness,
+            self.decode_share().map_or_else(
+                || "None".to_owned(),
+                |(min, max)| format!("({min:?}, {max:?})")
+            ),
         )
     }
 }
@@ -1552,6 +1573,7 @@ impl Engine {
                 max_batch_tokens: scheduler.max_batch_tokens,
                 prefill_chunk_size: scheduler.prefill_chunk_size,
                 schedule_conservativeness: scheduler.schedule_conservativeness,
+                decode_share: scheduler.decode_share,
             },
             prefix_cache,
         )
@@ -1868,6 +1890,7 @@ impl Engine {
                     max_batch_tokens: config.max_batch_tokens,
                     prefill_chunk_size: config.prefill_chunk_size,
                     schedule_conservativeness: config.schedule_conservativeness,
+                    decode_share: config.decode_share,
                 },
             )
         }

@@ -38,6 +38,13 @@ pub struct EngineMetricsSnapshot {
     pub elapsed_seconds: f64,
     /// Wall time with no queued requests or outstanding physical execution.
     pub scheduler_idle_seconds: f64,
+    /// Host-observed execution time of collected prefill launches.
+    pub prefill_busy_seconds: f64,
+    /// Host-observed execution time of collected decode launches, each
+    /// counted from the previous return when steps overlap.
+    pub decode_busy_seconds: f64,
+    /// The current target decode share, if prefill/decode time sharing is on.
+    pub decode_share_target: Option<f64>,
     pub prompt_tokens_histogram: Histogram,
     pub uncached_prompt_tokens_histogram: Histogram,
     pub generation_tokens_histogram: Histogram,
@@ -68,6 +75,9 @@ impl Default for EngineMetricsSnapshot {
             running_requests: 0,
             elapsed_seconds: 0.0,
             scheduler_idle_seconds: 0.0,
+            prefill_busy_seconds: 0.0,
+            decode_busy_seconds: 0.0,
+            decode_share_target: None,
             prompt_tokens_histogram: Histogram::default(),
             uncached_prompt_tokens_histogram: Histogram::default(),
             generation_tokens_histogram: Histogram::default(),

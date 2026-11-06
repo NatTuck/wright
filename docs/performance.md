@@ -37,8 +37,9 @@ sweep does not measure a server that receives requests at different times.
 
 In agentic workloads, each turn adds to a context that the server has already seen. This is
 generally not a problem there: the prefix cache holds the earlier context, so each turn prefills
-little more than the new tokens. Work is under way to let the scheduler divide time between prefill
-and decode in smaller slices.
+little more than the new tokens. The sweep ran before Wright divided the card time between prefill
+and decode. Its results are the same as with `--decode-share 0`. Refer to
+[Prefill stops decode for one chunk](../README.md#prefill-stops-decode-for-one-chunk).
 
 ## Make the results
 
@@ -77,6 +78,27 @@ For the Qwen3.5 dense models, `--qwen35` is the folder that holds `Qwen3.5-9B-FP
 sizes. Use `--only qwen35-4b-mtp0`, `qwen35-2b-mtp0`, or `qwen35-0.8b-mtp0` for the other sizes.
 To run the sizes at the same time on different cards, give each command its own `--gpu` and
 `--port`.
+
+The DeepSeek-V4.1-Flash results come from llama-benchy and one server. Start the server, then run
+llama-benchy:
+
+```bash
+wright -m ~/models/DeepSeek-V4.1-Flash-1017 --spec-draft-n-max 3 -c 512000 -np 8 \
+  --decode-share 25:99
+
+uvx --from git+https://github.com/eugr/llama-benchy@e9be344578cec17745066b220798b80a0d2686d3 \
+  llama-benchy --base-url http://127.0.0.1:8080/v1 \
+  --model deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+  --served-model-name deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+  --tokenizer ~/models/DeepSeek-V4.1-Flash-1017 \
+  --pp 1024 4096 32768 --tg 512 1024 --concurrency 1 2 4 8 \
+  --runs 3 --warmup-runs 1 --no-cache --latency-mode generation --skip-coherence \
+  --book-url https://www.gutenberg.org/files/1661/1661-0.txt \
+  --extra-body 'temperature=1.0,top_p=1.0,reasoning_effort="low"'
+```
+
+To get the acceptance of drafts, read the `spec_accepted_tokens_total` and
+`spec_draft_tokens_total` counters at `/metrics` before and after each cell.
 
 ## Qwen3.8-27B, 1 card
 
@@ -230,6 +252,46 @@ These results are from 2026-11-01.
 | 32K | 2,598 / 103 / 103 | 2,539 / 31 / 89 | 2,530 / 22 / 76¹ | 2,514 / 18 / 77¹ | 2,523 / 18 / 112¹ |
 | 64K | 2,034 / 93 / 94 | 2,000 / 13 / 79¹ | 1,989 / 13 / 92¹ | 1,995 / 8 / 78¹ | 1,947 / 8 / 67¹ |
 | 128K | 1,417 / 92 / 93¹ | 1,405 / 5 / 68¹ | 1,400 / 3 / 44¹ | No fit | No fit |
+
+## DeepSeek-V4.1-Flash, 8 cards
+
+These results are from 2026-11-05, with DSpark-3 (`--spec-draft-n-max 3`). The method is different
+from the method of the other tables:
+
+- **Server:** One server ran all cells, with 512,000 tokens of context, `-np 8`, and
+  `--decode-share 25:99`.
+- **Prompt:** Each prompt has exactly 1K, 4K, or 32K tokens. The reply comes after it.
+- **Reply:** Each request generates a maximum of 512 or 1,024 tokens. A request stops when the
+  model ends its answer. Thus, some requests generate fewer tokens. Wright does not support
+  `min_tokens` or `ignore_eos`.
+- **Sampling:** The checkpoint has no `generation_config.json`. The requests use temperature 1.0,
+  top-p 1.0, and low reasoning.
+- **Drafts:** DSpark runs only on decode steps of 2 sequences or fewer. A larger step runs without
+  drafts. Thus, with 4 or 8 requests, most steps have no drafts. The percent in each cell is the
+  part of the draft tokens that the model accepted. In total, the model accepted 45%.
+- **Runs:** A cell is the mean of 3 runs after 1 warmup run. A `¹` marks a cell that ran once,
+  with no warmup. A `²` marks a cell that ran twice.
+
+With 8 requests, prefill decreases to approximately 1,500 tok/s, because decode gets up to 99% of
+the card time. At 32K, a prefill takes approximately 10 s, and a reply takes less time. Thus, with
+more than one request, the requests decode mostly one after the other. As a result, the decode rate
+is low.
+
+**Replies of up to 512 tokens** (prefill / decode / peak, accepted drafts)
+
+| Prompt | 1 request | 2 requests | 4 requests | 8 requests |
+|---:|---:|---:|---:|---:|
+| 1K | 3,204 / 127 / 128, 43% | 3,341 / 187 / 198, 45% | 2,476 / 223 / 260, 57% | 1,510 / 247 / 369, 43% |
+| 4K | 4,017 / 115 / 116, 41% | 3,202 / 152 / 183, 43% | 2,356 / 151 / 224, 44% | 1,535 / 136 / 243, 44% |
+| 32K | 3,284 / 113 / 114, 44% | 2,665 / 53 / 117, 44% | 2,611 / 37 / 114, 48%¹ | 2,392 / 33 / 129, 45%¹ |
+
+**Replies of up to 1,024 tokens** (prefill / decode / peak, accepted drafts)
+
+| Prompt | 1 request | 2 requests | 4 requests | 8 requests |
+|---:|---:|---:|---:|---:|
+| 1K | 3,157 / 126 / 126, 45% | 3,343 / 163 / 219, 48% | 2,376 / 193 / 277, 48% | 1,514 / 257 / 395, 47% |
+| 4K | 4,021 / 128 / 128, 45% | 3,218 / 133 / 191, 42% | 2,351 / 134 / 250, 46% | 1,470 / 158 / 277, 42% |
+| 32K | 3,277 / 119 / 120, 49% | 2,796 / 52 / 122, 48%² | 2,453 / 43 / 122, 47%¹ | 2,338 / 37 / 129, 46%¹ |
 
 ## Qwen3.5 dense, 1 card each
 
