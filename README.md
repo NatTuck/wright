@@ -131,7 +131,8 @@ Wright has these features:
 
 Wright has these limits:
 
-- Wright has no vision tower. It does not accept images or video.
+- The vision tower is untested except on Qwen3.8-27B. Other models do not accept images or
+  video.
 - The Qwen models run on one card. Wright does not split these models across cards.
 - The full Mistral-Large-4 model needs 8 cards. On 4 cards, its weights do not fit in card memory.
 - GLM-5.3-Flash needs 4 or 8 cards.
@@ -966,12 +967,14 @@ history. Read [`RESIN.md`](RESIN.md) for the documentation of Resin.
 
 | Part | License |
 |---|---|
-| TPC-C kernels in [`models/gaudi/resin_models_gaudi/kernels/`](models/gaudi/resin_models_gaudi/kernels/) | [PolyForm Noncommercial 1.0.0](models/gaudi/resin_models_gaudi/kernels/LICENSE) |
+| TPC-C kernels in [`models/gaudi/resin_models_gaudi/kernels/`](models/gaudi/resin_models_gaudi/kernels/), except the twelve vision kernels below | [PolyForm Noncommercial 1.0.0](models/gaudi/resin_models_gaudi/kernels/LICENSE) |
+| Vision kernels `add.c`, `add3.c`, `bias.c`, `gelu_tanh.c`, `merge2x2.c`, `merge4.c`, `resid_bias.c`, `rope_vision.c`, `splice.c` | GNU Affero GPL 3.0 or later, Copyright 2026 Nat Tuck |
+| Vision kernels `ln_affine.c`, `ln_pre.c`, `softmax_rows.c` | GNU Affero GPL 3.0 or later, or PolyForm Noncommercial 1.0.0, Copyright Aaron Botsis and Nat Tuck |
 | All other code | [Apache License 2.0](LICENSE) |
 
 > [!CAUTION]
-> THE KERNELS ARE FOR NONCOMMERCIAL USE ONLY, AND WRIGHT CANNOT RUN WITHOUT THEM. FOR COMMERCIAL USE OF
-> WRIGHT AS A WHOLE, YOU MUST GET A SEPARATE LICENSE FROM THE AUTHOR.
+> NON-VISION KERNELS ARE FOR NONCOMMERCIAL USE ONLY, AND WRIGHT CANNOT RUN WITHOUT THEM. FOR COMMERCIAL
+> USE OF WRIGHT AS A WHOLE, YOU MUST GET A SEPARATE LICENSE FROM THE AUTHOR.
 
 I'm just a dude with a gpu habit who put hundreds of hours collectively into this. If you want to
 use this to make money, glad to help - I'm just asking for some good will to recoup hardware/power

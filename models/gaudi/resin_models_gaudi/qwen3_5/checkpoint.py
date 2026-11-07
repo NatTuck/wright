@@ -26,9 +26,9 @@ from pathlib import Path
 import numpy as np
 
 from resin.models.qwen3_5.config import Qwen35Config
+from resin_models_gaudi.quant import BLOCK, scale_suffix, weight_block
 
 FP8_MAX = 240.0
-BLOCK = 128
 
 _POOL = ThreadPoolExecutor(max(4, min(32, (os.cpu_count() or 8) // 2)))
 _DTYPES = {
@@ -246,11 +246,8 @@ class Qwen35Checkpoint:
         self.config = Qwen35Config.from_hugging_face(top, allow_tied_embeddings=True)
         text = top.get("text_config", top)
         quantization = top.get("quantization_config") or text.get("quantization_config")
-        if not quantization or quantization.get("quant_method") != "fp8":
-            raise ValueError(f"{self.path} is not a block-FP8 checkpoint")
-        block = quantization.get("weight_block_size", [BLOCK, BLOCK])
-        if list(block) != [BLOCK, BLOCK]:
-            raise ValueError(f"unsupported FP8 block size {block}")
+        if weight_block(quantization) != [BLOCK, BLOCK]:
+            raise ValueError(f"{self.path} is not a 128x128 block-FP8 checkpoint")
         self.files = Safetensors(self.path)
         prefix = "model.language_model."
         self.prefix = (
@@ -288,7 +285,7 @@ class Qwen35Checkpoint:
         array, dtype = self.files.raw(name)
         if dtype != "F8_E4M3":
             raise ValueError(f"{name}: expected block FP8, got {dtype}")
-        scales = self._f32(name + "_scale_inv").copy()
+        scales = self._f32(scale_suffix(self.files, name)).copy()
         weight = np.asarray(array)
         if self._halve is None:  # OCP-range bytes (the original release)?
             self._halve = bool(np.nanmax(np.abs(E4M3[weight[:256]])) > FP8_MAX)

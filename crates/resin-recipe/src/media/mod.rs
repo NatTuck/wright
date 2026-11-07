@@ -121,6 +121,119 @@ impl RgbImage {
     }
 }
 
+/// Torchvision's bicubic resize, which is what HF's image processors use.
+///
+/// The kernel is **not** the difference: torchvision's cubic coefficient is -0.5, the same
+/// Catmull-Rom the `image` crate's `FilterType::CatmullRom` uses, and a float reimplementation
+/// of the separable form matches `tvF.resize` on a float tensor to 0.0000. What differs is
+/// that HF's pipeline resizes **uint8** tensors, so torchvision quantizes to 8 bits **between
+/// the two separable passes** as well as at the end. Without that intermediate rounding the
+/// cubic's overshoot survives to the second pass, and on a 2.5x upscale of a black circle on
+/// white the two disagree by up to 18 levels of 255 - 0.14 in the normalized tensor, which is
+/// not rounding.
+///
+/// With the intermediate quantization this reproduces torchvision on the measured branches:
+/// 0 differing pixels on a 1000x64 -> 1024x96 resize and on 300x500 -> 288x512, and 21 of
+/// 196608 on 100x100 -> 256x256 (tie rounding). The source and the result are [0, 1] f32,
+/// which is what `RgbImage` holds; the arithmetic runs in 8-bit levels.
+pub fn resize_torchvision_bicubic(
+    image: &RgbImage,
+    width: usize,
+    height: usize,
+) -> Result<RgbImage, Error> {
+    const A: f64 = -0.5; // Catmull-Rom, and torchvision's bicubic
+    fn cubic(x: f64) -> f64 {
+        let x = x.abs();
+        if x < 1.0 {
+            ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+        } else if x < 2.0 {
+            ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A
+        } else {
+            0.0
+        }
+    }
+    /// (source index, weight) per output sample: the support widens by the reduction factor,
+    /// which is what makes a downscale antialias, and the weights are normalized.
+    fn weights(input: usize, output: usize) -> Vec<Vec<(usize, f64)>> {
+        let scale = input as f64 / output as f64;
+        let filter_scale = scale.max(1.0);
+        (0..output)
+            .map(|i| {
+                let center = scale * (i as f64 + 0.5);
+                let low = (center - 2.0 * filter_scale + 0.5).floor().max(0.0) as usize;
+                let high = (center + 2.0 * filter_scale - 0.5)
+                    .ceil()
+                    .min(input as f64) as usize;
+                let mut row: Vec<(usize, f64)> = (low..high)
+                    .map(|j| (j, cubic((j as f64 + 0.5 - center) / filter_scale)))
+                    .collect();
+                let sum: f64 = row.iter().map(|(_, v)| v).sum();
+                if sum != 0.0 {
+                    for (_, v) in &mut row {
+                        *v /= sum;
+                    }
+                }
+                row
+            })
+            .collect()
+    }
+    let dims = [image.width, image.height, width, height].map(u32::try_from);
+    let [Ok(sw), Ok(sh), Ok(dw), Ok(dh)] = dims else {
+        return Err(Error::new("image dimensions exceed u32"));
+    };
+    if dw == 0 || dh == 0 {
+        return Err(Error::new("resized image dimensions must be positive"));
+    }
+    if (sw, sh) == (dw, dh) {
+        return Ok(image.clone());
+    }
+    // levels, as torchvision's uint8 path sees them
+    // round, not truncate: `v * 255.0` for a level stored as f32 can land just below the
+    // integer, and truncating there turns 100 into 99 before the filter has run
+    let source: Vec<f64> = image
+        .data
+        .iter()
+        .map(|v| (v * 255.0).round() as f64)
+        .collect();
+    // half-to-even, which is what torchvision's uint8 cast does; `round()` rounds halves away
+    // from zero and leaves a one-level difference on the ties
+    let quantize = |v: f64| v.round_ties_even().clamp(0.0, 255.0);
+    let wx = weights(image.width, width);
+    let wy = weights(image.height, height);
+    let mut horizontal = vec![0.0f64; image.height * width * 3];
+    for y in 0..image.height {
+        for (x, row) in wx.iter().enumerate() {
+            for &(src, weight) in row {
+                for c in 0..3 {
+                    horizontal[(y * width + x) * 3 + c] +=
+                        source[(y * image.width + src) * 3 + c] * weight;
+                }
+            }
+        }
+    }
+    // the intermediate is 8-bit in torchvision, and that is the whole difference
+    for value in &mut horizontal {
+        *value = quantize(*value);
+    }
+    let mut data = vec![0.0f32; height * width * 3];
+    for (y, row) in wy.iter().enumerate() {
+        for x in 0..width {
+            for c in 0..3 {
+                let mut acc = 0.0f64;
+                for &(src, weight) in row {
+                    acc += horizontal[(src * width + x) * 3 + c] * weight;
+                }
+                data[(y * width + x) * 3 + c] = (quantize(acc) / 255.0) as f32;
+            }
+        }
+    }
+    Ok(RgbImage {
+        width,
+        height,
+        data,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct Video {
     pub frames: Vec<RgbImage>,
