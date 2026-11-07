@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -120,13 +121,15 @@ MODEL_SPECS = {
             repo_id="Qwen/Qwen3.8-27B-FP8",
             revision="017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
             directory="",
+            # The MTP weights are listed in the safetensor index, as `mtp.safetensors` in the
+            # official release or inside a numbered shard in a compressed-tensors export, so the
+            # index check below covers them. check_gaudi_drafts decides whether drafts can run.
             required_files=(
                 "config.json",
                 "generation_config.json",
                 "tokenizer.json",
                 "tokenizer_config.json",
                 "preprocessor_config.json",
-                "mtp.safetensors",
             ),
             patterns=(
                 "*.json",
@@ -143,7 +146,11 @@ MODEL_SPECS = {
         context_length=32_768,
         max_batch_size=32,
         draft_tokens=2,
-        media=False,
+        # Qwen3.8-27B's vision tower runs on the card and answers the accuracy set 19/19
+        # (docs/vision.md). `image_warmup` compiles and loads the image path at startup, so
+        # the first image request does not pay a compile. The dense presets below have none.
+        media=True,
+        image_warmup=True,
     ),
     # The smaller dense Qwen3.5 models, in FP8 from a third party, with no MTP weights.
     **{
@@ -421,7 +428,13 @@ def require_checkpoint(
 
 def warm_engine(engine, recipe, spec: ModelSpec, rank: int = 0) -> None:
     """Run a short greedy request (and an image one on presets that warm their media
-    tower) through a fresh engine before it serves."""
+    tower) through a fresh engine before it serves.
+
+    The text warmup failing is fatal - something is broken and the server must not come up
+    pretending otherwise. The image warmup failing is not: a bad checkpoint, a missing
+    preprocessor config or a grid that will not compile should cost the image feature, not
+    the whole server, so it warns and continues.
+    """
     import numpy as np
 
     from resin import SamplingParams
@@ -429,7 +442,8 @@ def warm_engine(engine, recipe, spec: ModelSpec, rank: int = 0) -> None:
 
     # Exercise several decode steps, rather than ending after a one-word reply.
     content = [Text("Count from 1 to 100.")]
-    for image_input in (False, True) if spec.image_warmup else (False,):
+
+    def warm_one(image_input: bool) -> None:
         lease = None
         # This function runs only on attention replica drivers. Warm each
         # replica's image tower; round-robin or sticky HTTP routing may use any
@@ -461,6 +475,18 @@ def warm_engine(engine, recipe, spec: ModelSpec, rank: int = 0) -> None:
             engine.step()
         if lease is not None:
             lease.take_result()
+
+    for image_input in (False, True) if spec.image_warmup else (False,):
+        try:
+            warm_one(image_input)
+        except Exception as error:  # noqa: BLE001 - a warmup must not decide the server's fate
+            if not image_input:
+                raise
+            warnings.warn(
+                f"image warmup failed, so this server will serve text only: {error!r}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 def create_runner(
@@ -599,6 +625,8 @@ def _create_gaudi_runner(
         if gpu_memory_utilization is None
         else gpu_memory_utilization,
         mtp=draft_tokens,
+        # the preset decides: a text-only deployment does not compile the media embed graph
+        media=spec.media,
     )
 
 
@@ -794,6 +822,44 @@ class TextOnlyRecipe:
         return self._recipe.create_parser(prompt)
 
 
+class StillImageRecipe:
+    """A media recipe whose runner serves one still image per prompt.
+
+    Multiple images and video are refused at render time: a media request the
+    runner cannot place has no per-request error channel - an exception inside
+    ``runner.forward`` kills the inference actor and the server with it, where a
+    render error is an ordinary bad request.
+    """
+
+    def __init__(self, recipe) -> None:
+        self._recipe = recipe
+
+    @property
+    def stop_token_ids(self):
+        return self._recipe.stop_token_ids
+
+    @property
+    def tokenizer(self):
+        return self._recipe.tokenizer
+
+    def render(self, messages, *, tools=(), options=None):
+        prompt = self._recipe.render(messages, tools=tools, options=options)
+        media = prompt.media
+        if media is not None:
+            import numpy as np
+
+            grids = np.asarray(media.image_grid_thw)
+            if grids.shape[0] != 1 or int(grids[0, 0]) != 1:
+                raise ValueError(
+                    "this preset serves one still image per prompt; "
+                    "multiple images and video are not supported yet"
+                )
+        return prompt
+
+    def create_parser(self, prompt):
+        return self._recipe.create_parser(prompt)
+
+
 def create_recipe(
     model: str | ModelSpec,
     checkpoint: str | Path | None = None,
@@ -820,6 +886,27 @@ def create_recipe(
             get_native_recipe(
                 name,
                 Tokenizer.from_file(str(path / "tokenizer.json")),
+                **dict(spec.recipe_options),
+            )
+        )
+    if spec.family == "qwen3_5":
+        # The vision tower needs no AutoProcessor. `media::qwen::Config` on the Rust side is
+        # exactly the checkpoint's own preprocessor_config.json - both structs are
+        # #[serde(default)], so absent keys take their defaults and the processor_class keys
+        # are ignored - so the file goes straight in as media_config. Keeping transformers
+        # out of this path is what lets the gaudi group serve images at all.
+        from tokenizers import Tokenizer
+
+        preprocessor = path / "preprocessor_config.json"
+        if not preprocessor.exists():
+            raise FileNotFoundError(
+                f"{preprocessor}: the vision tower takes its image processor config from here"
+            )
+        return StillImageRecipe(
+            get_native_recipe(
+                name,
+                Tokenizer.from_file(str(path / "tokenizer.json")),
+                media_config=json.loads(preprocessor.read_text()),
                 **dict(spec.recipe_options),
             )
         )

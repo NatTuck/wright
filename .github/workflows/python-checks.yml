@@ -47,6 +47,10 @@ jobs:
           models/gaudi/tests/test_gguf.py
           models/gaudi/tests/test_ml4_cache.py
           models/gaudi/tests/test_qwen_checkpoint.py
+          models/gaudi/tests/test_qwen_mrope.py
+          models/gaudi/tests/test_qwen_vision.py
+          models/gaudi/tests/test_qwen_vision_preprocess.py
+          models/gaudi/tests/test_qwen_vision_rope_binding.py
           models/gaudi/tests/test_sampling_plan.py
           models/gaudi/tests/test_trace.py
           --ignore=tests/recipe_fuzz

@@ -114,6 +114,16 @@ class RowCache:
     mtp_blocks: np.ndarray | None = None
     state_first: int = 0
     state_rows: tuple[int, ...] = ()
+    # what the rope index is offset by: the prompt's mrope delta (`ImagePrompt.delta`). Only
+    # the rope is compressed - `pos0` is the token position and stays the cache's index, and
+    # `pos0 + pos_delta` is the position the model rotates as. After an image prompt the two
+    # differ by the image's token count minus its merged grid's larger side.
+    pos_delta: int = 0
+
+    @property
+    def rope_at(self) -> int:
+        """The rope position of this row's first token."""
+        return self.pos0 + self.pos_delta
 
     def state_at(self, position: int) -> int:
         if not self.state_rows:
@@ -251,6 +261,56 @@ class _Binds:
     addresses: np.ndarray
 
 
+def slice_media(media, i: int, real: int, columns: int):
+    """The part of a prompt's media that falls inside the chunk starting at token ``i``.
+
+    ``media`` is (features (image tokens, hidden), first prompt column, count, rope rows
+    (prompt tokens, 128), the prompt's mrope delta); the image tokens are contiguous in the
+    prompt, which is what makes a (first, count) span enough. Returns the same five for this
+    chunk, or None when the chunk holds no image token at all - the usual case for a long
+    text prompt, where the plan must not carry the splice.
+    """
+    features, first, count, rope, delta = media
+    lo = max(first - i, 0)
+    hi = min(first + count - i, real)
+    if hi <= lo:
+        return None
+    k0 = lo + i - first
+    rows = rope[i : i + columns]
+    if len(rows) < columns:  # the last chunk is short; the tail columns are padding
+        rows = np.concatenate(
+            [rows, np.zeros((columns - len(rows), rope.shape[1]), np.float32)]
+        )
+    return (
+        features[k0 : k0 + (hi - lo)],
+        lo,
+        hi - lo,
+        np.ascontiguousarray(rows, np.float32),
+        delta,
+    )
+
+
+def image_block(features: np.ndarray, count: int, tokens: int, hidden: int) -> np.ndarray:
+    """The host array `splice`'s ``img`` input must receive: (tokens, hidden) f32.
+
+    Device tensors are token-major - a logical ``(n, T)`` tensor lives at flat ``t * n + i``
+    - so the ``(H, T)`` tensor the embed graph declares takes a ``(T, H)`` host array, and
+    the features go in its first ``count`` rows. ``features`` is (count, hidden).
+
+    Getting this wrong is silent and severe: the compact ``(hidden, count)`` array the
+    upload used to send put feature ``k`` at flat ``h * count``, which the kernel read as
+    some other ``(h, t)``. Every value was still there, in the wrong place, so the model
+    could tell an image was present and never what it was. `test_qwen_vision` pins the
+    layout; `emb_img_check` and the accuracy set pin the behaviour.
+    """
+    features = np.asarray(features, np.float32)
+    if features.shape != (count, hidden):
+        raise ValueError(f"features must be ({count}, {hidden}), got {features.shape}")
+    block = np.zeros((tokens, hidden), np.float32)
+    block[:count] = features
+    return block
+
+
 class Qwen35Gaudi:
     """``prefill(row, ids)`` runs one sequence's tokens; ``decode(rows, tokens)`` one token of
     each sequence; with MTP, ``verify(rows, anchors, drafts)`` one speculative step of each."""
@@ -270,8 +330,12 @@ class Qwen35Gaudi:
         decode_slots: int | None = None,
         mtp: int = 0,
         layers: int | None = None,
+        media: bool = False,
     ) -> None:
         self.device = device
+        # a text-only deployment must not pay for the media embed graph, and a request that
+        # arrives with media on a model built without it is a bug worth failing on
+        self.media = media
         ckpt = Qwen35Checkpoint(checkpoint)
         self.config = config = ckpt.config
         self.dims = Dims.from_config(config)
@@ -361,6 +425,9 @@ class Qwen35Gaudi:
             "kv_rows": buf(T * 8 * 4),
             "tok": buf(T * 4),
             "pos": buf(T * 4),
+            # the image rows of an embed splice, and its (first, count) span
+            "img": buf(H * T * 4),
+            "img_span": buf(2 * 4),
             "logits": buf(V * T * 4),
             "tok_out": buf(T * 4),
             "lp_out": buf(T * 4),
@@ -375,6 +442,9 @@ class Qwen35Gaudi:
             "score_top_v": buf(SCORE_TOPS[-1] * SCORE_ROWS * 4),
             "score_top_i": buf(SCORE_TOPS[-1] * SCORE_ROWS * 4),
             "cs_tab": buf(self.max_positions * 512),
+            # the media plan's own rope rows: the text table is never overwritten, so there is
+            # no restore and nothing can race with the launches
+            "cs_tab_media": buf(self.max_positions * 512),
             "hidden_table": buf(2 * B * 4),
         }
         for name in (
@@ -451,6 +521,12 @@ class Qwen35Gaudi:
             T = m.columns
             verify = m.per_row if m.name[0] == "v" else 0
             graphs[("embed", m.name)] = embed_graph(dev, d, T)
+            if self.media and m.name[0] == "p":
+                # media only arrives in a prefill, and only a deployment that serves images
+                # builds this variant, so a text-only preset keeps exactly the graphs it has
+                # today - including at startup, where this would otherwise be one extra
+                # compile for something that can never be used
+                graphs[("embed_img", m.name)] = embed_graph(dev, d, T, media=True)
             graphs[("gdn", m.name)] = gdn_layer_graph(
                 dev, d, T, nb, decode=m.name[0] != "p", verify=verify
             )
@@ -539,6 +615,9 @@ class Qwen35Gaudi:
                 names["h16"] = final["h16"]
                 names["x"] = final["x"]
                 names["next_norm"] = w["l0.attn_norm"].address
+                if kind == "embed_img":
+                    names["img"] = self.buf["img"]
+                    names["img_span"] = self.buf["img_span"]
                 if self.mtp:
                     names["gdn_pend"], names["gdn_pconv"] = self.pend, self.pconv
             else:
@@ -584,12 +663,21 @@ class Qwen35Gaudi:
 
     # ---- launching
     def _upload(self, address: int, array: np.ndarray) -> None:
-        """Queue a table upload behind the launches already submitted."""
-        array = np.ascontiguousarray(array)
-        if array.nbytes <= 65536:
-            self.device.h2d_nb(address, array)
-        else:
-            self.device.h2d(address, array)
+        """Queue a table upload behind the launches already submitted.
+
+        ``h2d_nb`` carries at most 64 KiB, so a larger table goes as consecutive queued
+        chunks instead of falling back to the blocking ``h2d``. That fallback was silent
+        and changed the meaning of every caller: below 64 KiB the copy was ordered after
+        the launches already submitted, above it the host waited for a copy that is not
+        ordered against them at all. The tables this matters for are exactly the large
+        ones - ``kv_rows`` for a big prefill bucket, the image block, a long rope table -
+        and a copy landing under a pending launch is how a plan reads a table that has
+        not been written yet.
+        """
+        raw = np.ascontiguousarray(array).view(np.uint8).reshape(-1)
+        for offset in range(0, raw.size, 65536):
+            chunk = np.ascontiguousarray(raw[offset : offset + 65536])
+            self.device.h2d_nb(address + offset, chunk)
 
     def _launch(
         self,
@@ -654,11 +742,18 @@ class Qwen35Gaudi:
             np.concatenate([b.addresses, addresses]),
         )
 
-    def _attention_steps(self, mode: _Mode, layer: int, variant: str, tables) -> list:
-        """A full-attention layer's launches: pre, one slot launch per table, post."""
+    def _attention_steps(
+        self, mode: _Mode, layer: int, variant: str, tables, media: bool = False
+    ) -> list:
+        """A full-attention layer's launches: pre, one slot launch per table, post.
+
+        ``media`` binds the pre graph's rope table to the media buffer, so a media plan reads
+        the mrope rows it uploaded and a text plan keeps the standard table untouched.
+        """
         recipe = self.recipe[("slots", mode.name)]
         b = self.binds[("slots", mode.name, layer, variant)]
-        steps = [self._step("pre", mode.name, layer, variant)]
+        extra = {"cs_tab": self.buf["cs_tab_media"]} if media else None
+        steps = [self._step("pre", mode.name, layer, variant, extra=extra)]
         for slots, addresses in tables:
             steps.append(
                 (
@@ -692,6 +787,7 @@ class Qwen35Gaudi:
         real: int,
         params: np.ndarray,
         token_source: int | None = None,
+        media: tuple[np.ndarray, int, int, np.ndarray] | None = None,
     ) -> None:
         """Launch the target model over ``mode``'s columns: ``tokens`` (columns,), or a
         callable returning them (called once the step's tables are queued), or with
@@ -703,12 +799,17 @@ class Qwen35Gaudi:
         dev.h2d_nb(self.buf["samp_params"], params)
         pos = np.zeros(T, np.int32)
         if prefill:
-            pos[:] = np.minimum(rows[0].pos0 + np.arange(T), self.max_positions - 1)
+            # `pos` is the rope index, so it is the compressed position; `starts` is the
+            # cache's, so it is not. A media chunk overwrites `pos` with arange(T) because
+            # its rope table is per-token (see `_splice_media`).
+            pos[:] = np.minimum(
+                rows[0].rope_at + np.arange(T), self.max_positions - 1
+            )
             starts = ([rows[0].pos0], real)
         else:
             q = mode.per_row
             for i, row in enumerate(rows):
-                pos[i * q : (i + 1) * q] = row.pos0 + np.arange(q)
+                pos[i * q : (i + 1) * q] = row.rope_at + np.arange(q)
             starts = ([row.pos0 for row in rows], q)
         if (
             int(pos[: real if prefill else len(rows) * mode.per_row].max())
@@ -730,19 +831,49 @@ class Qwen35Gaudi:
             tokens = tokens() if callable(tokens) else tokens
             dev.h2d_nb(self.buf["tok"], np.asarray(tokens).astype(np.int32))
         # a pass's launches depend only on its mode, slot launches and token source
-        key = ("target", mode.name, len(tables), token_source)
+        # media changes the embed graph, so it is part of the plan's identity: without it
+        # the text plan would be reused for an image prompt, silently
+        key = ("target", mode.name, len(tables), token_source, media is not None)
         plan = self._plans.get(key)
         if plan is None:
             extra = None if token_source is None else {"tok": token_source}
-            steps = [self._step("embed", mode.name, extra=extra)]
+            kind = "embed_img" if media is not None else "embed"
+            steps = [self._step(kind, mode.name, extra=extra)]
             for i in range(self.n_layers):
                 if i in self.gdn:
                     steps.append(self._step("gdn", mode.name, i))
                 else:
-                    steps += self._attention_steps(mode, i, "", tables)
+                    steps += self._attention_steps(mode, i, "", tables, media=media is not None)
             steps.append(self._step("head", mode.name))
             plan = self._plans[key] = LaunchPlan(self.device, steps)
+        if media is not None:
+            if not self.media:
+                raise ValueError(
+                    "this model was built without media support (media=False); "
+                    "enable it on the preset rather than sending image rows"
+                )
+            self._splice_media(media, T)
         plan.run()
+
+    def _splice_media(self, media, T: int) -> None:
+        """Queue this chunk's image rows and its per-token rope rows.
+
+        ``media`` is (image rows for this chunk (n, H), first column, n, rope rows (T, 128)).
+        The rope is safe to express as a per-token table because `attn_pre_graph` gathers
+        `cs_tab` by a per-token index: `pos = arange(T)` selects the row this token needs.
+        If that gather is ever changed to a position index, mrope breaks here and a batched
+        prefill collides.
+        """
+        img, first, count, rope, _delta = media  # the delta is the sequence's, not the plan's
+        self._upload(
+            self.buf["img"], image_block(img, count, T, self.dims.hidden)
+        )
+        self._upload(self.buf["img_span"], np.array([first, count], np.int32))
+        # blocking, into the media plan's own buffer: ordered by construction (the host does not
+        # proceed until the copy completes) and not at `_upload`'s size threshold, so no launch
+        # can read a stale table and no other plan can clobber it
+        self.device.h2d(self.buf["cs_tab_media"], np.ascontiguousarray(np.asarray(rope, np.float32)))
+        self._upload(self.buf["pos"], np.arange(T, dtype=np.int32))
 
     def _write_state_tables(self, rows: Sequence[RowCache], prefill: bool) -> None:
         """Every GDN layer's state rows for this step: [conv_src, ssm_src, conv_dst, ssm_dst]
@@ -802,8 +933,11 @@ class Qwen35Gaudi:
         pos = np.zeros(T, np.int32)
         q = mode.per_row
         for i, start in enumerate(starts):
+            # the MTP layer rotates at the compressed position too; its KV rows are at
+            # `starts`, which stay the token positions
+            shift = rows[i].pos_delta
             pos[i * q : i * q + (real if mode.name[0] == "p" else q)] = (
-                start + np.arange(real if mode.name[0] == "p" else q)
+                start + shift + np.arange(real if mode.name[0] == "p" else q)
             )
         dev.h2d_nb(self.buf["pos"], np.minimum(pos, self.max_positions - 1))
         slot_rows = self._pages(mode, rows, True, (list(starts), real))
@@ -903,6 +1037,7 @@ class Qwen35Gaudi:
         sampling: Sampling | np.ndarray | None = None,
         scores: ScoreRequest | None = None,
         draft: bool = True,
+        media: tuple[np.ndarray, int, int, np.ndarray] | None = None,
     ) -> Prefilled:
         """One sequence's tokens at row.pos0, in bucketed chunks: the next token, sampled with
         ``sampling`` (1 row) after the last chunk (None: greedy), the requested prompt scores
@@ -928,14 +1063,26 @@ class Qwen35Gaudi:
             params = np.zeros((1, PARAMS), np.float32)
             if last and sampling is not None:
                 params[:] = sampling.params[:1]
-            self._target(mode, [chunk], tokens, real, params)
+            chunk_media = None
+            if media is not None:
+                # the image span is in prompt coordinates; the splice works in this chunk's
+                chunk_media = slice_media(media, i, real, T)
+            self._target(mode, [chunk], tokens, real, params, media=chunk_media)
             token = int(self.device.d2h(self.buf["tok_out"], (1,), np.int32)[0])
             if scores is not None:
                 inside = np.flatnonzero(
                     (scores.positions >= i) & (scores.positions < i + real)
                 )
                 self._score(scores, inside, i, result)
-            if self.mtp:
+            # An image prompt does not use MTP. The MTP layer over the prompt's image tokens
+            # would need those tokens' mrope rows, and `_mtp_pass` binds the position-indexed
+            # text table; the columns are also shifted by one from the target's, so the rows
+            # are not simply this chunk's. Rather than bind the wrong table, the whole MTP
+            # pass is skipped for a media prompt - no MTP KV, no drafts - and the runner
+            # decodes such a sequence without speculation. (A decode step after an image is
+            # fine either way: the text table is indexed by position, and the positions are
+            # the compressed ones `RowCache.pos_delta` passes.)
+            if self.mtp and media is None:
                 drafts = self._prefill_mtp(
                     chunk, ids, i, real, tokens, last and draft, sampling
                 )
@@ -1282,6 +1429,7 @@ class SingleSequence:
 
     def reset(self) -> None:
         self.pos = 0
+        self.pos_delta = 0
         self.state_blocks: dict[int, int] = {}
         self.drafts: np.ndarray | None = None
 
@@ -1311,11 +1459,14 @@ class SingleSequence:
         if kv_slabs.max() > top:
             raise MemoryError("sequence exceeds its slabs")
         rows = g.kv_block_row(kv_slabs, blocks % per_slab)
-        return RowCache(self.pos, rows, src, dst, mtp_rows, first, states)
+        return RowCache(self.pos, rows, src, dst, mtp_rows, first, states, self.pos_delta)
 
-    def prefill(self, ids: Sequence[int], sampling=None) -> int:
-        done = self.model.prefill(self._row(len(ids)), ids, sampling)
+    def prefill(self, ids: Sequence[int], sampling=None, media=None) -> int:
+        done = self.model.prefill(self._row(len(ids)), ids, sampling, media=media)
         self.pos += len(ids)
+        # the prompt's own positions come from its rope rows; every later step rotates at the
+        # token position plus this, which is what makes a decode after an image correct
+        self.pos_delta = 0 if media is None else int(media[4])
         self.drafts = done.drafts
         return done.token
 

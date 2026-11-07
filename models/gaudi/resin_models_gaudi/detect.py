@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from resin_models_gaudi.quant import BLOCK, weight_block
+
 # GGUF file type of the Q4_K_XL weights that the Mistral-Large-4 kernels run.
 _GGUF_Q4_K = 15
 _GGUF_DIRECTORY = "UD-Q4_K_XL"
@@ -48,8 +50,8 @@ def _safetensors(path: Path, config: dict) -> Detected:
             f"{path}: model type {kind!r} has no Gaudi runner. Wright runs {supported}"
         )
     preset, name = _ARCHITECTURES[kind]
+    text = config.get("text_config", config)
     if kind == "qwen3_5":
-        text = config.get("text_config", config)
         shape = (text.get("hidden_size"), text.get("num_hidden_layers"))
         if shape not in _QWEN_SIZES:
             sizes = ", ".join(size for _, size in _QWEN_SIZES.values())
@@ -58,11 +60,14 @@ def _safetensors(path: Path, config: dict) -> Detected:
                 f"Wright runs {sizes}"
             )
         preset, name = _QWEN_SIZES[shape]
-    method = (config.get("quantization_config") or {}).get("quant_method")
-    if method != "fp8":
+    quantization = config.get("quantization_config") or text.get("quantization_config")
+    block = weight_block(quantization)
+    method = (quantization or {}).get("quant_method")
+    if block != [BLOCK, BLOCK]:
+        detail = f"{method} with block size {block}" if block else (method or "no quantization")
         raise DetectionError(
-            f"{path}: {name} needs FP8 weights, and this checkpoint has "
-            f"{method or 'no quantization'}"
+            f"{path}: {name} needs FP8 weights in 128x128 blocks, and this checkpoint has "
+            f"{detail}"
         )
     return Detected(preset, name, path)
 

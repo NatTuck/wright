@@ -152,6 +152,28 @@ class _Completion:
         return self._result
 
 
+def image_span(ids, count: int) -> int:
+    """Where the image's ``count`` placeholder tokens start in the prompt.
+
+    Kept for callers that prepare a prompt from whole-rendered media (the dev harnesses);
+    serving does not use it - see `Qwen3_5GaudiRunner._vision` for why scanning token ids
+    cannot work across prefill chunks.
+    """
+    runs, start = [], 0
+    for i in range(1, len(ids) + 1):
+        if i == len(ids) or ids[i] != ids[start]:
+            runs.append((start, i - start))
+            start = i
+    hits = [first for first, length in runs if length == count]
+    if len(hits) != 1:
+        found = ", ".join(str(first) for first in hits) or "none"
+        raise ValueError(
+            f"cannot place the image: the prompt has {len(hits)} maximal runs of {count} "
+            f"identical tokens (expected exactly 1), starting at {found}"
+        )
+    return hits[0]
+
+
 class Qwen3_5GaudiRunner:
     """``ManagedRunner`` over ``Qwen35Gaudi``."""
 
@@ -165,10 +187,14 @@ class Qwen3_5GaudiRunner:
         memory_utilization: float = 0.9,
         parent_capacity: int | None = None,
         mtp: int = 0,
+        media: bool = False,
     ) -> None:
         if max_batch_size > DECODE_BUCKETS[-1]:
             raise ValueError(f"max_batch_size exceeds {DECODE_BUCKETS[-1]}")
         self.device = open_device(card)
+        self.checkpoint = checkpoint
+        self._tower = None  # built on the first image, so a text server never loads it
+        self._prepared = {}  # media digest -> ImagePrompt, so chunks reuse one tower run
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.model = Qwen35Gaudi(
@@ -180,6 +206,7 @@ class Qwen3_5GaudiRunner:
             decode_buckets=[b for b in DECODE_BUCKETS if b < max_batch_size]
             + [min(b for b in DECODE_BUCKETS if b >= max_batch_size)],
             mtp=mtp,
+            media=media,
         )
         self.mtp = mtp
         self.speculative_tokens = mtp
@@ -189,6 +216,13 @@ class Qwen3_5GaudiRunner:
         self.lookahead = 2 * mtp - 1 if mtp else 0
         # sequence id -> (the next anchor's position, the anchor token, its drafts)
         self._drafts: dict[int, tuple[int, int, np.ndarray]] = {}
+        # each sequence's mrope delta: after an image prompt the model rotates at the token
+        # position plus this, because the image's tokens occupy fewer positions than they
+        # have tokens. Text prompts leave it at zero.
+        self._rope_delta: dict[int, int] = {}
+        # sequences whose history includes an image: they decode without speculation, because
+        # an image prompt does not run the MTP pass (see `Qwen35Gaudi.prefill`)
+        self._no_mtp: set[int] = set()
         self._stage = 0  # the next enqueued step's staging set
         self._open: _Verification | None = None  # the last enqueued MTP step
         self.geometry = self.model.geometry
@@ -259,6 +293,7 @@ class Qwen3_5GaudiRunner:
                     else g.mtp_block_row(mtp.block_slabs(r), mtp.block_slots(r)),
                     first_state,
                     states,
+                    self._rope_delta.get(int(batch.sequence_ids[r]), 0),
                 )
             )
         return rows
@@ -279,6 +314,51 @@ class Qwen3_5GaudiRunner:
                 stacklevel=3,
             )
 
+    def _vision(self, media):
+        """The image rows, their span and this prompt's rope rows, or None for text.
+
+        The tower is built on the first image and kept: loading and uploading the checkpoint
+        is 5-15 s, which must not be paid per request. `RESIN_GAUDI_VISION` decides whether
+        it runs on the card or on the CPU oracle.
+
+        The span comes from the media payload's ``image_positions`` (see
+        `prepare_image_prompt`); the token ids are not scanned, because this runner only
+        ever sees one prefill chunk's tokens and the image's run of placeholders can be
+        split across chunks (or start inside a prefix-cache restore). The prepared prompt
+        is cached on the payload's ``digest``: a chunked prefill hands every chunk the same
+        media, and without the cache the tower would rerun per chunk.
+        """
+        if media is None:
+            return None
+        from resin_models_gaudi.qwen3_5.media import (
+            prepare_image_prompt,
+            tower_from_checkpoint,
+        )
+
+        if self._tower is None:
+            import json
+            from pathlib import Path
+
+            raw = json.loads((Path(self.checkpoint) / "config.json").read_text())
+            self._tower = tower_from_checkpoint(self.checkpoint, raw, self.device)
+        key = media.digest
+        prompt = self._prepared.get(key)
+        if prompt is None:
+            prompt = prepare_image_prompt(media, self._tower, self.model.config)
+            self._prepared = {key: prompt}
+        return (
+            prompt.features,
+            prompt.first,
+            prompt.image_tokens,
+            prompt.rope,
+            prompt.delta,
+        )
+
+    def _plain(self, plan) -> bool:
+        """Whether this batch must decode without speculation: any row with an image in its
+        history, since an image prompt does not run the MTP pass."""
+        return any(int(sequence) in self._no_mtp for sequence in plan.sequence_ids)
+
     def _settle(self, feedback=None) -> None:
         """Finish an enqueued MTP step that ``feedback`` does not continue, so its commit
         precedes any other work."""
@@ -289,10 +369,6 @@ class Qwen3_5GaudiRunner:
     def forward(self, plan) -> ForwardOutput:
         self._check_compiles()
         self._settle()
-        if any(media is not None for media in plan.media):
-            raise NotImplementedError(
-                "this runner has no vision tower; text prompts only"
-            )
         decode = plan.phase == BatchPhase.DECODE
         cache = PagedCachePlan.from_plan(
             plan, self.cache_layout, decode_lookahead=self.lookahead if decode else 0
@@ -309,12 +385,21 @@ class Qwen3_5GaudiRunner:
         wanted = [p.top_logprobs for p in plan.sampling_params if p.logprobs]
         if wanted and max(wanted) > TOP_MAX:
             raise NotImplementedError(f"top_logprobs above {TOP_MAX}")
+        if batch.phase == BatchPhase.PREFILL:
+            # a prompt starting at position 0 replaces the sequence's history, and an image
+            # prompt sets its own delta below; either way nothing older may survive into the
+            # rows this plan builds. `_no_mtp` goes too: a sequence re-prefilled from
+            # scratch is a new conversation and speculates again
+            for r in range(batch.num_sequences):
+                if int(batch.context_lengths[r]) == 0 or plan.media[r] is not None:
+                    self._rope_delta.pop(int(batch.sequence_ids[r]), None)
+                    self._no_mtp.discard(int(batch.sequence_ids[r]))
         rows = self._rows(cache)
         seeds, offsets = plan_seeds(plan)
         scores = plan.needs_logprobs
         lp = top_ids = top_lp = None
         prompt_scores = []
-        if decode and self.mtp:
+        if decode and self.mtp and not self._plain(plan):
             return self._speculate(plan, rows, params, Sampling(params, seeds, offsets))
         if batch.phase == BatchPhase.PREFILL:
             tokens, parts = [], []
@@ -324,9 +409,18 @@ class Qwen3_5GaudiRunner:
                 sampling = Sampling(
                     params[r : r + 1], seeds[r : r + 1], offsets[r : r + 1]
                 )
+                vision = self._vision(plan.media[r])
                 done = self.model.prefill(
-                    row, ids, sampling, requests[r], draft=bool(plan.sampling_mask[r])
+                    row,
+                    ids,
+                    sampling,
+                    requests[r],
+                    draft=bool(plan.sampling_mask[r]),
+                    media=vision,
                 )
+                if vision is not None:
+                    self._rope_delta[int(batch.sequence_ids[r])] = int(vision[4])
+                    self._no_mtp.add(int(batch.sequence_ids[r]))
                 tokens.append(done.token)
                 prompt_scores.append(done.scores)
                 if done.drafts is not None:
@@ -392,7 +486,7 @@ class Qwen3_5GaudiRunner:
         stage = self.model.staging[self._stage]
         self._stage ^= 1
         scores = plan.needs_logprobs
-        if not self.mtp:
+        if not self.mtp or self._plain(plan):
             tokens = None if feedback is not None else batch.token_ids.tolist()
             self.model.decode(rows, tokens, sampling, stage=stage, scores=scores)
 
@@ -539,9 +633,11 @@ class Qwen3_5GaudiRunner:
         return columns
 
     def release(self, sequence_ids: list[int]) -> None:
-        """Drop the sequences' carried drafts."""
+        """Drop the sequences' carried drafts and rope deltas."""
         for sequence in sequence_ids:
             self._drafts.pop(int(sequence), None)
+            self._rope_delta.pop(int(sequence), None)
+            self._no_mtp.discard(int(sequence))
 
     def close(self) -> None:
         self._settle()

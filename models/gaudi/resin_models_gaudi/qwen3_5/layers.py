@@ -206,9 +206,16 @@ class LayerGraph:
         return out
 
 
-def embed_graph(device: Device, dims: Dims, tokens: int) -> Graph:
-    """Token embedding + the first layer's input norm -> the carry."""
-    lg = LayerGraph(device, f"qwen35_embed_T{tokens}", dims, tokens)
+def embed_graph(device: Device, dims: Dims, tokens: int, media: bool = False) -> Graph:
+    """Token embedding + the first layer's input norm -> the carry.
+
+    ``media`` adds the splice that replaces the image_pad tokens' embedding with the vision
+    tower's rows. It is a separate graph, not an always-present node with count 0: Synapse
+    will not accept a tensor as both a node's input and its output (`synNodeCreate` status
+    26), so there is no in-place splice, so a count=0 node would copy the whole embedding on
+    every text prefill. A text-only deployment never builds this variant at all.
+    """
+    lg = LayerGraph(device, f"qwen35_embed_T{tokens}" + ("_img" if media else ""), dims, tokens)
     H, T = dims.hidden, tokens
     emb = lg.tensor((H, T), BF16)
     table = lg.weight("E_gather", (H, dims.vocab), BF16)
@@ -220,6 +227,16 @@ def embed_graph(device: Device, dims: Dims, tokens: int) -> Graph:
     )
     x0 = lg.tensor((H, T), F32)
     lg.node("cast_bf16_to_f32", [emb], [x0])
+    if media:
+        # the image rows have to be in place before the norm: a host-side write into the
+        # carry afterwards is too late, the norm has already run on the un-spliced rows
+        spliced = lg.tensor((H, T), F32)
+        lg.node(
+            "rg_splice_f32",
+            [x0, lg.input("img", (H, T), F32), lg.input("img_span", (2,), I32)],
+            [spliced],
+        )
+        x0 = spliced
     lg.add_rms8(x0, None, None, "next_norm", lg.carry_out())
     return lg.g
 

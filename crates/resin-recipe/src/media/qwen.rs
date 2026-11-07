@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{RgbImage, Tensor, resize_filter};
+use super::{RgbImage, Tensor, resize_filter, resize_torchvision_bicubic};
 use crate::Error;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -51,7 +51,10 @@ impl Default for Config {
             do_normalize: true,
             image_mean: [0.5; 3],
             image_std: [0.5; 3],
-            resample: 3,
+            // torchvision's bicubic, which is what HF's image processor uses. The `image`
+            // crate's CatmullRom (3) is PIL's coefficient and does not match HF on any input
+            // that resamples.
+            resample: 4,
         }
     }
 }
@@ -130,7 +133,13 @@ impl Config {
 
     pub fn process(&self, images: &[RgbImage]) -> Result<Prepared, Error> {
         self.validate()?;
-        let filter = resize_filter(self.resample)?;
+        // 4 is torchvision's bicubic, which is what HF's processor uses; 0..3 are the `image`
+        // crate's filters, kept for a config that asks for one explicitly.
+        let filter = if self.resample == 4 {
+            None
+        } else {
+            Some(resize_filter(self.resample)?)
+        };
         let patch = self.patch_size;
         let merge = self.merge_size;
         let temporal = self.temporal_patch_size;
@@ -149,7 +158,10 @@ impl Config {
             let image = if (width, height) == (image.width, image.height) {
                 image
             } else {
-                resized = image.resize(width, height, filter)?;
+                resized = match filter {
+                    Some(filter) => image.resize(width, height, filter)?,
+                    None => resize_torchvision_bicubic(image, width, height)?,
+                };
                 &resized
             };
             let (grid_h, grid_w) = (height / patch, width / patch);
@@ -309,6 +321,58 @@ mod tests {
         // Python's round(2.5) is 2, not 3.
         assert_eq!(small.resize_shape(80, 80).unwrap(), (64, 64));
         assert!(small.resize_shape(201, 1).is_err());
+    }
+
+    #[test]
+    fn the_resize_quantizes_between_its_two_passes_like_torchvision() {
+        // A hard step edge upscaled: the cubic overshoots, and torchvision's uint8 path
+        // clamps the intermediate, so its result never leaves the source range. Without that
+        // intermediate quantization this overshoots by up to 0.14 in the normalized tensor,
+        // which is the difference the pv comparison found on every resampling branch.
+        let (width, height) = (4, 4);
+        let mut data = vec![0.0f32; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                let value = if x < width / 2 { 0.0 } else { 1.0 };
+                for c in 0..3 {
+                    data[(y * width + x) * 3 + c] = value;
+                }
+            }
+        }
+        let image = RgbImage {
+            width,
+            height,
+            data,
+        };
+        let out = resize_torchvision_bicubic(&image, 16, 16).unwrap();
+        assert_eq!((out.width, out.height), (16, 16));
+        for value in &out.data {
+            assert!(
+                (0.0..=1.0).contains(value),
+                "the resize left the source range: {value}"
+            );
+            // every level is a uint8 level, which is what torchvision's path produces
+            let level = value * 255.0;
+            assert!((level - level.round()).abs() < 1e-4, "not a level: {value}");
+        }
+        // an identity resize is the image, untouched
+        let same = resize_torchvision_bicubic(&image, width, height).unwrap();
+        assert_eq!(same.data, image.data);
+        // and a uniform image stays uniform: no ringing anywhere. It lands on the nearest
+        // 8-bit level rather than the exact input, which is the same thing torchvision's
+        // uint8 path does.
+        let flat = RgbImage {
+            width,
+            height,
+            data: vec![0.25; width * height * 3],
+        };
+        let out = resize_torchvision_bicubic(&flat, 13, 7).unwrap();
+        let (low, high) = out
+            .data
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+        assert_eq!(low, high, "a uniform image rang: {low} .. {high}");
+        assert!((low - 0.25).abs() < 1.0 / 255.0);
     }
 
     #[test]

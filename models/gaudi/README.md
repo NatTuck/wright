@@ -15,7 +15,7 @@ kernels. For the commands and the results, read the [root README](../../README.m
 | `resin_models_gaudi/deepseek_v41/` | The DeepSeek-V4.1-Flash runner, cache arena, and weight preparation |
 | `resin_models_gaudi/gguf/` | The GGUF reader and block formats |
 | `tests/` | The tests. Most need a card |
-| `tools/` | Reference models of the numerics, the reference for the DSpark drafter, and DeepSeek-V4.1-Flash development tools |
+| `tools/` | Reference models of the numerics, the reference for the DSpark drafter, DeepSeek-V4.1-Flash development tools, and the Qwen3.8 image harnesses (HF tower reference, preprocessing comparison, accuracy set, single-kernel check) |
 
 ## How it runs
 

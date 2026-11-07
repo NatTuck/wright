@@ -158,10 +158,19 @@ Resin files that Wright changed. The Apache License 2.0 in LICENSE applies to Wr
 kernels below.
 
 The TPC-C kernels in models/gaudi/resin_models_gaudi/kernels/ are licensed under the PolyForm Noncommercial
-License 1.0.0, in models/gaudi/resin_models_gaudi/kernels/LICENSE. They are not licensed under the Apache
-License 2.0. The rest of the engine needs these kernels to run.
+License 1.0.0, in models/gaudi/resin_models_gaudi/kernels/LICENSE, except for the twelve named below. They
+are not licensed under the Apache License 2.0. The rest of the engine needs these kernels to run.
 
 Required Notice: Copyright Aaron Botsis
+
+The kernels added for the Qwen3.8 vision tower are licensed under the GNU Affero General Public License,
+version 3.0 or any later version as published by the Free Software Foundation (AGPL-3.0-or-later):
+
+  Copyright 2026 Nat Tuck, AGPL-3.0-or-later: add.c, add3.c, bias.c, gelu_tanh.c, merge2x2.c, merge4.c,
+  resid_bias.c, rope_vision.c, splice.c
+
+  Copyright Aaron Botsis and Nat Tuck, AGPL-3.0-or-later OR PolyForm-Noncommercial-1.0.0, retaining the
+  Required Notice above: ln_affine.c, ln_pre.c, softmax_rows.c
 
 The GGUF block formats in models/gaudi/resin_models_gaudi/gguf/ and
 models/gaudi/resin_models_gaudi/synapse/native/pack.c follow the format of ggml-quants.c in llama.cpp:
