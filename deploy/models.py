@@ -682,6 +682,15 @@ def checkpoint_weight_bytes(spec: ModelSpec, checkpoint: Path) -> int:
     )
 
 
+def engram_table_bytes(spec: ModelSpec, checkpoint: Path) -> int:
+    """The Engram tables' bytes in the checkpoint: 256 E4M3 bytes and 8 E8M0 scale bytes per row.
+    The host path reads these rows from the file and never copies them to a card."""
+    if spec.family != "deepseek_v41":
+        return 0
+    text = json.loads((checkpoint / "config.json").read_text())["text_config"]
+    return sum(text["engram_num_embeddings"]) * 264
+
+
 def validate_gaudi_options(
     spec: ModelSpec,
     *,

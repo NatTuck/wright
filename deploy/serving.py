@@ -31,6 +31,7 @@ from deploy.models import (
     checkpoint_weight_bytes,
     create_recipe,
     create_runner,
+    engram_table_bytes,
     gaudi_supports_ranks,
     get_model,
     require_checkpoint,
@@ -460,6 +461,7 @@ def serve_gaudi_ranks(parser, args, spec) -> None:
         checkpoint=str(checkpoint),
         weight_bytes=checkpoint_weight_bytes(spec, checkpoint),
         engram=engram,
+        engram_bytes=engram_table_bytes(spec, checkpoint) if engram == "host" else 0,
         tokenizer=None if args.tokenizer is None else str(args.tokenizer),
         alias=args.alias,
         assistant=(
@@ -529,7 +531,7 @@ def _startup_problem(options: dict, states: list[tuple[int, int] | None]) -> str
         )
     if options["num_layers"] is None:
         free = min(state[1] for state in states if state is not None)
-        share = options["weight_bytes"] // len(states)
+        share = (options["weight_bytes"] - options["engram_bytes"]) // len(states)
         if share > free:
             return (
                 f"{options['model']} does not fit at {len(states)} ranks: its weights need "
@@ -578,7 +580,7 @@ def _serve_claimed_rank(rank: int, options: dict, claim) -> None:
         if options["num_layers"] is None:
             estimate_kv_pool(
                 min(state[1] for state in states if state is not None),
-                options["weight_bytes"],
+                options["weight_bytes"] - options["engram_bytes"],
                 ranks,
             )
     groups = ParallelGroups.create(topology, device_backend="gloo", timeout=timeout)
