@@ -67,6 +67,9 @@ class ModelSpec:
     max_batch_size: int = 128
     prefill_chunk_size: int = 4096
     draft_tokens: int = 0
+    # Where the DeepSeek Engram tables live: "card" (this rank's rows, hashed on the device) or
+    # "host" (read from the checkpoint each step; 4 cards cannot hold both tables).
+    engram: str = "card"
     gpu_memory_utilization: float = 0.9
     expert_backend: str = "flashinfer"
     memory: int = 256 * 1024
@@ -476,6 +479,7 @@ def create_runner(
     gpu_memory_utilization: float | None = None,
     assistant_checkpoint: str | Path | None = None,
     num_layers: int | None = None,
+    engram: str | None = None,
 ):
     """Construct one runner with model-specific cache geometry and draft support."""
     spec = get_model(model)
@@ -496,6 +500,7 @@ def create_runner(
             else Path(assistant_checkpoint)
         ),
         num_layers=num_layers,
+        engram=engram,
     )
 
 
@@ -512,6 +517,7 @@ def _create_gaudi_runner(
     gpu_memory_utilization: float | None,
     assistant: Path | None = None,
     num_layers: int | None = None,
+    engram: str | None = None,
 ):
     """One Gaudi card per rank, selected by ``hpu:N`` (its accel index) or the first free one."""
     if spec.family == "glm5_3_flash":
@@ -553,6 +559,7 @@ def _create_gaudi_runner(
             max_batch_size=max_batch_size,
             max_seq_len=context_length + draft_tokens,
             num_layers=num_layers,
+            engram=spec.engram if engram is None else engram,
             draft_tokens=draft_tokens,
         )
     if spec.family == "mistral_large4":

@@ -176,6 +176,12 @@ def argument_parser() -> argparse.ArgumentParser:
         help="test only: run the first N layers of a tensor-parallel preset, skip the fit check",
     )
     parser.add_argument(
+        "--engram",
+        choices=("card", "host"),
+        help="where the DeepSeek Engram tables live: on the cards, or in the checkpoint's file, "
+        "gathered on the host each step (default: the preset's)",
+    )
+    parser.add_argument(
         "--numa",
         choices=("auto", "off", "required"),
         default="auto",
@@ -289,6 +295,8 @@ def _validate(parser, args, spec) -> None:
         and not 0 < args.gpu_memory_utilization < 1
     ):
         parser.error("--gpu-memory-utilization takes a value above 0 and below 1")
+    if args.engram is not None and spec.family != "deepseek_v41":
+        parser.error(f"{spec.name} has no Engram tables; --engram is DeepSeek-V4.1 only")
     problem = check_listen_address(args.host, args.port)
     if problem is not None:
         parser.error(problem)
@@ -415,6 +423,7 @@ def serve_gaudi_ranks(parser, args, spec) -> None:
 
     ranks = args.ranks or spec.world_size
     draft_tokens = spec.draft_tokens if args.draft_tokens is None else args.draft_tokens
+    engram = args.engram or spec.engram
     if args.gpu_memory_utilization is not None:
         parser.error(f"{spec.name} sizes its KV cache from free memory on every rank")
     try:
@@ -450,6 +459,7 @@ def serve_gaudi_ranks(parser, args, spec) -> None:
         numa=args.numa,
         checkpoint=str(checkpoint),
         weight_bytes=checkpoint_weight_bytes(spec, checkpoint),
+        engram=engram,
         tokenizer=None if args.tokenizer is None else str(args.tokenizer),
         alias=args.alias,
         assistant=(
@@ -584,6 +594,7 @@ def _serve_claimed_rank(rank: int, options: dict, claim) -> None:
         draft_tokens=options["draft_tokens"],
         assistant_checkpoint=options["assistant"],
         num_layers=options["num_layers"],
+        engram=options["engram"],
     )
     worker = DistributedWorker(runner, groups)
     engine = None
