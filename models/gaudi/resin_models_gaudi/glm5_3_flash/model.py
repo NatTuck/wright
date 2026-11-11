@@ -20,6 +20,8 @@ token; each chunk stores its last hidden in its STATE block, which the next chun
 
 from __future__ import annotations
 
+import os
+
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -54,7 +56,21 @@ from resin_models_gaudi.glm5_3_flash.weights import NS, RankSlices, Safetensors,
 from resin_models_gaudi.qwen3_5.attention import SlotRow, plan_slots
 from resin_models_gaudi.qwen3_5.model import Sampling
 from resin_models_gaudi.qwen3_5.sampling import PARAMS, TOP_MAX
-from resin_models_gaudi.synapse.graph import LAUNCH_STATS, _PROFILE_STEP
+_LAUNCH_MODE = os.environ.get("RESIN_GAUDI_PROFILE_LAUNCH_MODE", "full")
+# Bind once and launch per step: _Op.args is built at construction and the addresses are mutated
+# only in the GLM MTP path and LaunchPlan.patch, so a DeepSeek decode step re-binds 109 identical
+# slot/address arrays every token (~36 us each, ~3.9 ms/step). Default OFF until the token gate
+# proves it bit-identical: RESIN_GAUDI_LAZY_BIND=1 to try it.
+_LAZY_BIND = os.environ.get("RESIN_GAUDI_LAZY_BIND") == "1"
+_SYNC_EVERY = int(os.environ.get("RESIN_GAUDI_PROFILE_SYNC_EVERY", "0") or 0)
+_SYNC_COUNT = [0]
+
+from resin_models_gaudi.synapse.graph import (
+    LAUNCH_BY_RECIPE,
+    LAST_CALLS,
+    LAUNCH_STATS,
+    _PROFILE_STEP,
+)
 from resin_models_gaudi.synapse.graph import Recipe, RecipeCache
 from resin_models_gaudi.synapse.progress import info, weight_file_bytes
 from resin_models_gaudi.synapse.runtime import Device
@@ -1334,12 +1350,44 @@ class _Op:
 
     def run(self, lib) -> None:
         if _PROFILE_STEP:
-            # the launch path every Gaudi model uses: one bind plus one launch per op
+            # the launch path every Gaudi model uses: one bind plus one launch per op.
+            # RESIN_GAUDI_PROFILE_LAUNCH_MODE separates the cost: "full" (normal), "bind" (bind only,
+            # no launch), "none" (neither). "bind" and "none" produce garbage tokens and exist only to
+            # time the host floor - never leave them on for a correctness run.
             started = time.perf_counter()
-            if lib.rg_bind_slots(*self.args) < 0 or lib.rg_launch(self.args[0]) < 0:
+            if _LAUNCH_MODE == "none":
+                ok = True
+            elif _LAUNCH_MODE == "bind":
+                ok = lib.rg_bind_slots(*self.args) >= 0
+            elif _SYNC_EVERY:
+                # the clean host/device separator: never let the queue build, so the per-call time
+                # collapses to the pure host call cost if blocking was what we were measuring
+                ok = lib.rg_bind_slots(*self.args) >= 0 and lib.rg_launch(self.args[0]) >= 0
+                _SYNC_COUNT[0] += 1
+                if _SYNC_COUNT[0] % _SYNC_EVERY == 0:
+                    self.recipe.device.sync()
+            else:
+                ok = lib.rg_bind_slots(*self.args) >= 0 and lib.rg_launch(self.args[0]) >= 0
+            elapsed = time.perf_counter() - started
+            if not ok:
                 self.recipe.device.check(-1, f"launch {self.recipe.name}")
             LAUNCH_STATS["calls"] += 1
-            LAUNCH_STATS["seconds"] += time.perf_counter() - started
+            LAUNCH_STATS["seconds"] += elapsed
+            LAST_CALLS.append(elapsed)
+            entry = LAUNCH_BY_RECIPE.get(self.recipe.name)
+            if entry is None:
+                # workspace is a benign per-recipe query: cached once, never launched
+                entry = LAUNCH_BY_RECIPE[self.recipe.name] = [0, 0.0, self.recipe.workspace]
+            entry[0] += 1
+            entry[1] += elapsed
+            return
+        if _LAZY_BIND:
+            if not getattr(self, "_bound", False):
+                if lib.rg_bind_slots(*self.args) < 0:
+                    self.recipe.device.check(-1, f"bind {self.recipe.name}")
+                self._bound = True
+            if lib.rg_launch(self.args[0]) < 0:
+                self.recipe.device.check(-1, f"launch {self.recipe.name}")
             return
         if lib.rg_bind_slots(*self.args) < 0 or lib.rg_launch(self.args[0]) < 0:
             self.recipe.device.check(-1, f"launch {self.recipe.name}")
