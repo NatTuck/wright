@@ -54,6 +54,7 @@ from resin_models_gaudi.glm5_3_flash.weights import NS, RankSlices, Safetensors,
 from resin_models_gaudi.qwen3_5.attention import SlotRow, plan_slots
 from resin_models_gaudi.qwen3_5.model import Sampling
 from resin_models_gaudi.qwen3_5.sampling import PARAMS, TOP_MAX
+from resin_models_gaudi.synapse.graph import LAUNCH_STATS, _PROFILE_STEP
 from resin_models_gaudi.synapse.graph import Recipe, RecipeCache
 from resin_models_gaudi.synapse.progress import info, weight_file_bytes
 from resin_models_gaudi.synapse.runtime import Device
@@ -1332,6 +1333,14 @@ class _Op:
         return int(np.flatnonzero(self.slots == self.recipe.slot(name))[0])
 
     def run(self, lib) -> None:
+        if _PROFILE_STEP:
+            # the launch path every Gaudi model uses: one bind plus one launch per op
+            started = time.perf_counter()
+            if lib.rg_bind_slots(*self.args) < 0 or lib.rg_launch(self.args[0]) < 0:
+                self.recipe.device.check(-1, f"launch {self.recipe.name}")
+            LAUNCH_STATS["calls"] += 1
+            LAUNCH_STATS["seconds"] += time.perf_counter() - started
+            return
         if lib.rg_bind_slots(*self.args) < 0 or lib.rg_launch(self.args[0]) < 0:
             self.recipe.device.check(-1, f"launch {self.recipe.name}")
 
