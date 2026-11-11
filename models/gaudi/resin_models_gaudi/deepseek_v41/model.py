@@ -22,6 +22,7 @@ Engram hash ids are computed on the host from each row's last tokens (``Row.befo
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -54,6 +55,7 @@ from resin_models_gaudi.deepseek_v41.weights import (
     reader,
     split64,
     table_rows,
+    take_engram_profile,
 )
 from resin_models_gaudi.glm5_3_flash.layers import sample_graph
 from resin_models_gaudi.glm5_3_flash.model import (
@@ -72,6 +74,8 @@ from resin_models_gaudi.synapse.runtime import Device
 
 DECODE_BUCKETS = (1, 2, 4, 8, 16)
 PREFILL_BUCKETS = (32, 128, 512, 1024, 2048)
+_PROFILE_ENGRAM = os.environ.get("RESIN_GAUDI_PROFILE_ENGRAM") == "1"
+
 PAGED_T = 128  # prefill launches this wide decode each routed expert once per page of its rows
 MAX_T = DECODE_BUCKETS[-1]
 TMAX = PREFILL_BUCKETS[-1]
@@ -1155,6 +1159,8 @@ class DeepSeekV41Gaudi:
         self._host_turn ^= 1
         if self._host_pending[k]:
             dev.wait(_HOST_EVENT + k)
+        profile = _PROFILE_ENGRAM
+        t_fill = time.perf_counter() if profile else 0.0
         counts = self._fill(
             k,
             tb,
@@ -1162,7 +1168,9 @@ class DeepSeekV41Gaudi:
             np.asarray(positions),
             rows,
         )
+        t_h2d = time.perf_counter() if profile else 0.0
         dev.h2d_async(self.table, self.host[k][: tb.nbytes])
+        t_launch = time.perf_counter() if profile else 0.0
         dev.record(_HOST_EVENT + k)
         self._host_pending[k] = True
         if tokens is None:
@@ -1238,6 +1246,18 @@ class DeepSeekV41Gaudi:
                 self.logits + 4 * d.vocab * int(logits), self.logits_all, d.vocab
             )
             self._column = True
+        if profile:
+            dev.sync()
+            gather = take_engram_profile()
+            total = time.perf_counter() - t_fill
+            self.log(
+                f"engram profile T={s.T} rows={gather['rows']}: fill {1000 * (t_h2d - t_fill):.1f} ms "
+                f"(gather {1000 * (gather['read'] + gather['expand']):.1f} = read "
+                f"{1000 * gather['read']:.1f} + expand {1000 * gather['expand']:.1f}), "
+                f"h2d {1000 * (t_launch - t_h2d):.1f} ms ({tb.nbytes / 2**20:.1f} MiB), "
+                f"enqueue+sync {1000 * (time.perf_counter() - t_launch):.1f} ms, "
+                f"total {1000 * total:.1f} ms"
+            )
         return T
 
     # ------------------------------------------------------------------ DSpark

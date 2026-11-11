@@ -497,6 +497,19 @@ _ENGRAM_MAPS: dict[int, tuple] = {}
 _ENGRAM_CHECKPOINT: Path | None = None
 _ENGRAM_SHARDS: dict[int, str] = {}
 _ENGRAM_LAST_CHECK = 0.0
+# per-chunk breakdown for one process: RESIN_GAUDI_PROFILE_ENGRAM=1 turns the timers on
+_ENGRAM_PROFILE = os.environ.get("RESIN_GAUDI_PROFILE_ENGRAM") == "1"
+_ENGRAM_STATS = {"read": 0.0, "expand": 0.0, "rows": 0, "calls": 0}
+
+
+def take_engram_profile() -> dict:
+    """The gather's read and expand time since the last call, and reset the counters."""
+    stats = dict(_ENGRAM_STATS)
+    _ENGRAM_STATS["read"] = 0.0
+    _ENGRAM_STATS["expand"] = 0.0
+    _ENGRAM_STATS["rows"] = 0
+    _ENGRAM_STATS["calls"] = 0
+    return stats
 
 
 def configure_engram_gather(
@@ -674,19 +687,24 @@ def engram_rows(src: Safetensors, layer: int, rows: np.ndarray) -> np.ndarray:
     over the whole block at once instead of a row at a time. With the tables resident, mapping the
     shard beats both (0.183 s per chunk against 3.5 s pooled), which is what ``mmap`` mode uses."""
     _engram_monitor()
+    ids = np.asarray(rows, np.int64).reshape(-1)
+    started = time.perf_counter() if _ENGRAM_PROFILE else 0.0
     if _ENGRAM_MODE == "mmap" and layer in _ENGRAM_MAPS:
         weight, scale, _, _ = _ENGRAM_MAPS[layer]
-        ids = np.asarray(rows, np.int64).reshape(-1)
-        out = OCP[weight[ids]] * np.exp2(scale[ids].astype(np.float32) - 127).repeat(
-            32, axis=1
-        )
-        return out.astype(np.float32)
-    name = f"layers.{layer}.engram.embed"
-    ids = np.asarray(rows, np.int64).reshape(-1)
-    w = _engram_bytes(src, f"{name}.weight", ids, 256)
-    s = _engram_bytes(src, f"{name}.scale", ids, 8)
+        w, s = weight[ids], scale[ids]
+    else:
+        name = f"layers.{layer}.engram.embed"
+        w = _engram_bytes(src, f"{name}.weight", ids, 256)
+        s = _engram_bytes(src, f"{name}.scale", ids, 8)
+    read = time.perf_counter() - started if _ENGRAM_PROFILE else 0.0
     out = OCP[w] * np.exp2(s.astype(np.float32) - 127).repeat(32, axis=1)
-    return out.astype(np.float32)
+    out = out.astype(np.float32)
+    if _ENGRAM_PROFILE:
+        _ENGRAM_STATS["read"] += read
+        _ENGRAM_STATS["expand"] += time.perf_counter() - started - read
+        _ENGRAM_STATS["rows"] += len(ids)
+        _ENGRAM_STATS["calls"] += 1
+    return out
 
 
 def _engram_bytes(src: Safetensors, name: str, rows: np.ndarray, width: int) -> np.ndarray:
