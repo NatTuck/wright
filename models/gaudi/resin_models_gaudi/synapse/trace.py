@@ -44,7 +44,7 @@ def enable_profiler(directory: str | Path) -> None:
                 "values": {
                     "generalOptions": {
                         "arch": {"value": "gaudi2"},
-                        "profilePhase": {"value": "profileApi"},
+                        "profilePhase": {"value": "profileDevice"},
                     },
                     "parseOptions": {
                         "outputPerInvocation": {
