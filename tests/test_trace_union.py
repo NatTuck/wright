@@ -70,11 +70,29 @@ def run(capsys, path, *argv):
 
 
 def test_a_complete_trace_is_quoted(tmp_path, capsys):
+    """Two passes of one cohort, each unit spanning the harness's prefill_seconds: quotable.
+
+    This is the case the whole-trace gate made impossible (ratio ~2.0), so it is the check that the
+    per-unit window is the right quantity.
+    """
     trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json")
-    status, out = run(capsys, trace, "--expect-seconds", "0.004")
+    status, out = run(capsys, trace, "--expect-seconds", "0.002")
     assert status == 0
     assert "REFUSED" not in out
     assert "## the step, three numbers" in out
+    assert "mean per-unit device window = 0.002 s over 2 units" in out
+
+
+def test_a_two_pass_trace_whose_units_are_fragments_is_refused(tmp_path, capsys):
+    """Two passes each covering HALF a cohort: the mean unit window is half, so it is refused.
+
+    A complete trace cannot be laundered into quotability by adding passes.
+    """
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json")
+    status, out = run(capsys, trace, "--expect-seconds", "0.004")
+    assert status == 1
+    assert "the units are not whole cohorts" in out
+    assert "## the step, three numbers" not in out
 
 
 def test_a_truncated_trace_is_refused(tmp_path, capsys):
@@ -101,7 +119,7 @@ def test_a_window_that_does_not_match_the_cohort_is_refused(tmp_path, capsys):
     trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json")
     status, out = run(capsys, trace, "--expect-seconds", "16.38")
     assert status == 1
-    assert "fragment of the cohort" in out
+    assert "the trace is a fragment" in out
     assert "## the step, three numbers" not in out
 
 

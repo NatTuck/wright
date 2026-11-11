@@ -8,6 +8,7 @@ import logging
 import os
 import struct
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -293,7 +294,30 @@ def _below_the_floor(monkeypatch, W):
     W._ENGRAM_LAST_CHECK = time.monotonic() - 1000.0
 
 
-def test_engram_monitor_falls_back_without_raising(engram_gather, monkeypatch, caplog):
+@contextmanager
+def _wright_warnings():
+    """The WARNING records this module's logger emits, collected directly.
+
+    Not `caplog`: caplog sees records through the root handler, so a test elsewhere in the session
+    that turns off propagation or replaces the handlers silently empties it - which made this
+    assertion pass alone and fail in the full suite.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Collect()
+    logger = logging.getLogger("wright")
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_engram_monitor_falls_back_without_raising(engram_gather, monkeypatch):
     """A residency drop mid-request: the gather must switch to pooled, not kill the request.
 
     RED on the old code: `mapping.close()` raised BufferError (numpy held the mmap's exported
@@ -304,20 +328,18 @@ def test_engram_monitor_falls_back_without_raising(engram_gather, monkeypatch, c
     np.testing.assert_array_equal(W.engram_rows(src, 0, ids), expected[ids])
 
     _below_the_floor(monkeypatch, W)
-    with caplog.at_level(logging.WARNING, logger="wright"):
+    with _wright_warnings() as records:
         W._engram_monitor()  # must not raise
 
     assert W._ENGRAM_MODE == "pooled"
     assert W._ENGRAM_MAPS == {}
     # the views were dropped before the close: no unmap failure, not merely a caught one
-    assert not any("unmapping" in record.getMessage() for record in caplog.records)
+    assert not any("unmapping" in record.getMessage() for record in records)
     # and the request it was called from still gets its rows, now from the pooled gather
     np.testing.assert_array_equal(W.engram_rows(src, 0, ids), expected[ids])
 
 
-def test_engram_monitor_falls_back_even_when_close_fails(
-    engram_gather, monkeypatch, caplog
-):
+def test_engram_monitor_falls_back_even_when_close_fails(engram_gather, monkeypatch):
     """The contract is "a monitor failure never takes a request down", not "close() works".
 
     The unmap is best-effort: the mode and the registry are what the gather reads, so they must
@@ -338,11 +360,11 @@ def test_engram_monitor_falls_back_even_when_close_fails(
     W._ENGRAM_MAPS[layer] = (weight, scale, Unclosable(mapping), raw)
 
     _below_the_floor(monkeypatch, W)
-    with caplog.at_level(logging.WARNING, logger="wright"):
+    with _wright_warnings() as records:
         W._engram_monitor()  # must not raise even though close() does
 
     assert W._ENGRAM_MODE == "pooled"
     assert W._ENGRAM_MAPS == {}
-    assert any("unmap" in record.getMessage() for record in caplog.records)
+    assert any("unmap" in record.getMessage() for record in records)
     np.testing.assert_array_equal(W.engram_rows(src, 0, ids), expected[ids])
 
