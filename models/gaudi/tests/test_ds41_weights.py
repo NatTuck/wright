@@ -212,12 +212,18 @@ def test_engram_lut_is_bit_identical_to_the_expression_it_replaced():
         new = _ENGRAM_LUT[s.reshape(1, 8)[:, :, None], codes.reshape(1, 8, 32)].reshape(1, 256)
         np.testing.assert_array_equal(new, old)
 
-    # the scope: a float64 exponent is finite where the f32 table is not, at 254 and 255
-    wide254 = OCP * np.exp2(254.0 - 127.0)
-    table254 = _ENGRAM_LUT[254].astype(np.float64)
-    assert int(np.count_nonzero(np.isfinite(wide254) & ~np.isfinite(table254))) == 126
+    # The branch's actual change is f64 -> f32 for the exponent, so pin where the two tables diverge:
+    # MEASURED, they are equal for scales 0..246 and differ from 247 up (448 * 2^120 leaves f32
+    # range). A future change back to f64 fails here, which is the point.
+    f64 = OCP[None, :] * np.exp2(np.arange(256, dtype=np.float64) - 127.0)[:, None]
+    differing = [
+        s for s in range(256) if not np.array_equal(_ENGRAM_LUT[s].astype(np.float64), f64[s])
+    ]
+    assert differing == list(range(247, 256))
+    # and the two figures the comment states, which are the whole reason 254/255 are called out
+    assert int(np.count_nonzero(np.isfinite(f64[254]) & ~np.isfinite(_ENGRAM_LUT[254]))) == 126
     assert not np.any(np.isfinite(_ENGRAM_LUT[255]))
-    assert np.all(np.isfinite(OCP * np.exp2(255.0 - 127.0)))  # finite in float64, not in f32
+    assert np.all(np.isfinite(f64[255]))  # finite in float64, not in f32
 
 
 def test_expert_k_per_expert_when_the_tensor_spreads_too_far():
@@ -327,13 +333,32 @@ def test_engram_monitor_falls_back_without_raising(engram_gather, monkeypatch):
     assert W._ENGRAM_MODE == "mmap" and set(W._ENGRAM_MAPS) == {0}
     np.testing.assert_array_equal(W.engram_rows(src, 0, ids), expected[ids])
 
+    # count the close, so "views dropped before close" cannot pass by never closing at all
+    layer = next(iter(W._ENGRAM_MAPS))
+    closed: list = []
+
+    class _Counting:
+        def __init__(self, mapping):
+            self.mapping = mapping
+
+        def close(self):
+            closed.append(self.mapping)
+            self.mapping.close()
+
+    weight, scale, mapping, raw = W._ENGRAM_MAPS[layer]
+    W._ENGRAM_MAPS[layer] = (weight, scale, _Counting(mapping), raw)
+    # and drop the test's own references: a view held here would keep the mmap's export alive and
+    # turn this into the racing-gather case (the other test), not the clean one
+    del weight, scale, mapping, raw
+
     _below_the_floor(monkeypatch, W)
     with _wright_warnings() as records:
         W._engram_monitor()  # must not raise
 
     assert W._ENGRAM_MODE == "pooled"
     assert W._ENGRAM_MAPS == {}
-    # the views were dropped before the close: no unmap failure, not merely a caught one
+    # the mapping was really closed, and the close did not fail (the views were gone first)
+    assert len(closed) == 1 and closed[0].closed
     assert not any("unmapping" in record.getMessage() for record in records)
     # and the request it was called from still gets its rows, now from the pooled gather
     np.testing.assert_array_equal(W.engram_rows(src, 0, ids), expected[ids])
