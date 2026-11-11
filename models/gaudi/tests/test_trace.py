@@ -5,9 +5,9 @@ from __future__ import annotations
 import gzip
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
-from types import SimpleNamespace
 
 from resin.bench import BenchCase
 from resin_models_gaudi.synapse.trace import (
