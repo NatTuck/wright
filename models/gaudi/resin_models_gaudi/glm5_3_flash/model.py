@@ -67,6 +67,9 @@ _LAZY_BIND = os.environ.get("RESIN_GAUDI_LAZY_BIND") == "1"
 _SYNC_EVERY = int(os.environ.get("RESIN_GAUDI_PROFILE_SYNC_EVERY", "0") or 0)
 _SYNC_COUNT = [0]
 _SYNC_PENDING = [False]
+# the sum of the diagnostic syncs is the serialised device time for the window
+_SYNC_TOTAL = [0.0]
+_SYNC_TIMES: list[float] = []
 
 from resin_models_gaudi.synapse.graph import (
     LAUNCH_BY_RECIPE,
@@ -1410,7 +1413,10 @@ class _Op:
             elapsed = time.perf_counter() - started
             if _SYNC_PENDING[0]:
                 _SYNC_PENDING[0] = False
+                _sync_started = time.perf_counter()
                 self.recipe.device.sync()
+                _SYNC_TOTAL[0] += time.perf_counter() - _sync_started
+                _SYNC_TIMES.append(time.perf_counter() - _sync_started)
             if not ok:
                 self.recipe.device.check(-1, f"launch {self.recipe.name}")
             LAUNCH_STATS["calls"] += 1

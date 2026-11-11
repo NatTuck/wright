@@ -47,7 +47,7 @@ from resin_models_gaudi.mistral_large4 import parallel
 from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
 from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params
 from resin_models_gaudi.synapse.progress import info
-from resin_models_gaudi.glm5_3_flash.model import diagnostics
+from resin_models_gaudi.glm5_3_flash.model import _SYNC_TIMES, _SYNC_TOTAL, diagnostics
 from resin_models_gaudi.synapse.graph import (
     LAUNCH_BY_RECIPE,
     LAST_CALLS,
@@ -336,6 +336,18 @@ class DeepSeekV41GaudiRunner:
                     sample_wall = 1000 * (end - t_sample)
                     step_wall = 1000 * (end - t_step)
                     self._last_step_end = end
+                    if _SYNC_TIMES:
+                        import statistics as _st
+
+                        info(
+                            f"sync profile: {len(_SYNC_TIMES)} syncs, "
+                            f"total {1000 * _SYNC_TOTAL[0]:.1f} ms, "
+                            f"median {1000 * _st.median(_SYNC_TIMES):.1f} ms, "
+                            f"max {1000 * max(_SYNC_TIMES):.1f} ms "
+                            f"(sum of syncs = serialised device time for the window)"
+                        )
+                        _SYNC_TOTAL[0] = 0.0
+                        _SYNC_TIMES.clear()
                     if LAST_CALLS:
                         # test A: cost by position in the step. A filling queue shows later calls slower.
                         n = len(LAST_CALLS)
