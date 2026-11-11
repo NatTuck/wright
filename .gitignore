@@ -13,3 +13,4 @@ target/
 *.so
 artifacts/
 profiles/
+core
