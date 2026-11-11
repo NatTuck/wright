@@ -45,10 +45,25 @@ logger = logging.getLogger("wright")
 EXIT_REPORTED = 78
 # A rank exits with this code when a signal stops it during the load.
 EXIT_STOPPED = 79
-# Recipe workspaces and slack that the KV pool leaves free on a card.
-_WORKSPACE_BYTES = 3 << 30
 # Rank 0 and its followers need this long to shut down after the drain.
 _SHUTDOWN_SECONDS = 60.0
+
+
+def workspace_bytes() -> int:
+    """Recipe workspaces and slack that the KV pool leaves free on a card, for the pre-load estimate.
+
+    Read from the model family with the largest reserve instead of duplicated here: a second constant
+    that has to agree with the loader's is the defect that produced the short-context load failure
+    (deepseek_v41's floor went 3 -> 4 GiB when `ds41_ffn_paged_T1024` turned out to need 3.35 GiB,
+    and this estimate kept saying 3). The other families are smaller - glm5_3_flash 3 GiB, qwen3_5
+    2 GiB, mistral_large4 0.5 GiB - so taking the largest is also the conservative estimate.
+
+    Imported lazily: the estimate runs once at startup, and the module that defines the constant is
+    the one being served.
+    """
+    from resin_models_gaudi.deepseek_v41.model import WORKSPACE_RESERVE
+
+    return WORKSPACE_RESERVE
 
 
 def batch_tokens(runner, prefill_chunk_size: int) -> int:
@@ -66,7 +81,7 @@ def current_device_free() -> int:
 def estimate_kv_pool(free: int, weight_bytes: int, ranks: int) -> None:
     """The limit on the KV pool, before the load: what the weights leave free on one card. Graph
     buffers and the memory share of the preset take more, so the report after the load is smaller."""
-    left = free - weight_bytes // ranks - _WORKSPACE_BYTES
+    left = free - weight_bytes // ranks - workspace_bytes()
     logger.info(
         f"KV pool: at most {left / 2**30:.0f} GiB per card, {left * ranks / 2**30:.0f} GiB in "
         f"total, from {free / 2**30:.0f} GiB free and {weight_bytes / ranks / 2**30:.0f} GiB of "
