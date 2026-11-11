@@ -103,9 +103,16 @@ J = 24  # Engram rows per column: (max n-gram - 1) x heads
 # 0.46 GiB, so it failed to compile with synDeviceMalloc status=26. Reproduced twice: the 131,072
 # boot (which died at this recipe) and the 8,206 load, plus the settling test that compiled this one
 # recipe ALONE at 131,072 against 2.89 GiB free (§4b) - same weights, same recipe, only max_seq_len
-# differs. The formula's second term already covers the large contexts (5.56 GiB at 512,000), so the
-# floor only decides short ones; raising it costs ~0.5 GiB of arena = ~200 slabs = 0.56 of a 512k
-# sequence (359 slabs) or ~2 sequences at 128k (103 slabs).
+# differs.
+#
+# What the fix COSTS, computed from the formula below (TMAX = 2048, and the +1 GiB is inside the
+# max) - "about 0.5 GiB" is neither the short-context figure nor the long-context one:
+#   * below ~227k the second term is under 3 GiB, so the floor decides on both sides and the delta
+#     is exactly +1.00 GiB. That is the regime this fix is about: 8,206 and 131,072 both pay 1.00.
+#   * from ~227k the second term passes 3 GiB and the delta tapers (0.688 GiB at 262,144),
+#     reaching zero at ~342k.
+#   * at 512,000 the second term is 5.44 GiB and decides on both sides, so the delta is ZERO: every
+#     512k measurement in this tree was taken with a reserve the 3.35 GiB recipe already fit inside.
 WORKSPACE_RESERVE = 4 << 30
 _HOST_EVENT = 60  # 60, 61: the pinned table copies' uploads
 _STAGE_EVENT = 56  # 56, 57: the sampler's staging copies
