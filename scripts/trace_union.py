@@ -310,6 +310,14 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--rank", type=int, default=None, help="only for the heading")
     parser.add_argument(
+        "--expect-seconds",
+        type=float,
+        help="the harness's own prefill_seconds for this case. The trace's device window must "
+        "match it, or the trace is a FRAGMENT of the cohort and not the cohort: a 16-chunk "
+        "prefill trace once passed every internal check while covering 102 ms of a 16.38 s "
+        "cohort, because the internal checks were all derived from the trace itself.",
+    )
+    parser.add_argument(
         "--compare",
         type=Path,
         help="another trace: print recipe-set and node-count agreement, so a substituted "
@@ -628,6 +636,14 @@ def main(argv=None) -> int:
     # The buffer size is a config value, so read it rather than assume it: the device refused
     # 1 GiB outright (scal_allocate_buffer rc -5) once the KV pool was reserved, so the
     # working size is a property of this run.
+    if args.expect_seconds:
+        window = total_span / 1e6
+        ratio = window / args.expect_seconds if args.expect_seconds else 0.0
+        emit(
+            f"  harness prefill_seconds = {args.expect_seconds:.3f} s;"
+            f" trace device window = {window:.3f} s -> ratio {ratio:.3f}"
+            f"  -> {'PASS' if 0.8 <= ratio <= 1.2 else 'FAIL (the trace is a fragment, not the cohort)'}"
+        )
     buffer_bytes = 0x8000000
     buffer_note = "default assumption"
     if config_path.exists():
