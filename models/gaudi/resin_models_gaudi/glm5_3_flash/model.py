@@ -21,7 +21,6 @@ token; each chunk stores its last hidden in its STATE block, which the next chun
 from __future__ import annotations
 
 import os
-
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -56,6 +55,17 @@ from resin_models_gaudi.glm5_3_flash.weights import NS, RankSlices, Safetensors,
 from resin_models_gaudi.qwen3_5.attention import SlotRow, plan_slots
 from resin_models_gaudi.qwen3_5.model import Sampling
 from resin_models_gaudi.qwen3_5.sampling import PARAMS, TOP_MAX
+from resin_models_gaudi.synapse.graph import (
+    _PROFILE_STEP,
+    LAST_CALLS,
+    LAUNCH_BY_RECIPE,
+    LAUNCH_STATS,
+    Recipe,
+    RecipeCache,
+)
+from resin_models_gaudi.synapse.progress import info, weight_file_bytes
+from resin_models_gaudi.synapse.runtime import Device
+
 _LAUNCH_MODE = os.environ.get("RESIN_GAUDI_PROFILE_LAUNCH_MODE", "full")
 # Bind once and launch per step: _Op.args is built at construction and the addresses are mutated
 # only in the GLM MTP path and LaunchPlan.patch, so a DeepSeek decode step re-binds 109 identical
@@ -82,16 +92,6 @@ _SYNC_TIMES: list[float] = []
 _SYNC_OVERHEAD_TOTAL = [0.0]
 _SYNC_OVERHEAD_COUNT = [0]
 SECOND_SYNC_BY_RECIPE: dict[str, list] = {}
-
-from resin_models_gaudi.synapse.graph import (
-    LAUNCH_BY_RECIPE,
-    LAST_CALLS,
-    LAUNCH_STATS,
-    _PROFILE_STEP,
-)
-from resin_models_gaudi.synapse.graph import Recipe, RecipeCache
-from resin_models_gaudi.synapse.progress import info, weight_file_bytes
-from resin_models_gaudi.synapse.runtime import Device
 
 DECODE_BUCKETS = (1, 2, 4, 8, 16)
 MAX_T = DECODE_BUCKETS[-1]

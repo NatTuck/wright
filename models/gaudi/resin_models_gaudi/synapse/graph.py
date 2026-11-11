@@ -8,13 +8,11 @@ variables. Every persistent tensor is bound at launch.
 
 from __future__ import annotations
 
-import os
-import time
-
 import ctypes as C
 import mmap
 import os
 import tempfile
+import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field

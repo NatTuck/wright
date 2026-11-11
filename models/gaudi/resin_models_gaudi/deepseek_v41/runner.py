@@ -42,26 +42,26 @@ from resin_models_gaudi.deepseek_v41.model import (
     Row,
     Shape,
 )
-from resin_models_gaudi.glm5_3_flash.runner import _Scorer
-from resin_models_gaudi.mistral_large4 import parallel
-from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
-from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params
-from resin_models_gaudi.synapse.progress import info
 from resin_models_gaudi.glm5_3_flash.model import (
-    SECOND_SYNC_BY_RECIPE,
     _RECIPE_DEVICE,
     _SYNC_OVERHEAD_COUNT,
     _SYNC_OVERHEAD_TOTAL,
     _SYNC_TIMES,
     _SYNC_TOTAL,
+    SECOND_SYNC_BY_RECIPE,
     diagnostics,
 )
+from resin_models_gaudi.glm5_3_flash.runner import _Scorer
+from resin_models_gaudi.mistral_large4 import parallel
+from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
+from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params
 from resin_models_gaudi.synapse.graph import (
-    LAUNCH_BY_RECIPE,
     LAST_CALLS,
+    LAUNCH_BY_RECIPE,
     LAUNCH_STATS,
     reset_launch_stats,
 )
+from resin_models_gaudi.synapse.progress import info
 from resin_models_gaudi.synapse.runtime import open_device
 
 PREFILL_CHUNK_SIZE = TMAX
