@@ -47,7 +47,12 @@ from resin_models_gaudi.mistral_large4 import parallel
 from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
 from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params
 from resin_models_gaudi.synapse.progress import info
-from resin_models_gaudi.glm5_3_flash.model import _SYNC_TIMES, _SYNC_TOTAL, diagnostics
+from resin_models_gaudi.glm5_3_flash.model import (
+    _RECIPE_DEVICE,
+    _SYNC_TIMES,
+    _SYNC_TOTAL,
+    diagnostics,
+)
 from resin_models_gaudi.synapse.graph import (
     LAUNCH_BY_RECIPE,
     LAST_CALLS,
@@ -336,6 +341,40 @@ class DeepSeekV41GaudiRunner:
                     sample_wall = 1000 * (end - t_sample)
                     step_wall = 1000 * (end - t_step)
                     self._last_step_end = end
+                    if _RECIPE_DEVICE and LAUNCH_BY_RECIPE:
+                        total = sum(e[1] for e in LAUNCH_BY_RECIPE.values())
+                        calls = sum(e[0] for e in LAUNCH_BY_RECIPE.values())
+                        fams: dict[str, list] = {}
+                        for name, (c, secs, _w) in LAUNCH_BY_RECIPE.items():
+                            if name.startswith("ds41_attn_pre"):
+                                fam = "attn_pre"
+                            elif name.startswith("ds41_attn_out"):
+                                fam = "attn_out"
+                            elif name.startswith("ds41_attn"):
+                                fam = "attn"
+                            elif name.startswith("ds41_ffn"):
+                                fam = "ffn"
+                            elif name.startswith("ds41_engram"):
+                                fam = "engram"
+                            elif name.startswith("ds41_index"):
+                                fam = "index"
+                            elif name.startswith("ds41_head"):
+                                fam = "head"
+                            else:
+                                fam = "other"
+                            slot = fams.setdefault(fam, [0, 0.0])
+                            slot[0] += c
+                            slot[1] += secs
+                        info(
+                            f"recipe-device: {calls} calls, {1000 * total:.1f} ms total "
+                            f"(sum over recipes = the step's device occupancy)"
+                        )
+                        for fam, (c, secs) in sorted(fams.items(), key=lambda kv: -kv[1][1]):
+                            info(
+                                f"  family {fam:<10} calls {c:>5} total {1000 * secs:7.1f} ms "
+                                f"mean {1e6 * secs / c:6.1f} us"
+                            )
+                        LAUNCH_BY_RECIPE.clear()
                     if _SYNC_TIMES:
                         import statistics as _st
 

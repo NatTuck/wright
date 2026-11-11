@@ -65,6 +65,10 @@ _LAUNCH_MODE = os.environ.get("RESIN_GAUDI_PROFILE_LAUNCH_MODE", "full")
 # 805-835, graph.py:331) and lazy bind would leave them stale - silent corruption, not a crash.
 _LAZY_BIND = os.environ.get("RESIN_GAUDI_LAZY_BIND") == "1"
 _SYNC_EVERY = int(os.environ.get("RESIN_GAUDI_PROFILE_SYNC_EVERY", "0") or 0)
+# Sync at every recipe boundary and time the recipe: with the queue drained by the previous sync,
+# (t1 - t0) is host bind+launch plus that recipe's device execution. Recipes are serial, so the sum
+# over recipes is the step's device occupancy - attribution only, never a performance run.
+_RECIPE_DEVICE = os.environ.get("RESIN_GAUDI_PROFILE_RECIPE_DEVICE") == "1"
 _SYNC_COUNT = [0]
 _SYNC_PENDING = [False]
 # the sum of the diagnostic syncs is the serialised device time for the window
@@ -1390,6 +1394,10 @@ class _Op:
                 ok = True
             elif _LAUNCH_MODE == "bind":
                 ok = _do_bind(lib, self.args) >= 0
+            elif _RECIPE_DEVICE:
+                ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
+                # inside the timed region on purpose: this mode measures the recipe, not the call
+                self.recipe.device.sync()
             elif _LAZY_BIND:
                 # the profiling branch has to honour lazy bind too, or a gate run measures the
                 # unmodified path while reporting the flag as on (found the hard way)
