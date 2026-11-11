@@ -23,6 +23,7 @@ compressor, the indexer, the router and the hyper-connections.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,6 +31,9 @@ import numpy as np
 from resin.models.deepseek_v41.config import DeepSeekV41Config
 from resin_models_gaudi.glm5_3_flash.weights import Safetensors
 from resin_models_gaudi.qwen3_5.checkpoint import _POOL, kperm, tperm
+
+# chunks of rows handed to the read pool for one Engram gather: enough to fill 32 workers four times
+_ENGRAM_CHUNKS = 128
 
 DTYPES = {
     "BF16": np.uint16,
@@ -450,13 +454,36 @@ def engram_hash_tables(h, k: int) -> dict[str, np.ndarray]:
 
 
 def engram_rows(src: Safetensors, layer: int, rows: np.ndarray) -> np.ndarray:
-    """Rows of an Engram table, dequantized (n, 256) f32, read one by one (a host lookup for development)."""
+    """Rows of an Engram table, dequantized (n, 256) f32.
+
+    The row ids are hash outputs, so neighbouring rows are not adjacent in the file: a 2,048-token
+    chunk's rows measured 1.00 rows per contiguous run, and an iovec array cannot serve them. What
+    is left is one random 264-byte read per row, which at queue depth 1 costs the disk's full
+    latency - with the page cache dropped, a chunk's gather took 138 s. Reading the rows from the
+    thread pool gives the reads queue depth (2.0 s for the same chunk) and the dequant then runs
+    over the whole block at once instead of a row at a time."""
     name = f"layers.{layer}.engram.embed"
-    out = np.empty((len(rows), 256), np.float32)
-    for i, r in enumerate(np.asarray(rows).reshape(-1)):
-        one = slice(int(r), int(r) + 1)
-        w, s = src.read(f"{name}.weight", one), src.read(f"{name}.scale", one)
-        out[i] = OCP[w[0]] * np.exp2(s[0].astype(np.float64) - 127).repeat(32)
+    rows = np.asarray(rows, np.int64).reshape(-1)
+    w = _engram_bytes(src, f"{name}.weight", rows, 256)
+    s = _engram_bytes(src, f"{name}.scale", rows, 8)
+    out = OCP[w] * np.exp2(s.astype(np.float32) - 127).repeat(32, axis=1)
+    return out.astype(np.float32)
+
+
+def _engram_bytes(src: Safetensors, name: str, rows: np.ndarray, width: int) -> np.ndarray:
+    """``rows`` of one Engram tensor as raw bytes: one preadv per row, spread over the thread pool."""
+    fd, entry, base = src._entry(name)
+    start = base + entry["data_offsets"][0]
+    out = np.empty((len(rows), width), np.uint8)
+    view = memoryview(out.reshape(-1))
+
+    def read(bounds: tuple[int, int]) -> None:
+        for i in range(*bounds):
+            os.preadv(fd, [view[i * width : (i + 1) * width]], start + int(rows[i]) * width)
+
+    if len(rows):
+        step = -(-len(rows) // min(len(rows), _ENGRAM_CHUNKS))
+        list(_POOL.map(read, ((i, min(i + step, len(rows))) for i in range(0, len(rows), step))))
     return out
 
 
