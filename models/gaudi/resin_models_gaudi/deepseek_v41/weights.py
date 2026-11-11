@@ -23,14 +23,34 @@ compressor, the indexer, the router and the hyper-connections.
 
 from __future__ import annotations
 
+import ctypes
+import json
+import logging
+import mmap
 import os
+import struct
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from resin.models.deepseek_v41.config import DeepSeekV41Config
 from resin_models_gaudi.glm5_3_flash.weights import Safetensors
 from resin_models_gaudi.qwen3_5.checkpoint import _POOL, kperm, tperm
+
+logger = logging.getLogger("wright")
+
+_LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+_LIBC.mmap.restype = ctypes.c_void_p
+_LIBC.mmap.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_long,
+]
 
 # chunks of rows handed to the read pool for one Engram gather: enough to fill 32 workers four times
 _ENGRAM_CHUNKS = 128
@@ -457,6 +477,184 @@ def engram_hash_tables(h, k: int) -> dict[str, np.ndarray]:
     return {"eg_a0": split64(h.newest()[k]), "eg_hp": hp}
 
 
+# ------------------------------------------------------------------ the host gather
+# The Engram tables are 188.8 GiB of the checkpoint and stay in their file; a host gather reads the
+# rows a step needs. Two ways to read them, measured on this box (cases/wright/STATUS.md §8-§9):
+#   pooled - one preadv per row through the host thread pool. Bounded worst case: 2.4-2.9 s per
+#            2,048-token chunk with the page cache cold, and it is the fallback.
+#   mmap   - map the shard and gather with a numpy fancy index. 0.183 s per chunk when the rows are
+#            resident, but NEVER on a cold table: a random fault pulls readahead with it and one
+#            chunk read 161 GB from the block layer and took 27.5 s (6,206x amplification).
+_ENGRAM_GATHER_MODES = ("pooled", "mmap", "auto")
+# "auto" takes mmap only when the shards are this resident; below it, pooled.
+_ENGRAM_RESIDENT_FLOOR = 0.95
+# how often the monitor re-checks residency while mmap is in use
+_ENGRAM_CHECK_SECONDS = 30.0
+_ENGRAM_MODE = "pooled"
+_ENGRAM_RESIDENT = 0.0
+_ENGRAM_MAPS: dict[int, tuple] = {}
+_ENGRAM_CHECKPOINT: Path | None = None
+_ENGRAM_SHARDS: dict[int, str] = {}
+_ENGRAM_LAST_CHECK = 0.0
+
+
+def configure_engram_gather(
+    checkpoint, layers, *, mode: str = "auto", prewarm: bool = False, log=print
+) -> None:
+    """Choose the host gather for this checkpoint: ``pooled``, ``mmap``, or ``auto`` by residency.
+
+    ``auto`` measures the two Engram shards' residency with mincore and takes mmap only above
+    ``_ENGRAM_RESIDENT_FLOOR``. mmap on a cold table is not slow, it is pathological: 27.5 s and
+    161 GB of block reads for one 2,048-token chunk, against 2.9 s for the pooled path.
+    """
+    global _ENGRAM_MODE, _ENGRAM_RESIDENT, _ENGRAM_CHECKPOINT, _ENGRAM_LAST_CHECK
+    if mode not in _ENGRAM_GATHER_MODES:
+        raise ValueError(f"engram gather {mode!r}: one of {_ENGRAM_GATHER_MODES}")
+    _ENGRAM_CHECKPOINT = Path(checkpoint)
+    if not layers:
+        _ENGRAM_MODE = "pooled"
+        return
+    src = reader(checkpoint)
+    for layer in layers:
+        _ENGRAM_SHARDS[layer] = src.weight_map[f"layers.{layer}.engram.embed.weight"]
+
+    if prewarm:
+        total = 0
+        t0 = time.time()
+        buffer = bytearray(1 << 30)
+        view = memoryview(buffer)
+        for shard in sorted(set(_ENGRAM_SHARDS.values())):
+            path = _ENGRAM_CHECKPOINT / shard
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                offset, size = 0, path.stat().st_size
+                while offset < size:
+                    read = os.preadv(fd, [view], offset)
+                    if read <= 0:
+                        break
+                    offset += read
+                    total += read
+            finally:
+                os.close(fd)
+        seconds = time.time() - t0
+        log(
+            f"engram pre-warm: {total / 2**30:.1f} GiB in {seconds:.1f} s = "
+            f"{total / seconds / 1e9:.2f} GB/s"
+        )
+
+    _ENGRAM_RESIDENT = _engram_residency(_ENGRAM_CHECKPOINT, _ENGRAM_SHARDS)
+    chosen = mode
+    if mode == "auto":
+        chosen = "mmap" if _ENGRAM_RESIDENT >= _ENGRAM_RESIDENT_FLOOR else "pooled"
+    elif mode == "mmap" and _ENGRAM_RESIDENT < _ENGRAM_RESIDENT_FLOOR:
+        log(
+            f"engram gather: mmap was asked for, but the shards are "
+            f"{_ENGRAM_RESIDENT:.1%} resident, and mmap on a cold table reads 161 GB for one chunk "
+            f"- using pooled"
+        )
+        chosen = "pooled"
+    _ENGRAM_MODE = chosen
+    _ENGRAM_LAST_CHECK = time.monotonic()
+    if chosen == "mmap":
+        _engram_maps()
+    log(
+        f"engram gather: {chosen} (shards {_ENGRAM_RESIDENT:.1%} resident, "
+        f"floor {_ENGRAM_RESIDENT_FLOOR:.0%})"
+    )
+
+
+def _engram_residency(checkpoint: Path, shards: dict[int, str], sample: bool = False) -> float:
+    """Share of the Engram shards in page cache, from mincore.
+
+    ``sample`` checks four 256 MiB windows per shard instead of the whole file, which is what the
+    periodic monitor can afford inside a serving loop.
+    """
+    fractions = []
+    for shard in sorted(set(shards.values())):
+        path = checkpoint / shard
+        size = path.stat().st_size
+        if not size:
+            continue
+        if sample:
+            window = min(size, 256 << 20)
+            fractions.extend(
+                _mincore_fraction(path, offset, window)
+                for offset in (size // 5, size // 2, (4 * size) // 5, size - window)
+            )
+        else:
+            fractions.append(_mincore_fraction(path, 0, size))
+    return min(fractions) if fractions else 0.0
+
+
+def _mincore_fraction(path: Path, offset: int, length: int) -> float:
+    length = min(length, path.stat().st_size - offset)
+    pages = (length + 4095) // 4096
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        addr = _LIBC.mmap(None, length, 1, 2, fd, offset)  # PROT_READ, MAP_PRIVATE
+        if addr == ctypes.c_void_p(-1).value:
+            raise OSError(ctypes.get_errno(), f"mmap {path.name}")
+        try:
+            vec = ctypes.create_string_buffer(pages)
+            if _LIBC.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(length), vec) != 0:
+                raise OSError(ctypes.get_errno(), "mincore")
+            return sum(1 for b in vec.raw if b & 1) / pages
+        finally:
+            _LIBC.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(length))
+    finally:
+        os.close(fd)
+
+
+def _engram_maps() -> None:
+    """Map each Engram layer's shard once and keep a view of its two tensors."""
+    if _ENGRAM_MAPS or _ENGRAM_CHECKPOINT is None:
+        return
+    for layer, shard in _ENGRAM_SHARDS.items():
+        path = _ENGRAM_CHECKPOINT / shard
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            header_bytes = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+            header = json.loads(os.pread(fd, header_bytes, 8))
+            base = 8 + header_bytes
+            name = f"layers.{layer}.engram.embed"
+            mapping = mmap.mmap(fd, path.stat().st_size, prot=mmap.PROT_READ)
+        finally:
+            os.close(fd)
+        raw = np.frombuffer(mapping, np.uint8)
+        weight = base + header[f"{name}.weight"]["data_offsets"][0]
+        scale = base + header[f"{name}.scale"]["data_offsets"][0]
+        rows = header[f"{name}.weight"]["shape"][0]
+        _ENGRAM_MAPS[layer] = (
+            raw[weight : weight + rows * 256].reshape(rows, 256),
+            raw[scale : scale + rows * 8].reshape(rows, 8),
+            mapping,
+            raw,
+        )
+
+
+def _engram_monitor() -> None:
+    """Fall back to the pooled gather if the tables stopped being resident."""
+    global _ENGRAM_MODE, _ENGRAM_RESIDENT, _ENGRAM_LAST_CHECK
+    if _ENGRAM_MODE != "mmap" or _ENGRAM_CHECKPOINT is None:
+        return
+    now = time.monotonic()
+    if now - _ENGRAM_LAST_CHECK < _ENGRAM_CHECK_SECONDS:
+        return
+    _ENGRAM_LAST_CHECK = now
+    _ENGRAM_RESIDENT = _engram_residency(
+        _ENGRAM_CHECKPOINT, _ENGRAM_SHARDS, sample=True
+    )
+    if _ENGRAM_RESIDENT < _ENGRAM_RESIDENT_FLOOR:
+        logger.warning(
+            f"engram gather: shards {_ENGRAM_RESIDENT:.1%} resident, below the "
+            f"{_ENGRAM_RESIDENT_FLOOR:.0%} floor - falling back to the pooled gather"
+        )
+        _ENGRAM_MODE = "pooled"
+        for _, _, mapping, _ in _ENGRAM_MAPS.values():
+            mapping.close()
+        _ENGRAM_MAPS.clear()
+
+
 def engram_rows(src: Safetensors, layer: int, rows: np.ndarray) -> np.ndarray:
     """Rows of an Engram table, dequantized (n, 256) f32.
 
@@ -464,12 +662,21 @@ def engram_rows(src: Safetensors, layer: int, rows: np.ndarray) -> np.ndarray:
     chunk's rows measured 1.00 rows per contiguous run, and an iovec array cannot serve them. What
     is left is one random 264-byte read per row, which at queue depth 1 costs the disk's full
     latency - with the page cache dropped, a chunk's gather took 138 s. Reading the rows from the
-    thread pool gives the reads queue depth (2.0 s for the same chunk) and the dequant then runs
-    over the whole block at once instead of a row at a time."""
+    thread pool gives the reads queue depth (2.4 s for the same chunk) and the dequant then runs
+    over the whole block at once instead of a row at a time. With the tables resident, mapping the
+    shard beats both (0.183 s per chunk against 3.5 s pooled), which is what ``mmap`` mode uses."""
+    _engram_monitor()
+    if _ENGRAM_MODE == "mmap" and layer in _ENGRAM_MAPS:
+        weight, scale, _, _ = _ENGRAM_MAPS[layer]
+        ids = np.asarray(rows, np.int64).reshape(-1)
+        out = OCP[weight[ids]] * np.exp2(scale[ids].astype(np.float32) - 127).repeat(
+            32, axis=1
+        )
+        return out.astype(np.float32)
     name = f"layers.{layer}.engram.embed"
-    rows = np.asarray(rows, np.int64).reshape(-1)
-    w = _engram_bytes(src, f"{name}.weight", rows, 256)
-    s = _engram_bytes(src, f"{name}.scale", rows, 8)
+    ids = np.asarray(rows, np.int64).reshape(-1)
+    w = _engram_bytes(src, f"{name}.weight", ids, 256)
+    s = _engram_bytes(src, f"{name}.scale", ids, 8)
     out = OCP[w] * np.exp2(s.astype(np.float32) - 127).repeat(32, axis=1)
     return out.astype(np.float32)
 

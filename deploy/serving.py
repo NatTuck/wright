@@ -183,6 +183,20 @@ def argument_parser() -> argparse.ArgumentParser:
         "gathered on the host each step (default: the preset's)",
     )
     parser.add_argument(
+        "--engram-gather",
+        choices=("pooled", "mmap", "auto"),
+        help="how the host Engram gather reads the checkpoint: one preadv per row through a thread "
+        "pool, a mapped shard gathered with numpy, or auto by measured page-cache residency "
+        "(default: the preset's)",
+    )
+    parser.add_argument(
+        "--engram-prewarm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="read the two Engram shards once at startup (189 GiB, ~114 s) so the gather can map "
+        "them; without it the gather stays on the pooled path (default: the preset's)",
+    )
+    parser.add_argument(
         "--numa",
         choices=("auto", "off", "required"),
         default="auto",
@@ -296,8 +310,15 @@ def _validate(parser, args, spec) -> None:
         and not 0 < args.gpu_memory_utilization < 1
     ):
         parser.error("--gpu-memory-utilization takes a value above 0 and below 1")
-    if args.engram is not None and spec.family != "deepseek_v41":
-        parser.error(f"{spec.name} has no Engram tables; --engram is DeepSeek-V4.1 only")
+    if spec.family != "deepseek_v41" and (
+        args.engram is not None
+        or args.engram_gather is not None
+        or args.engram_prewarm is not None
+    ):
+        parser.error(
+            f"{spec.name} has no Engram tables; --engram, --engram-gather and --engram-prewarm "
+            "are DeepSeek-V4.1 only"
+        )
     problem = check_listen_address(args.host, args.port)
     if problem is not None:
         parser.error(problem)
@@ -425,6 +446,10 @@ def serve_gaudi_ranks(parser, args, spec) -> None:
     ranks = args.ranks or spec.world_size
     draft_tokens = spec.draft_tokens if args.draft_tokens is None else args.draft_tokens
     engram = args.engram or spec.engram
+    engram_gather = args.engram_gather or spec.engram_gather
+    engram_prewarm = (
+        spec.engram_prewarm if args.engram_prewarm is None else args.engram_prewarm
+    )
     if args.gpu_memory_utilization is not None:
         parser.error(f"{spec.name} sizes its KV cache from free memory on every rank")
     try:
@@ -461,6 +486,8 @@ def serve_gaudi_ranks(parser, args, spec) -> None:
         checkpoint=str(checkpoint),
         weight_bytes=checkpoint_weight_bytes(spec, checkpoint),
         engram=engram,
+        engram_gather=engram_gather,
+        engram_prewarm=engram_prewarm,
         engram_bytes=engram_table_bytes(spec, checkpoint) if engram == "host" else 0,
         tokenizer=None if args.tokenizer is None else str(args.tokenizer),
         alias=args.alias,
@@ -597,6 +624,8 @@ def _serve_claimed_rank(rank: int, options: dict, claim) -> None:
         assistant_checkpoint=options["assistant"],
         num_layers=options["num_layers"],
         engram=options["engram"],
+        engram_gather=options["engram_gather"],
+        engram_prewarm=options["engram_prewarm"],
     )
     worker = DistributedWorker(runner, groups)
     engine = None

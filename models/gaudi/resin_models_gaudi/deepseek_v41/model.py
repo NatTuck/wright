@@ -43,6 +43,7 @@ from resin_models_gaudi.deepseek_v41.cache import (
 from resin_models_gaudi.deepseek_v41.rope import cs_table, layer_frequencies
 from resin_models_gaudi.deepseek_v41.weights import (
     RankSlices,
+    configure_engram_gather,
     engram_hash_tables,
     engram_rows,
     engram_table,
@@ -291,6 +292,8 @@ class DeepSeekV41Gaudi:
         layers: int | None = None,
         recipes: RecipeCache | None = None,
         engram: str = "card",
+        engram_gather: str = "auto",
+        engram_prewarm: bool = False,
         gather: bool = True,
         weights: dict[str, int] | None = None,
         barrier: Callable[[], None] | None = None,
@@ -349,6 +352,15 @@ class DeepSeekV41Gaudi:
         t0 = time.time()
         self.w = weights if weights is not None else self._load(barrier)
         log(f"ds41 rank {rank}/{nranks}: weights in {time.time() - t0:.0f} s")
+        if self.engram_layers and engram == "host":
+            # the host gather reads the tables out of the checkpoint file; choose how
+            configure_engram_gather(
+                self.checkpoint,
+                self.engram_layers,
+                mode=engram_gather,
+                prewarm=engram_prewarm,
+                log=log,
+            )
         self.eg_vocab = 0
         if self.engram_layers and engram == "card":
             self._hash_tables()
@@ -1131,6 +1143,10 @@ class DeepSeekV41Gaudi:
         if prefill and len(rows) != 1:
             raise ValueError("a prefill step runs one row")
         if tokens is None and not self.hashed(s):
+            # Keep this check: it is the invariant that device tokens need the tables on the cards.
+            # In host mode it cannot fire, because runner.enqueue diverts every decode plan to
+            # forward() (which passes real tokens) when `hashed` is False. Relaxing it lets a
+            # continuation's stale bound token reach `v["tok"]` and poison the Engram hash.
             raise ValueError(
                 "device tokens need a decode step with the Engram tables on the cards"
             )

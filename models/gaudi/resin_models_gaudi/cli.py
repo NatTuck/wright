@@ -104,6 +104,8 @@ def server_arguments(
     batch_size: int | None = None,
     draft_tokens: int | None = None,
     engram: str | None = None,
+    engram_gather: str | None = None,
+    engram_prewarm: bool | None = None,
     model_draft: Path | None = None,
     device: str | None = None,
     ranks: int | None = None,
@@ -132,6 +134,7 @@ def server_arguments(
         ("--prefill-chunk-size", batch_size),
         ("--draft-tokens", draft_tokens),
         ("--engram", engram),
+        ("--engram-gather", engram_gather),
         ("--assistant-checkpoint", model_draft),
         ("--gpu", device_modules(device) if device else None),
         ("--ranks", ranks),
@@ -144,6 +147,8 @@ def server_arguments(
     ):
         if value is not None:
             line += [flag, str(value)]
+    if engram_prewarm is not None:
+        line += ["--engram-prewarm" if engram_prewarm else "--no-engram-prewarm"]
     line += [
         "--numa",
         numa.value,
@@ -349,6 +354,24 @@ def serve(
             rich_help_panel=_WRIGHT,
         ),
     ] = None,
+    engram_gather: Annotated[
+        str | None,
+        typer.Option(
+            metavar="HOW",
+            help="How the host gather reads the tables: 'pooled', 'mmap', or 'auto' by measured "
+            "page-cache residency. (default: the model's)",
+            rich_help_panel=_WRIGHT,
+        ),
+    ] = None,
+    engram_prewarm: Annotated[
+        bool | None,
+        typer.Option(
+            "--engram-prewarm/--no-engram-prewarm",
+            help="Read the two Engram shards once at startup (189 GiB, ~114 s) so the gather can "
+            "map them. (default: the model's)",
+            rich_help_panel=_WRIGHT,
+        ),
+    ] = None,
     spin_wait: Annotated[
         float | None,
         typer.Option(
@@ -446,6 +469,8 @@ def serve(
         batch_size=batch_size,
         draft_tokens=spec_draft_n_max,
         engram=engram,
+        engram_gather=engram_gather,
+        engram_prewarm=engram_prewarm,
         model_draft=model_draft,
         device=device,
         ranks=None if ranks == 4 and preset.endswith("-tp4") else ranks,

@@ -67,6 +67,8 @@ class DeepSeekV41GaudiRunner:
         parent_capacity: int | None = None,
         num_layers: int | None = None,
         engram: str = "card",
+        engram_gather: str = "auto",
+        engram_prewarm: bool = False,
         draft_tokens: int = 0,
         log=info,
     ) -> None:
@@ -134,7 +136,8 @@ class DeepSeekV41GaudiRunner:
             barrier = lambda: parallel.barrier(groups.replica.handle)  # noqa: E731
         self.model = DeepSeekV41Gaudi(
             self.device, checkpoint, cfg, capacity=capacity, max_seq_len=max_seq_len, rank=rank, nranks=nranks,
-            layers=num_layers, engram=engram, barrier=barrier, log=log if rank == 0 else (lambda *_: None),
+            layers=num_layers, engram=engram, engram_gather=engram_gather, engram_prewarm=engram_prewarm,
+            barrier=barrier, log=log if rank == 0 else (lambda *_: None),
             dspark=speculative,
         )  # fmt: skip
         if barrier is not None:
@@ -354,6 +357,17 @@ class DeepSeekV41GaudiRunner:
             or any(media is not None for media in plan.media)
             or not self.model.hashed(Shape(MAX_T, False))
         ):
+            # The last clause is load-bearing in host mode, and it is not a bug to "fix": with the
+            # Engram tables on the host, `hashed` is False for every decode shape, so every decode
+            # plan takes this synchronous path. That is what makes host-mode decode correct - a
+            # fresh plan carries the previous step's sampled tokens in `batch.token_ids`, so the
+            # Engram hash and `Row.before` see real tokens. Drop the clause to keep a continuation
+            # and the Engine hands over a *conservative bound*, one position stale
+            # (crates/resin-core/src/engine.rs: "the longest possible previous output"), which
+            # model.py's `tokens is None` ValueError then rejects; drop that check too and the
+            # stale token is hashed and recorded in EngramContext, poisoning every later
+            # Row.before for the sequence - wrong text, no error. Host mode has no overlap to
+            # recover anyway: the next step's rows need this step's sampled token on the host.
             self._harvest()
             return self.forward(plan)
         self._check_compiles()
