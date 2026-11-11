@@ -225,7 +225,9 @@ class DeepSeekV41GaudiRunner:
         )  # fmt: skip
 
     def forward(self, plan) -> ForwardOutput:
+        t_enter = time.perf_counter() if profile_step else 0.0
         self._harvest()
+        t_harvest = time.perf_counter() if profile_step else 0.0
         self._check_compiles()
         if any(media is not None for media in plan.media):
             raise NotImplementedError(
@@ -234,6 +236,7 @@ class DeepSeekV41GaudiRunner:
         cache = PagedCachePlan.from_plan(
             plan, self.cache_layout, decode_lookahead=self.lookahead
         )
+        t_cache = time.perf_counter() if profile_step else 0.0
         batch = cache.batch
         if batch.num_sequences > self.max_batch_size:
             raise ValueError(f"{batch.num_sequences} rows exceed {self.max_batch_size}")
@@ -243,6 +246,7 @@ class DeepSeekV41GaudiRunner:
         if prompt and batch.phase != BatchPhase.PREFILL:
             raise ValueError("prompt logprobs are scored by prefill plans")
         params = plan_params(plan, self.vocab_size)
+        t_params = time.perf_counter() if profile_step else 0.0
         wanted = [p.top_logprobs for p in plan.sampling_params if p.logprobs]
         if wanted and max(wanted) > TOP_MAX:
             raise NotImplementedError(f"top_logprobs above {TOP_MAX}")
@@ -309,6 +313,7 @@ class DeepSeekV41GaudiRunner:
                 if profile_step:
                     reset_launch_stats()
                     t_step = time.perf_counter()
+                    t_rows = t_step
                 T = model.launch(tokens[sl], positions[sl], rows)
                 for r in part:
                     self._context.seen(
@@ -322,11 +327,17 @@ class DeepSeekV41GaudiRunner:
                     launch_wall = 1000 * (t_sample - t_step)
                     sample_wall = 1000 * (end - t_sample)
                     step_wall = 1000 * (end - t_step)
-                    self.log(
+                    self._last_step_end = end
+                    info(
                         f"step profile T={T} rows={len(rows)}: launches={LAUNCH_STATS['calls']} "
                         f"enqueue={enqueue:.1f} ms, launch_wall={launch_wall:.1f} ms, "
                         f"sync+d2h={sample_wall:.1f} ms, step_wall={step_wall:.1f} ms, "
-                        f"residual={step_wall - enqueue - sample_wall:.1f} ms"
+                        f"residual={step_wall - enqueue - sample_wall:.1f} ms; "
+                        f"pre={1000 * (t_rows - t_enter):.1f} ms "
+                        f"(harvest {1000 * (t_harvest - t_enter):.1f}, "
+                        f"cache_plan {1000 * (t_cache - t_harvest):.1f}, "
+                        f"params {1000 * (t_params - t_cache):.1f}, "
+                        f"rows {1000 * (t_rows - t_params):.1f})"
                     )
         tok, lp, top_ids, top_lp = (np.concatenate(x) for x in zip(*outs, strict=True))
         counts = np.ones(len(tok), np.int64)
@@ -337,6 +348,10 @@ class DeepSeekV41GaudiRunner:
         )
         if prompt:
             columns.update(Qwen3_5GaudiRunner._prompt_columns(plan, prompt_scores))
+        if profile_step and getattr(self, "_last_step_end", None) is not None:
+            info(
+                f"step post: {1000 * (time.perf_counter() - self._last_step_end):.1f} ms"
+            )
         return ForwardOutput(
             token_ids=np.asarray(tok, np.uint32),
             token_indptr=np.arange(len(tok) + 1, dtype=np.uint32),
