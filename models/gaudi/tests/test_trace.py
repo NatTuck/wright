@@ -5,6 +5,8 @@ from __future__ import annotations
 import gzip
 import json
 import os
+
+import pytest
 from types import SimpleNamespace
 
 from resin.bench import BenchCase
@@ -125,3 +127,39 @@ def test_profiler_configuration_points_outputs_at_the_directory(tmp_path, monkey
     )
     assert os.environ["HABANA_PROFILE"] == "1"
     assert os.environ["HABANA_PROF_CONFIG"] == str(tmp_path / "prof" / "profiler.json")
+
+
+def test_the_case_config_survives_a_failed_json_write_and_carries_the_timing(
+    tmp_path, monkeypatch
+):
+    """The config is written BEFORE the Chrome JSON, and carries the harness's own seconds.
+
+    The JSON is the artifact that grows to gigabytes and gets killed; the config is a kilobyte
+    and is what `trace_union` gates a trace against. Our 8192 prefill run is the proof that the
+    ordering matters: the hook died inside the JSON write and took the config with it, so the
+    pass count had to be reconstructed by hand and the completeness argument had to fall back on
+    triangulation.
+    """
+
+    def stop(path):
+        write_tsv(path)
+        return len(ROWS)
+
+    device = SimpleNamespace(sync=lambda: None, prof_start=lambda: None, prof_stop=stop)
+    trace = perfetto_trace(tmp_path, 0, {"model": "m"}, device=device, decode_passes=2)
+
+    def killed(*args, **kwargs):
+        raise OSError("killed during the JSON write")
+
+    monkeypatch.setattr("resin_models_gaudi.synapse.trace.gzip.open", killed)
+    case = BenchCase(phase="prefill", context_length=8192, batch_size=1)
+    with pytest.raises(OSError):
+        trace(case, lambda: {"seconds": 3.5, "steps": 4})
+
+    config = json.loads(
+        (tmp_path / "prefill-ctx8192-b1-rank000-config.json").read_text()
+    )
+    assert config["phase"] == "prefill"
+    assert config["passes"] == 2
+    assert config["prefill_seconds"] == 3.5
+    assert config["prefill_seconds_per_pass"] == [3.5, 3.5]

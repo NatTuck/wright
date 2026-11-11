@@ -218,12 +218,55 @@ def perfetto_trace(
         # The raw TSV is the attributable artifact (it carries recipe_id and both halves of
         # every B/E pair); the Chrome JSON is a view of it. Keep both.
         tsv = directory / f"{name}.tsv"
+        pass_results = []
         try:
             for _ in range(passes):
-                run_pass()
+                pass_results.append(run_pass())
         finally:
             device.prof_stop(tsv)
-            events = chrome_events(tsv)
+
+        # WRITE THE CONFIG BEFORE THE CHROME JSON. The JSON is the artifact that grows to
+        # gigabytes and gets killed; the config is a kilobyte and must not die with it. Our own
+        # 8192 prefill run is the proof: the hook died inside the JSON write and took the config
+        # with it, so the pass count had to be reconstructed by hand and the completeness
+        # argument had to fall back on triangulation.
+        #
+        # `prefill_seconds` here is the harness's own timing for the passes just traced (the
+        # trace pass returns the seconds it spent per prefill cohort), so trace_union can gate a
+        # trace against the run that produced it instead of a number an operator typed.
+        seconds = [
+            float(result["seconds"])
+            for result in pass_results
+            if isinstance(result, dict) and isinstance(result.get("seconds"), (int, float))
+        ]
+        config_values = {
+            "phase": case.phase,
+            "context_length": case.context_length,
+            "batch_size": case.batch_size,
+            "shared_prefix_tokens": case.shared_prefix_tokens,
+            "rank": rank,
+            "passes": passes,
+            "unit": unit,
+            "model": (metadata or {}).get("model"),
+            "checkpoint": (metadata or {}).get("checkpoint"),
+            "hardware": (metadata or {}).get("hardware"),
+            "profile_phase": "profileApi",
+            "resin_prof_trace_type": os.environ.get("RESIN_PROF_TRACE_TYPE"),
+            "output_per_invocation": ["json"],
+            "trace_buffer_size": os.environ.get("RESIN_PROF_BUFFER"),
+            "trace_buffer_location": os.environ.get("RESIN_PROF_LOCATION"),
+            "DUMP_POST_GRAPHS": os.environ.get("DUMP_POST_GRAPHS"),
+            "HOME": os.environ.get("HOME"),
+            "HABANA_PROFILE": os.environ.get("HABANA_PROFILE"),
+            "tsv": str(tsv),
+        }
+        if seconds:
+            config_values["prefill_seconds"] = sum(seconds) / len(seconds)
+            config_values["prefill_seconds_per_pass"] = seconds
+        (directory / f"{name}-config.json").write_text(
+            json.dumps(config_values, indent=2)
+        )
+        events = chrome_events(tsv)
         busy = sum(event["ph"] in ("B", "X") and event["pid"] != 0 for event in events)
         trace_data = {
             "traceEvents": events,
@@ -240,35 +283,6 @@ def perfetto_trace(
         }
         with gzip.open(directory / f"{name}.json.gz", "wt", encoding="utf-8") as target:
             json.dump(trace_data, target)
-        # A self-describing directory: every knob that decides what a device trace contains,
-        # resolved, beside the trace it produced.
-        (directory / f"{name}-config.json").write_text(
-            json.dumps(
-                {
-                    "phase": case.phase,
-                    "context_length": case.context_length,
-                    "batch_size": case.batch_size,
-                    "shared_prefix_tokens": case.shared_prefix_tokens,
-                    "rank": rank,
-                    "passes": passes,
-                    "unit": unit,
-                    "model": (metadata or {}).get("model"),
-                    "checkpoint": (metadata or {}).get("checkpoint"),
-                    "hardware": (metadata or {}).get("hardware"),
-                    "profile_phase": "profileApi",
-                    "resin_prof_trace_type": os.environ.get("RESIN_PROF_TRACE_TYPE"),
-                    "output_per_invocation": ["json"],
-                    "trace_buffer_size": os.environ.get("RESIN_PROF_BUFFER"),
-                    "trace_buffer_location": os.environ.get("RESIN_PROF_LOCATION"),
-                    "DUMP_POST_GRAPHS": os.environ.get("DUMP_POST_GRAPHS"),
-                    "HABANA_PROFILE": os.environ.get("HABANA_PROFILE"),
-                    "tsv": str(tsv),
-                    "events": len(events),
-                    "device_events": busy,
-                },
-                indent=2,
-            )
-        )
         print(
             f"[bench-trace] rank={rank} case={name} Synapse engine events={busy}",
             flush=True,
