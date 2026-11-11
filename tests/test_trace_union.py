@@ -127,7 +127,8 @@ def test_a_prefill_trace_without_the_cohort_claim_is_refused(tmp_path, capsys):
     trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json")
     status, out = run(capsys, trace)
     assert status == 1
-    assert "without --expect-seconds" in out
+    # The message names both accepted sources, because the trace's own config is one of them.
+    assert "no prefill_seconds" in out
     assert "## the step, three numbers" not in out
 
 

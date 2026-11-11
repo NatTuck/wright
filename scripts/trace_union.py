@@ -679,7 +679,19 @@ def main(argv=None) -> int:
     # 1 GiB outright (scal_allocate_buffer rc -5) once the KV pool was reserved, so the
     # working size is a property of this run.
     window = total_span / 1e6
-    if args.expect_seconds:
+    # The gate is only as external as the number fed to it. Prefer the trace's own config -- the
+    # hook records the harness's `prefill_seconds` there, from the run that produced this trace --
+    # and fall back to the command line only when the config does not carry it. Which one was used
+    # is printed, because a reader must be able to tell whether the check was external to the run
+    # (a number from another boot, or one an operator typed, is a weaker claim).
+    expect_seconds = args.expect_seconds
+    expect_source = "from the command line (--expect-seconds)"
+    if expect_seconds is None:
+        from_config = config.get("prefill_seconds")
+        if isinstance(from_config, (int, float)) and from_config > 0:
+            expect_seconds = float(from_config)
+            expect_source = f"from the trace's config ({config_path.name}, this run)"
+    if expect_seconds:
         # Compare ONE cohort's window, not the whole trace: a trace with k recorded passes of the
         # same cohort spans k x prefill_seconds, so dividing the whole-trace window by a single
         # cohort's duration fails by construction for any k > 1 -- and k >= 2 is exactly what the
@@ -688,15 +700,15 @@ def main(argv=None) -> int:
         # detection intact, because two passes each covering half a cohort give a mean unit window
         # of half the harness's seconds and still FAIL.
         mean_unit_window = (sum(unit_span) / len(unit_span) / 1e6) if unit_span else 0.0
-        ratio = mean_unit_window / args.expect_seconds if args.expect_seconds else 0.0
+        ratio = mean_unit_window / expect_seconds if expect_seconds else 0.0
         if not 0.8 <= ratio <= 1.2:
             blockers.append(
                 f"mean per-unit device window {mean_unit_window:.3f} s against the harness's "
-                f"prefill_seconds {args.expect_seconds:.3f} s (ratio {ratio:.3f}): the units are "
+                f"prefill_seconds {expect_seconds:.3f} s (ratio {ratio:.3f}): the units are "
                 f"not whole cohorts, so the trace is a fragment"
             )
         emit(
-            f"  harness prefill_seconds = {args.expect_seconds:.3f} s (ONE cohort);"
+            f"  harness prefill_seconds = {expect_seconds:.3f} s (ONE cohort, {expect_source});"
             f" mean per-unit device window = {mean_unit_window:.3f} s over {len(unit_span)} units"
             f" -> ratio {ratio:.3f}"
             f"  -> {'PASS' if 0.8 <= ratio <= 1.2 else 'FAIL (the units are fragments, not cohorts)'}"
@@ -710,10 +722,14 @@ def main(argv=None) -> int:
             )
     elif phase == "prefill":
         blockers.append(
-            "prefill trace without --expect-seconds: the only check that can see a fragment is "
-            "the harness's own prefill_seconds, so the cohort cannot be confirmed"
+            "prefill trace with no prefill_seconds: neither the trace's own config nor"
+            " --expect-seconds carries the harness's timing, so the only check that can see a"
+            " fragment cannot be performed"
         )
-        emit("  harness prefill_seconds: NOT GIVEN (--expect-seconds is required for prefill)")
+        emit(
+            "  harness prefill_seconds: NOT GIVEN (the trace's config carries no prefill_seconds"
+            " and --expect-seconds was not passed)"
+        )
     buffer_bytes = 0x8000000
     buffer_note = "default assumption"
     raw_buffer = config.get("trace_buffer_size") or ""
@@ -723,34 +739,35 @@ def main(argv=None) -> int:
             buffer_note = f"from {config_path.name}"
         except ValueError:
             pass
-    capacity_events = max(buffer_bytes // 64, 1)
+    # INFORMATION, NOT A CHECK. `traceBufferSize` does not bound the recorded event count: a
+    # prefill trace configured for 0x10000000 (256 MiB, ~4.19e6 events at 64 B) recorded
+    # 49,128,810 events and is complete by every detector below. So a capacity division carries
+    # no information about truncation, and it is printed only so a reader can see the configured
+    # size next to what was recorded.
     emit(
-        f"  events observed = {len(rows)}; buffer {buffer_bytes / 2**20:.0f} MiB at ~64 B/event"
-        f" holds ~{capacity_events} ({buffer_note})"
-        f"  -> {100 * len(rows) / capacity_events:.1f}% full"
+        f"  events observed = {len(rows)}; buffer configured {buffer_bytes / 2**20:.0f} MiB"
+        f" ({buffer_note}) -- the ratio of the two is NOT a check: traceBufferSize does not bound"
+        f" the recorded count (measured: 256 MiB configured, 49,128,810 events, complete)"
     )
-    # `traceBufferSize` does NOT bound the recorded event count. MEASURED: a prefill trace with
-    # traceBufferSize 0x10000000 (256 MiB, ~4.19e6 events at 64 B) recorded 49,128,810 events and
-    # is demonstrably COMPLETE -- 944 Recipe Start rows = 2 units x 472 launches exactly, and its
-    # mean per-unit device window matched the harness's own prefill_seconds to 0.99 (3.513 s of
-    # 3.549 s). So the capacity division is an inference from a config value, and the measurement
-    # refutes it: Synapse's profiler evidently does not stop at the configured size. The check is
-    # therefore a WARNING, and it is overridden by the external window gate when that passes.
-    over_capacity = len(rows) > capacity_events
-    if over_capacity:
-        window_passed = bool(args.expect_seconds) and 0.8 <= ratio <= 1.2
-        if window_passed:
-            emit(
-                "  NOTE: more events than the configured buffer nominally holds, but the"
-                " per-unit window gate PASSED against the harness's own prefill_seconds, so"
-                " nothing was lost: traceBufferSize does not bound the event count (measured)."
-            )
-        else:
-            blockers.append(
-                f"{len(rows)} events observed but the buffer holds ~{capacity_events} and no"
-                f" external window check confirms the trace: it may have lost events"
-            )
-            emit("  WARNING: more events than the buffer holds -> this trace may be TRUNCATED")
+    emit("")
+    emit("## what detects a LOST event (a span cannot: it is invariant to interior loss)")
+    emit(
+        f"  B/E pairing: {len(intervals)} pairs, {unmatched_begin} unmatched B,"
+        f" {unmatched_end} unmatched E -- a dropped half shows up here immediately"
+        f"  -> {'PASS' if unmatched_begin == 0 and unmatched_end == 0 else 'FAIL'}"
+    )
+    emit(
+        f"  recipe attribution: {unattributed} intervals with a recipe_id and no launch --"
+        f" a lost `Recipe Start` strands every interval under it"
+        f"  -> {'PASS' if unattributed == 0 else 'FAIL'}"
+    )
+    if len(unit_union) > 1:
+        spread = (max(unit_union) - min(unit_union)) / (sum(unit_union) / len(unit_union))
+        emit(
+            f"  per-unit agreement: {100 * spread:.3f}% spread over {len(unit_union)} units --"
+            f" two recordings that lost DIFFERENT interior events would not agree"
+            f"  -> {'PASS' if spread <= 0.01 else 'FAIL'}"
+        )
     emit("")
     if blockers:
         # Refuse, and do not print a single accounting number: a reader who quotes one of them

@@ -21,7 +21,7 @@ import re
 
 from scripts.trace_union import main
 
-PERIOD = 2  # launches per unit, and distinct recipe ids per unit
+PERIOD = 3  # launches per unit, and distinct recipe ids per unit (see LAUNCHES)
 
 # The accounting fixture, in microseconds from the start of a unit. Chosen so that every number
 # below is hand-computable and so that each hazard is present:
@@ -164,7 +164,15 @@ def test_the_three_numbers_hold_the_identity(tmp_path, capsys):
     numbers = three_numbers(out)
 
     assert numbers["b"] <= numbers["a"] <= numbers["span"], numbers
-    assert abs(numbers["c"] - (numbers["a"] - numbers["b"])) <= 0.15, numbers
+    # (c) is (a) - (b) by definition, so asserting that identity would only re-check a
+    # subtraction. What has content is the OTHER number two lines below it: the recipe_id-0
+    # union is larger than (c), because the copy overlaps recipe work. If the two were ever
+    # conflated, a reader would price the recipe-less term at 20 us instead of 40 us.
+    assert numbers["rid0"] == EXPECTED_RECIPE_LESS, numbers
+    assert numbers["rid0"] > numbers["c"], (
+        "the recipe_id-0 union must exceed (a)-(b) when recipe-less work overlaps a recipe; "
+        f"got rid0={numbers['rid0']} and c={numbers['c']}"
+    )
     assert numbers["b"] == EXPECTED_PER_RECIPE
     assert numbers["a"] == EXPECTED_MERGED
     assert numbers["c"] == EXPECTED_MERGED - EXPECTED_PER_RECIPE
@@ -216,3 +224,75 @@ def test_the_host_api_row_enters_no_union(tmp_path, capsys):
     # the 5 us host row sits inside 0-95 us, so a device union that counted it would be
     # unchanged only by luck; the real check is that (a) is exactly the device intervals.
     assert numbers["a"] == EXPECTED_MERGED
+
+
+def test_expect_seconds_falls_back_to_the_trace_config(tmp_path, capsys):
+    """The gate is only as external as its number: the trace's own config must be the source.
+
+    The hook writes `prefill_seconds` into <case>-config.json from the run that produced the
+    trace, so the completeness gate can use the harness's own timing without an operator typing
+    it. The report must say which source was used, because a number from another boot (or from
+    the command line) is a weaker claim than one from this run.
+    """
+    trace = write_accounting_trace(tmp_path / "prefill-ctx8192-b1-rank000.json")
+    config = json.loads(
+        trace.with_name("prefill-ctx8192-b1-rank000-config.json").read_text()
+    )
+    config["phase"] = "prefill"
+    config["prefill_seconds"] = EXPECTED_SPAN / 1e6  # one unit's window, in seconds
+    trace.with_name("prefill-ctx8192-b1-rank000-config.json").write_text(
+        json.dumps(config)
+    )
+
+    status, out = run_trace(capsys, trace)
+    assert status == 0, out
+    assert "from the trace's config" in out, out
+    assert "ratio 1.000" in out, out
+
+
+def test_a_prefill_trace_with_no_timing_anywhere_is_refused(tmp_path, capsys):
+    """No prefill_seconds in the config and no --expect-seconds: the gate cannot be performed.
+
+    A prefill trace whose completeness cannot be checked is not quotable, and the refusal must
+    print no accounting numbers.
+    """
+    trace = write_accounting_trace(tmp_path / "prefill-ctx8192-b1-rank000.json")
+    config = json.loads(
+        trace.with_name("prefill-ctx8192-b1-rank000-config.json").read_text()
+    )
+    config["phase"] = "prefill"
+    config.pop("prefill_seconds", None)
+    trace.with_name("prefill-ctx8192-b1-rank000-config.json").write_text(
+        json.dumps(config)
+    )
+
+    status, out = run_trace(capsys, trace)
+    assert status == 1, out
+    assert "REFUSED" in out, out
+    assert "(a) merged union" not in out, out
+
+
+def test_a_tiny_configured_buffer_does_not_refuse_a_complete_trace(tmp_path, capsys):
+    """The buffer ratio is information, not a check -- measured, not assumed.
+
+    A real prefill trace configured for 256 MiB recorded 49,128,810 events and is complete, so
+    `traceBufferSize` does not bound the recorded count. A capacity division therefore says
+    nothing about truncation, and it must not be able to refuse a trace (nor be "excusable": a
+    span is invariant to losing interior events, which is exactly what an event-count check was
+    supposed to catch). Set the configured buffer absurdly small and the trace must still pass.
+    """
+    trace = write_accounting_trace(tmp_path / "prefill-ctx8192-b1-rank000.json")
+    config_path = trace.with_name("prefill-ctx8192-b1-rank000-config.json")
+    config = json.loads(config_path.read_text())
+    config["phase"] = "prefill"
+    config["prefill_seconds"] = EXPECTED_SPAN / 1e6
+    config["trace_buffer_size"] = "0x1000"  # 4 KiB: ~64 events, against hundreds recorded
+    config_path.write_text(json.dumps(config))
+
+    status, out = run_trace(capsys, trace)
+    assert status == 0, out
+    assert "NOT a check" in out, out
+    assert "REFUSED" not in out, out
+    # the interior-loss detectors are the stated basis for completeness
+    assert "B/E pairing" in out, out
+    assert "recipe attribution" in out, out
