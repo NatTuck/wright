@@ -246,7 +246,7 @@ def main(argv=None) -> int:
 
     # ---- device intervals: pair B with E on (engine, index, name) with a stack
     stacks: dict[tuple[int, int, str], list[Row]] = defaultdict(list)
-    intervals = []  # (engine, index, name, rid, start, end)
+    intervals = []  # (engine, index, name, rid, start, end, recipe_name)
     unmatched_end = 0
     for row in sorted(rows, key=lambda r: r.ts):
         if row.cat == "Host API" or row.ph in ("V",):
@@ -258,13 +258,29 @@ def main(argv=None) -> int:
             if stacks[key]:
                 begin = stacks[key].pop()
                 intervals.append(
-                    (key[0], key[1], key[2], begin.rid, begin.ts, row.ts)
+                    (
+                        key[0],
+                        key[1],
+                        key[2],
+                        begin.rid,
+                        begin.ts,
+                        row.ts,
+                        begin.rname or row.rname,
+                    )
                 )
             else:
                 unmatched_end += 1
         elif row.ph == "X" and row.dur > 0:
             intervals.append(
-                (engine_of(row.engine), row.index, row.name, row.rid, row.ts, row.ts + row.dur)
+                (
+                    engine_of(row.engine),
+                    row.index,
+                    row.name,
+                    row.rid,
+                    row.ts,
+                    row.ts + row.dur,
+                    row.rname,
+                )
             )
     unmatched_begin = sum(len(stack) for stack in stacks.values())
 
@@ -316,7 +332,8 @@ def main(argv=None) -> int:
     outside: list[tuple[float, float]] = []
     outside_by_engine: dict[int, list[tuple[float, float]]] = defaultdict(list)
     unattributed = 0
-    for engine, _index, name, rid, start, end in intervals:
+    launch_rname: dict[int, str] = {}
+    for engine, _index, name, rid, start, end, rname in intervals:
         if end <= start:
             continue
         if not launches:
@@ -340,6 +357,8 @@ def main(argv=None) -> int:
             unattributed += 1
             continue
         per_launch[which].append((start, end))
+        if rname and which not in launch_rname:
+            launch_rname[which] = rname
         per_launch_engine[which][engine].append((start, end))
         per_launch_family[which][family(name)].append((start, end))
         per_launch_name[which][name].append((start, end))
@@ -381,13 +400,66 @@ def main(argv=None) -> int:
         )
 
     # ---- diagnostics
-    all_intervals = [(start, end) for *_rest, start, end in intervals]
+    all_intervals = [(iv[4], iv[5]) for iv in intervals]
     total_span = max(e for _s, e in all_intervals) - min(s for s, _e in all_intervals)
     step_union = unit_union[0] if unit_union else 0.0
     step_span = unit_span[0] if unit_span else total_span
     merged_all = merge(all_intervals)
     outside_union = merge(outside)
     rid_rows = sum(1 for r in rows if r.rid and r.cat != "Host API")
+
+    # Three numbers, on ONE scope (the first repeating unit), because they only compare if
+    # they cover the same time window:
+    #   (a) merged union over every interval in the unit      -- device busy
+    #   (b) sum of per-recipe unions                          -- the manual's accounting number
+    #   (c) the difference, labelled: recipe-less device work (host copies, barriers, and any
+    #       device activity with no recipe_id). If (c) dominates, the per-recipe table is not
+    #       the step and saying so is the finding.
+    boundaries = [launches[unit[0]][0] for unit in units] if launches else [0.0]
+
+    def unit_of(ts: float) -> int:
+        lo, hi = 0, len(boundaries)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if boundaries[mid] <= ts:
+                lo = mid + 1
+            else:
+                hi = mid
+        return max(0, lo - 1)
+
+    outside_by_unit: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    for start, end in outside:
+        outside_by_unit[unit_of(start)].append((start, end))
+
+    def unit_merged(k: int) -> float:
+        """Every device interval that starts inside unit k, merged: device busy for that step."""
+        spans = [iv for i in units[k] for iv in per_launch.get(i, ())]
+        spans.extend(outside_by_unit.get(k, ()))
+        return merge(spans)
+
+    merged_unit = unit_merged(0) if units else merged_all
+    recipe_less_unit = merge(outside_by_unit.get(0, ()))
+    # All units are nominally the same step measured k times, so the mean is the better
+    # estimator than unit 0; unit 0 is printed beside it for comparison.
+    n_units = max(len(units), 1)
+    merged_unit_mean = sum(unit_merged(k) for k in range(len(units))) / n_units
+    recipe_less_mean = (
+        sum(merge(outside_by_unit.get(k, ())) for k in range(len(units))) / n_units
+    )
+    step_union_mean = sum(unit_union) / n_units if unit_union else 0.0
+    # A trace that lost events to buffer overflow shows up as fewer launches than the model
+    # issued. Two independent checks: the units must partition the launches exactly, and every
+    # interval that carries a recipe_id must have found its launch.
+    expected_units = None
+    config_path = args.trace.with_name(
+        args.trace.name.replace(".tsv", "-config.json").replace(".json.gz", "-config.json")
+    )
+    if config_path.exists():
+        try:
+            expected_units = json.loads(config_path.read_text()).get("passes")
+        except (OSError, ValueError):
+            expected_units = None
+    launches_cover = len(units) * period == len(launches) if launches else False
 
     lines: list[str] = []
 
@@ -416,39 +488,107 @@ def main(argv=None) -> int:
     emit(f"rows carrying a recipe_id: {rid_rows}   Recipe Start rows: {len(launches)}")
     emit(f"device events present: {'YES' if intervals else 'NO'}")
     emit("")
+    emit("## truncation check (the only protection against reading a buffer overflow)")
+    emit(
+        f"  Recipe Start rows = {len(launches)};  units {len(units)} x period {period}"
+        f" = {len(units) * period}  -> {'PASS' if launches_cover else 'FAIL'}"
+    )
+    if expected_units is not None:
+        emit(
+            f"  passes recorded in the trace config = {expected_units},"
+            f" units detected = {len(units)}  ->"
+            f" {'PASS' if len(units) == expected_units else 'FAIL (truncated or mis-split)'}"
+        )
+    else:
+        emit("  passes in the trace config: no <case>-config.json beside this trace")
+    emit(
+        f"  intervals carrying a recipe_id that found no launch = {unattributed}"
+        f"  -> {'PASS' if unattributed == 0 else 'FAIL (lost Recipe Start rows)'}"
+    )
+    buffer_bytes = 0x10000000
+    emit(
+        f"  events observed = {len(rows)}; buffer 256 MiB at ~64 B/event holds ~{buffer_bytes // 64}"
+        f"  -> {100 * len(rows) / (buffer_bytes // 64):.1f}% full"
+    )
+    emit("")
+    emit("## the step, three numbers on the same scope (mean over the repeating units)")
+    emit(
+        f"  (a) merged union over every device interval = {merged_unit_mean:10.1f} us"
+        "   <- device busy"
+    )
+    emit(
+        f"  (b) sum of per-recipe unions               = {step_union_mean:10.1f} us"
+        "   <- union within a recipe, sum across recipes"
+    )
+    emit(
+        f"  (c) recipe-less device work (a) minus (b)  = {merged_unit_mean - step_union_mean:10.1f} us"
+        f"   = {100 * (merged_unit_mean - step_union_mean) / merged_unit_mean:.1f}% of (a)"
+    )
+    emit(
+        f"      of which intervals with recipe_id 0 (host copies, barriers)"
+        f" = {recipe_less_mean:10.1f} us"
+        f"   = {100 * recipe_less_mean / merged_unit_mean:.1f}% of (a)"
+    )
+    if len(units) > 1:
+        emit(
+            f"      unit 0 alone: (a) {merged_unit:.1f} us, (b) {step_union:.1f} us,"
+            f" recipe-less {recipe_less_unit:.1f} us"
+        )
+    emit(
+        f"  step span (first start -> last end)        = {step_span:10.1f} us"
+    )
+    emit(
+        f"  union/span = {step_union / step_span:.3f}"
+        if step_span
+        else "  union/span = n/a"
+    )
+    emit(
+        "  (b) + (c) can exceed (a): recipes overlap each other across engines, and (c) is a"
+        " merge, so the two are not disjoint."
+    )
+    if len(units) > 1:
+        emit(
+            f"  per-unit (b): mean {sum(unit_union) / len(unit_union):.1f} us"
+            f"  min {min(unit_union):.1f}  max {max(unit_union):.1f}  ({len(units)} units)"
+        )
+        emit(
+            f"  per-unit (a): mean {sum(unit_merged(k) for k in range(len(units))) / len(units):.1f} us"
+        )
+    emit(f"  whole window: span {total_span:.1f} us, merged union {merged_all:.1f} us"
+         f" ({merged_all / total_span:.3f} of window span)")
+    emit("")
+    emit("## nodes per recipe (per unit) — a recipe is several device nodes, not one")
+    nodes_per_launch = sorted(len(per_launch.get(i, ())) for unit in units for i in unit)
+    if nodes_per_launch:
+        emit(
+            f"  device intervals per launch: median {nodes_per_launch[len(nodes_per_launch) // 2]}"
+            f"  min {nodes_per_launch[0]}  max {nodes_per_launch[-1]}"
+            f"  over {len(nodes_per_launch)} launches"
+        )
+        emit(
+            f"  launches per unit {period}, so one unit is ~{period} recipes x ~"
+            f"{sum(nodes_per_launch) // len(nodes_per_launch)} device nodes"
+            f" = ~{sum(nodes_per_launch) // len(units)} node intervals"
+        )
+    per_launch_engines = [
+        len(per_launch_engine.get(i, {})) for unit in units for i in unit
+    ]
+    if per_launch_engines:
+        emit(
+            f"  engine streams per launch: median {sorted(per_launch_engines)[len(per_launch_engines) // 2]}"
+            f"  max {max(per_launch_engines)}"
+        )
+    emit("")
     emit("## window")
     emit(f"span (all device intervals): {total_span:.1f} us")
     emit(
         f"launches: {len(launches)}   repeating unit: {period} launches ({detected})"
         f"   units in trace: {len(units)}"
     )
-    emit(
-        "accounting: union within a recipe, sum across recipes (recipes are serial)"
-    )
-    emit(f"  step union   (sum of per-recipe unions)  = {step_union:10.1f} us")
-    emit(f"  step span    (first start -> last end)   = {step_span:10.1f} us")
-    emit(
-        f"  union/span   = {step_union / step_span:.3f}"
-        if step_span
-        else "  union/span   = n/a"
-    )
-    emit(
-        f"  merged union across every interval       = {merged_all:10.1f} us"
-        f"   ({merged_all / total_span:.3f} of window span; diagnostic, cross-recipe overlap"
-        " counted once)"
-    )
     if outside_union:
         emit(
-            f"  outside any recipe (recipe_id 0: host copies, barriers)"
+            f"outside any recipe over the whole window (recipe_id 0)"
             f" = {outside_union:10.1f} us"
-        )
-    if unattributed:
-        emit(f"  intervals with a recipe_id but no launch marker = {unattributed}")
-    if len(units) > 1:
-        emit(
-            f"  per-unit union: mean {sum(unit_union) / len(unit_union):.1f} us"
-            f"  min {min(unit_union):.1f}  max {max(unit_union):.1f}"
-            f"  ({len(units)} units)"
         )
     emit("")
     emit("## by engine type (sum over recipes of that recipe's per-engine union)")
@@ -480,7 +620,23 @@ def main(argv=None) -> int:
         share = 100 * total / step_union if step_union else 0.0
         emit(f"  {fam:<18} {total:10.1f} us  {share:5.1f}% of union")
     emit("")
-    emit(f"## top {args.top} recipes by union (per unit)")
+    emit(f"## top {args.top} recipes by union (per unit; one launch = one recipe)")
+    recipe_totals: dict[tuple[int, str], float] = defaultdict(float)
+    for unit in units:
+        for i in unit:
+            key = (launches[i][2], launch_rname.get(i, ""))
+            recipe_totals[key] += launch_union.get(i, 0.0)
+    for (rid, rname), total in sorted(
+        recipe_totals.items(), key=lambda kv: -kv[1]
+    )[: args.top]:
+        per = total / n_units
+        share = 100 * per / step_union if step_union else 0.0
+        label = rname or f"recipe_id {rid}"
+        emit(f"  {per:9.1f} us  {share:5.1f}%  [{family(rname)}] {label}  (id {rid})")
+    emit("")
+    emit(
+        f"## top {args.top} node names by union (per unit; the union is per node, not per launch)"
+    )
     name_totals: dict[str, float] = defaultdict(float)
     for unit in units:
         for i in unit:
@@ -493,7 +649,8 @@ def main(argv=None) -> int:
     emit("")
     emit("## name -> family mapping used")
     mapping: dict[str, set[str]] = defaultdict(set)
-    for _engine, _index, name, *_rest in intervals:
+    for iv in intervals:
+        name = iv[2]
         mapping[family(name)].add(name)
     for fam in sorted(mapping, key=lambda f: -len(mapping[f])):
         sample = sorted(mapping[fam])[:3]
