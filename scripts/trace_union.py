@@ -330,6 +330,7 @@ def main(argv=None) -> int:
     stacks: dict[tuple[int, int, str], list[Row]] = defaultdict(list)
     intervals = []  # (engine, index, name, rid, start, end, recipe_name)
     unmatched_end = 0
+    leftover_e: list[Row] = []
     for row in sorted(rows, key=lambda r: r.ts):
         if row.cat == "Host API" or row.ph in ("V",):
             continue
@@ -352,6 +353,7 @@ def main(argv=None) -> int:
                 )
             else:
                 unmatched_end += 1
+                leftover_e.append(row)
         elif row.ph == "X" and row.dur > 0:
             intervals.append(
                 (
@@ -364,7 +366,41 @@ def main(argv=None) -> int:
                     row.rname,
                 )
             )
-    unmatched_begin = sum(len(stack) for stack in stacks.values())
+    # A second pass for what the name-keyed pass could not pair. Synapse emits flush and
+    # end markers (`END_EVENT 324`, `DBG_DMA_TRC_WR_DATA_LAST 169`) whose begin and end rows
+    # do not carry the same name, so a name-keyed stack leaves them unmatched -- 12,112 of
+    # 250,318 B rows on a 32k prefill trace, 4.8%. A single engine instance is serial, so on
+    # (engine, index) alone a stack is exact; this recovers those pairs without weakening the
+    # name-keyed pass, and the count is reported so a reader can see how much came this way.
+    leftover: list[Row] = []
+    for stack in stacks.values():
+        leftover.extend(stack)
+    leftover.extend(leftover_e)
+    leftover.sort(key=lambda r: r.ts)
+    by_engine: dict[tuple[int, int], list[Row]] = defaultdict(list)
+    for row in leftover:
+        by_engine[(engine_of(row.engine), row.index)].append(row)
+    fallback = 0
+    for (engine, index), rows_ in by_engine.items():
+        open_b: list[Row] = []
+        for row in rows_:
+            if row.ph == "B":
+                open_b.append(row)
+            elif open_b:
+                begin = open_b.pop()
+                intervals.append(
+                    (
+                        engine,
+                        index,
+                        begin.name,
+                        begin.rid,
+                        begin.ts,
+                        row.ts,
+                        begin.rname or row.rname,
+                    )
+                )
+                fallback += 1
+    unmatched_begin = sum(len(stack) for stack in stacks.values()) - fallback
 
     if not intervals:
         print(f"NO DEVICE EVENTS: {args.trace}")
@@ -566,6 +602,8 @@ def main(argv=None) -> int:
         emit(f"  engine {engine:<5} {label:<24} intervals={count}")
     emit(
         f"B/E pairs: {len(intervals)}   unmatched B: {unmatched_begin}   unmatched E: {unmatched_end}"
+        f"   (of which paired on (engine, index) alone, because the two halves carry different"
+        f" names: {fallback})"
     )
     emit(f"rows carrying a recipe_id: {rid_rows}   Recipe Start rows: {len(launches)}")
     emit(f"device events present: {'YES' if intervals else 'NO'}")
