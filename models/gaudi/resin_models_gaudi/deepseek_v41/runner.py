@@ -15,6 +15,8 @@ prefix cache starts from cached blocks (``EngramContext``).
 from __future__ import annotations
 
 import json
+import os
+import time
 import warnings
 from pathlib import Path
 
@@ -45,10 +47,12 @@ from resin_models_gaudi.mistral_large4 import parallel
 from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
 from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params
 from resin_models_gaudi.synapse.progress import info
+from resin_models_gaudi.synapse.graph import LAUNCH_STATS, reset_launch_stats
 from resin_models_gaudi.synapse.runtime import open_device
 
 PREFILL_CHUNK_SIZE = TMAX
 MAX_BATCH = 64
+profile_step = os.environ.get("RESIN_GAUDI_PROFILE_STEP") == "1"
 
 
 class DeepSeekV41GaudiRunner:
@@ -302,12 +306,28 @@ class DeepSeekV41GaudiRunner:
                     for r in part
                 ]
                 sl = slice(g, g + len(rows))
+                if profile_step:
+                    reset_launch_stats()
+                    t_step = time.perf_counter()
                 T = model.launch(tokens[sl], positions[sl], rows)
                 for r in part:
                     self._context.seen(
                         int(batch.sequence_ids[r]), int(positions[r]), tokens[r : r + 1]
                     )
+                t_sample = time.perf_counter() if profile_step else 0.0
                 outs.append(model.sample_launched(Shape(T, False), params[sl]))
+                if profile_step:
+                    end = time.perf_counter()
+                    enqueue = 1000 * LAUNCH_STATS["seconds"]
+                    launch_wall = 1000 * (t_sample - t_step)
+                    sample_wall = 1000 * (end - t_sample)
+                    step_wall = 1000 * (end - t_step)
+                    self.log(
+                        f"step profile T={T} rows={len(rows)}: launches={LAUNCH_STATS['calls']} "
+                        f"enqueue={enqueue:.1f} ms, launch_wall={launch_wall:.1f} ms, "
+                        f"sync+d2h={sample_wall:.1f} ms, step_wall={step_wall:.1f} ms, "
+                        f"residual={step_wall - enqueue - sample_wall:.1f} ms"
+                    )
         tok, lp, top_ids, top_lp = (np.concatenate(x) for x in zip(*outs, strict=True))
         counts = np.ones(len(tok), np.int64)
         columns = (
