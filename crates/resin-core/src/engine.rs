@@ -10,6 +10,7 @@ use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources};
+use crate::steptimer::{self, Slot};
 use crate::timeshare::{Clock, DecodeShare, TimeShare};
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
@@ -962,7 +963,10 @@ impl<P: Clone> EngineCore<P> {
         let Some(plan) = self.prepare_step(runner, phase)? else {
             return Ok(Vec::new());
         };
-        let output = execution_call("forward", || runner.forward(plan));
+        let output = {
+            let _forward = steptimer::span(Slot::Forward);
+            execution_call("forward", || runner.forward(plan))
+        };
         let output = output
             .as_ref()
             .map(OwnedTokenRows::view)
@@ -980,6 +984,8 @@ impl<P: Clone> EngineCore<P> {
         runner: &mut impl Runner<P>,
         phase: Option<Phase>,
     ) -> Result<Option<ExecutionPlan<P>>> {
+        steptimer::begin_step();
+        let _prepare = steptimer::span(Slot::Prepare);
         self.raise_if_open()?;
         self.require_completed_step()?;
         let Some((batch, plan)) = self.prepare_batch(runner, phase)? else {
@@ -987,6 +993,8 @@ impl<P: Clone> EngineCore<P> {
         };
         self.timeshare.launched(plan.phase, batch.launch_share);
         self.in_flight = Some(batch);
+        drop(_prepare);
+        steptimer::note_phase(plan.phase == Phase::Decode);
         Ok(Some(plan))
     }
 
@@ -1005,6 +1013,7 @@ impl<P: Clone> EngineCore<P> {
         output: Result<TokenRows<'_>>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
+        let _complete = steptimer::span(Slot::Complete);
         self.raise_if_open()?;
         self.continuation = None;
         let Some(mut batch) = self.in_flight.take() else {
@@ -1120,6 +1129,7 @@ impl<P: Clone> EngineCore<P> {
         output: Result<TokenRows<'_>>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
+        let _complete = steptimer::span(Slot::Complete);
         self.raise_if_open()?;
         let Some(template) = self.continuation.take() else {
             return Err(Error::internal("Engine has no safe decode continuation"));
@@ -1238,14 +1248,20 @@ impl<P: Clone> EngineCore<P> {
         }
 
         let (scheduled_rows, selection, contended, launch_share) = {
-            let (selected_requests, mut selection, target) = self.selected_cohort()?;
+            let (selected_requests, mut selection, target) = {
+                let _cohort = steptimer::span(Slot::PrepCohort);
+                self.selected_cohort()?
+            };
             if selected_requests.is_empty() {
                 return Ok(None);
             }
             if phase.is_some_and(|phase| selected_requests[0].phase() != phase) {
                 return Ok(None);
             }
-            let scheduled_rows = schedule_requests(&selected_requests, self.planning_config())?;
+            let scheduled_rows = {
+                let _schedule = steptimer::span(Slot::PrepSchedule);
+                schedule_requests(&selected_requests, self.planning_config())?
+            };
             if scheduled_rows.is_empty() {
                 return Err(Error::internal(
                     "scheduler produced no token-bearing rows for a nonempty cohort",
@@ -1292,6 +1308,7 @@ impl<P: Clone> EngineCore<P> {
         }
         let mut scheduled = self.scheduler.take_selected(selection);
 
+        let _kv = steptimer::span(Slot::PrepKv);
         let growth_error = if let Some(resources) = self.kv_resources.as_mut() {
             let mut growth_error = None;
             for (request, row) in scheduled.iter_mut().zip(&scheduled_rows) {
@@ -1325,7 +1342,9 @@ impl<P: Clone> EngineCore<P> {
             }
             return Err(Error::from(error));
         }
+        drop(_kv);
 
+        let _acquire = steptimer::span(Slot::PrepAcquire);
         let mut acquired_kv = match self.kv_resources.as_mut() {
             Some(resources) => {
                 let requests = scheduled
@@ -1363,6 +1382,8 @@ impl<P: Clone> EngineCore<P> {
 
         // Payload cloning is caller code too. It runs before runner execution,
         // so an unwind must release access and restore the selected requests.
+        drop(_acquire);
+        let _build = steptimer::span(Slot::PrepBuild);
         let plan = catch_unwind(AssertUnwindSafe(|| {
             build_plan(
                 batch_id,
@@ -1384,6 +1405,7 @@ impl<P: Clone> EngineCore<P> {
                 return Err(error);
             }
         };
+        drop(_build);
         let batch = Batch {
             prepared_at: self.metrics.as_ref().map(|_| Instant::now()),
             launch_share,
@@ -1410,6 +1432,7 @@ impl<P: Clone> EngineCore<P> {
         mut make_event: impl FnMut(TokenEvent) -> Result<E>,
         continuation: Option<ExecutionPlan<P>>,
     ) -> Result<Vec<E>> {
+        let _validate = steptimer::span(Slot::CompValidate);
         // Validate the complete execution result before terminal output limits
         // can hide writes beyond the leased capacity or extra prefill tokens.
         let logprobs = match execution_call("logprob access", || Ok(runner.logprobs())) {
@@ -1476,7 +1499,9 @@ impl<P: Clone> EngineCore<P> {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        drop(_validate);
 
+        let _events = steptimer::span(Slot::CompEvents);
         let mut retired = Vec::with_capacity(batch.rows.len());
         let mut retired_ids = Vec::new();
         let event_capacity = output_token_ids.token_count();
@@ -1547,6 +1572,8 @@ impl<P: Clone> EngineCore<P> {
             committed_token_ids.push(committed);
         }
 
+        drop(_events);
+        let _progress = steptimer::span(Slot::CompProgress);
         let prepared_progress =
             match Self::prepare_scheduled_progress(&mut batch.rows, &committed_token_ids) {
                 Ok(prepared) => prepared,
@@ -1554,7 +1581,9 @@ impl<P: Clone> EngineCore<P> {
                     return self.quarantine(batch, "native progress commit failed", error);
                 }
             };
+        drop(_progress);
 
+        let _release = steptimer::span(Slot::CompRelease);
         // Validate every physical retirement and reserve all destination
         // storage before asking the runner or any allocator to release state.
         for (row, retire) in batch.rows.iter().zip(&retired) {
@@ -1592,6 +1621,8 @@ impl<P: Clone> EngineCore<P> {
             }
         }
 
+        drop(_release);
+        let _retire = steptimer::span(Slot::CompRetire);
         for (row, retire) in batch.rows.iter_mut().zip(&retired) {
             if !*retire || continuation.is_some() {
                 continue;
@@ -1604,7 +1635,9 @@ impl<P: Clone> EngineCore<P> {
                 );
             }
         }
+        drop(_retire);
 
+        let _commit = steptimer::span(Slot::CompCommit);
         // Logical progress becomes visible only after every fallible physical
         // cleanup step has completed.
         let committed_at = self.metrics.as_ref().map(|_| Instant::now());
@@ -2028,6 +2061,7 @@ impl<P: Clone> EngineCore<P> {
         if let Some(metrics) = &mut self.metrics {
             metrics.close();
         }
+        steptimer::flush();
         Ok(())
     }
 

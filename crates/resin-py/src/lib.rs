@@ -38,6 +38,7 @@ use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, Cac
 use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
 use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
+use resin_core::steptimer::{self, Slot};
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, optional_runner_callable,
     resolve_runner_config, resolve_runner_contract, runner_error_is_post_accept,
@@ -1298,7 +1299,11 @@ impl Engine {
                     .runner_enqueue
                     .as_ref()
                     .expect("pending runner can enqueue");
-                let result = match enqueue.bind(py).call((&next_plan,), Some(&kwargs)) {
+                let enqueued = {
+                    let _forward = steptimer::span(Slot::Forward);
+                    enqueue.bind(py).call((&next_plan,), Some(&kwargs))
+                };
+                let result = match enqueued {
                     Ok(result) => result.unbind(),
                     Err(error) => {
                         self.core
@@ -1382,7 +1387,11 @@ impl Engine {
         };
         if can_enqueue {
             let enqueue = self.runner_enqueue.as_ref().expect("checked enqueue");
-            match enqueue.bind(py).call1((&plan,)) {
+            let enqueued = {
+                let _forward = steptimer::span(Slot::Forward);
+                enqueue.bind(py).call1((&plan,))
+            };
+            match enqueued {
                 Ok(output) => {
                     let asynchronous = match runner_result_is_async(&output) {
                         Ok(asynchronous) => asynchronous,
@@ -1410,7 +1419,11 @@ impl Engine {
                 Err(error) => return Err(self.fail_output(py, error, false)),
             }
         } else {
-            match self.runner_forward.bind(py).call1((&plan,)) {
+            let output = {
+                let _forward = steptimer::span(Slot::Forward);
+                self.runner_forward.bind(py).call1((&plan,))
+            };
+            match output {
                 Ok(output) => events.extend(self.consume_output(py, &plan, &output, false)?),
                 Err(error) => return Err(self.fail_output(py, error, false)),
             }
@@ -1439,6 +1452,7 @@ impl Engine {
             prompt_logprobs: None,
         };
         let tokens;
+        let _extract = steptimer::span(Slot::Extract);
         let output = match extract_runner_output(output) {
             Ok(output) => {
                 tokens = output.tokens;
@@ -1458,6 +1472,7 @@ impl Engine {
             }
             Err(error) => Err(runner.failed(error, true)),
         };
+        drop(_extract);
         let mut event_error = None;
         let make_event = |event: core::TokenEvent| {
             Py::new(

@@ -23,6 +23,7 @@ pub mod parallelism;
 mod planning;
 pub mod resources;
 mod scheduler;
+pub mod steptimer;
 pub mod timeshare;
 
 pub use batch::{SequenceStep, TokenRange};
