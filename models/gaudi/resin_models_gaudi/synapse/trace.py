@@ -43,11 +43,55 @@ def enable_profiler(
     accepts (``profileDevice`` is refused, and is not in the plugin's vocabulary at all).
     ``trace_type`` is what ``rg_prof_start`` passes to ``synProfilerStart``; ``device`` is
     the one that emits device execution records.
+
+    Two further settings come from the plugin's own embedded schema
+    (``libhw_trace.so``: ``{"archProfileUnits": ..., "generalOptions": ..., "parseOptions": ...}``)
+    and both are needed for a 512k prefill:
+
+      * ``generalOptions.traceBufferSize`` defaults to ``"0x5000000"`` (80 MiB), which a
+        512k prefill overruns. Raised here to ``RESIN_PROF_BUFFER`` (default ``"0x8000000"``,
+        128 MiB); ``traceBufferLocation`` (``dram``/``host``/``auto``) is pinned explicitly.
+      * ``archProfileUnits.gaudi2.TPC.Gaudi2TpcAdvancedProfiling`` and
+        ``.../MME/Gaudi2MmeAdvancedProfiling`` default to **false**, and with them false the
+        device records are sync-point markers only (categories ``SP n``), not per-kernel
+        records. They are turned on here (``RESIN_PROF_ADVANCED=0`` restores the default).
+        They live under ``archProfileUnits``, NOT under ``generalOptions``: a key in the
+        wrong section is silently ignored by the deserializer.
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     json_only = {"value": True}
     off = {"value": False}
+    on = {"value": True}
+    advanced = os.environ.get("RESIN_PROF_ADVANCED", "1") == "1"
+    buffer_size = os.environ.get("RESIN_PROF_BUFFER", "0x8000000")
+    location = os.environ.get("RESIN_PROF_LOCATION", "dram")
+    values = {
+        "generalOptions": {
+            "arch": {"value": "gaudi2"},
+            "profilePhase": {"value": phase},
+            "traceBufferSize": {"value": buffer_size},
+            "traceBufferLocation": {"value": location},
+        },
+        "parseOptions": {
+            "outputPerInvocation": {
+                "binary": off,
+                "csv": off,
+                "dbgInfo": off,
+                "hltv": off,
+                "hltvWithHost": off,
+                "json": json_only,
+                "text": off,
+            }
+        },
+    }
+    if advanced:
+        values["archProfileUnits"] = {
+            "gaudi2": {
+                "TPC": {"Gaudi2TpcAdvancedProfiling": on},
+                "MME": {"Gaudi2MmeAdvancedProfiling": on},
+            }
+        }
     config = {
         "GeneralSettings": {
             "values": {
@@ -64,23 +108,7 @@ def enable_profiler(
             {
                 "lib": "libhw_trace.so",
                 "name": "HwTrace",
-                "values": {
-                    "generalOptions": {
-                        "arch": {"value": "gaudi2"},
-                        "profilePhase": {"value": phase},
-                    },
-                    "parseOptions": {
-                        "outputPerInvocation": {
-                            "binary": off,
-                            "csv": off,
-                            "dbgInfo": off,
-                            "hltv": off,
-                            "hltvWithHost": off,
-                            "json": json_only,
-                            "text": off,
-                        }
-                    },
-                },
+                "values": values,
             },
         ],
     }
@@ -98,7 +126,11 @@ def enable_profiler(
                 "trace_type": trace_type,
                 "output_per_invocation": ["json"],
                 "plugins": ["HostProfiler", "HwTrace"],
+                "trace_buffer_size": buffer_size,
+                "trace_buffer_location": location,
+                "tpc_mme_advanced_profiling": advanced,
                 "DUMP_POST_GRAPHS": os.environ.get("DUMP_POST_GRAPHS"),
+                "HOME": os.environ.get("HOME"),
                 "HABANA_PROFILE": os.environ.get("HABANA_PROFILE"),
                 "resin_prof_trace_type": os.environ.get("RESIN_PROF_TRACE_TYPE"),
                 "config": str(path),
@@ -137,10 +169,13 @@ def chrome_events(tsv: str | Path) -> list[dict]:
             if phase != "M":
                 # recipe identity is what makes a device row attributable; it is populated
                 # on device rows and on the `V`/Recipe Start rows, never on metadata rows.
+                # `-` is the writer's "this phase carries no event args" marker (M and C
+                # rows); `0`/empty means the member is live with no recipe.
                 args = event.get("args") or {}
-                if row.get("recipe_id") and row["recipe_id"] != "0":
-                    args["recipe_id"] = int(row["recipe_id"])
-                if row.get("recipe_name"):
+                recipe = (row.get("recipe_id") or "").strip()
+                if recipe.isdigit() and recipe != "0":
+                    args["recipe_id"] = int(recipe)
+                if row.get("recipe_name") and row["recipe_name"] != "-":
                     args["recipe_name"] = row["recipe_name"]
                 if args:
                     event["args"] = args
