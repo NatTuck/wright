@@ -89,6 +89,18 @@ def merge(intervals) -> float:
 # `n1_rg_swiglu_f32`, so the leading index is stripped first. Ordered: the more specific
 # prefixes win. The report prints the name->family mapping it used, so it is auditable.
 _FAMILIES = (
+    ("mx4_decs", "expert-dequant"),
+    ("mx4", "expert-dequant"),
+    ("fp8_gemm", "gemm"),
+    ("batch_gemm", "gemm"),
+    ("gemm", "gemm"),
+    ("moe_route", "routing"),
+    ("ix_thr", "indexer"),
+    ("ix_gather", "indexer"),
+    ("ix_slot", "indexer"),
+    ("stream_index", "indexer"),
+    ("swiglu", "act"),
+    ("memset", "copy/dma"),
     ("attn_pre", "attn_pre"),
     ("attn_out", "attn_out"),
     ("attn", "attn"),
@@ -220,6 +232,70 @@ def engine_names(path: Path) -> dict[int, str]:
     return names
 
 
+def summarize(path: Path) -> dict:
+    """Recipe set and node counts of a trace, for comparing a substituted capture with the
+    real one. Deliberately independent of the accounting above: a substitution is only valid
+    if the recipe set and the node counts match, and that must be checkable, not asserted."""
+    rows = load(path)
+    stacks: dict[tuple[int, int, str], list] = defaultdict(list)
+    intervals = []
+    for row in sorted(rows, key=lambda r: r.ts):
+        if row.cat == "Host API" or row.ph == "V":
+            continue
+        key = (engine_of(row.engine), row.index, row.name)
+        if row.ph == "B":
+            stacks[key].append(row)
+        elif row.ph == "E" and stacks[key]:
+            begin = stacks[key].pop()
+            intervals.append((key[0], begin.rid, begin.ts, row.ts, begin.rname or row.rname))
+    launches = [
+        (r.ts, r.rid, r.rname) for r in rows if r.ph == "V" and r.cat == "Recipe Start"
+    ]
+    launches.sort()
+    by_launch: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    starts: dict[int, list[float]] = defaultdict(list)
+    for ts, rid, _name in launches:
+        starts[rid].append(ts)
+    names: dict[int, str] = {}
+    for engine, rid, start, end, rname in intervals:
+        if not rid or rid not in starts:
+            continue
+        seq = starts[rid]
+        lo, hi = 0, len(seq)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if seq[mid] <= start:
+                lo = mid + 1
+            else:
+                hi = mid
+        which = lo - 1
+        if which < 0:
+            continue
+        key = (rid, seq[which])
+        ordinal = next(
+            (i for i, (ts, r, _n) in enumerate(launches) if (r, ts) == key), None
+        )
+        if ordinal is None:
+            continue
+        by_launch[ordinal].append((start, end))
+        if rname and ordinal not in names:
+            names[ordinal] = rname
+    per_launch = sorted(len(v) for v in by_launch.values())
+    engines = {
+        engine
+        for engine, *_rest in intervals
+    }
+    return {
+        "path": path,
+        "recipe_ids": sorted({rid for _ts, rid, _n in launches}),
+        "recipe_names": sorted({n for n in names.values() if n}),
+        "launches": len(launches),
+        "nodes": per_launch,
+        "median_nodes": per_launch[len(per_launch) // 2] if per_launch else 0,
+        "engines": sorted(engines),
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace", type=Path)
@@ -233,6 +309,12 @@ def main(argv=None) -> int:
         "otherwise detects the repeating launch sequence itself)",
     )
     parser.add_argument("--rank", type=int, default=None, help="only for the heading")
+    parser.add_argument(
+        "--compare",
+        type=Path,
+        help="another trace: print recipe-set and node-count agreement, so a substituted "
+        "capture (a smaller context, a different batch) is CHECKED rather than asserted",
+    )
     args = parser.parse_args(argv)
 
     rows = load(args.trace)
@@ -505,11 +587,28 @@ def main(argv=None) -> int:
         f"  intervals carrying a recipe_id that found no launch = {unattributed}"
         f"  -> {'PASS' if unattributed == 0 else 'FAIL (lost Recipe Start rows)'}"
     )
-    buffer_bytes = 0x10000000
+    # The buffer size is a config value, so read it rather than assume it: the device refused
+    # 1 GiB outright (scal_allocate_buffer rc -5) once the KV pool was reserved, so the
+    # working size is a property of this run.
+    buffer_bytes = 0x8000000
+    buffer_note = "default assumption"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+            raw = cfg.get("trace_buffer_size") or ""
+            if isinstance(raw, str) and raw:
+                buffer_bytes = int(raw, 0)
+                buffer_note = f"from {config_path.name}"
+        except (OSError, ValueError):
+            pass
+    capacity_events = max(buffer_bytes // 64, 1)
     emit(
-        f"  events observed = {len(rows)}; buffer 256 MiB at ~64 B/event holds ~{buffer_bytes // 64}"
-        f"  -> {100 * len(rows) / (buffer_bytes // 64):.1f}% full"
+        f"  events observed = {len(rows)}; buffer {buffer_bytes / 2**20:.0f} MiB at ~64 B/event"
+        f" holds ~{capacity_events} ({buffer_note})"
+        f"  -> {100 * len(rows) / capacity_events:.1f}% full"
     )
+    if len(rows) > capacity_events:
+        emit("  WARNING: more events than the buffer holds -> this trace may be TRUNCATED")
     emit("")
     emit("## the step, three numbers on the same scope (mean over the repeating units)")
     emit(
@@ -534,11 +633,20 @@ def main(argv=None) -> int:
             f"      unit 0 alone: (a) {merged_unit:.1f} us, (b) {step_union:.1f} us,"
             f" recipe-less {recipe_less_unit:.1f} us"
         )
+    span_mean = sum(unit_span) / n_units if unit_span else step_span
+    emit(f"  step span (unit 0, first start -> last end) = {step_span:10.1f} us")
+    emit(f"  step span (mean over the units)             = {span_mean:10.1f} us")
+    # The ratio must divide like by like: both numbers are means over the units. Quoting a
+    # mean union over unit 0's span (or the reverse) gives a fraction that no pair of printed
+    # numbers reproduces, which is exactly the kind of figure a reader cannot re-check.
     emit(
-        f"  step span (first start -> last end)        = {step_span:10.1f} us"
+        f"  union/span (mean union / mean span) = {step_union_mean / span_mean:.3f}"
+        "   <- device busy fraction of the step's own span"
+        if span_mean
+        else "  union/span = n/a"
     )
     emit(
-        f"  union/span = {step_union / step_span:.3f}"
+        f"  union/span (unit 0 union / unit 0 span) = {step_union / step_span:.3f}"
         if step_span
         else "  union/span = n/a"
     )
@@ -635,6 +743,35 @@ def main(argv=None) -> int:
         emit(f"  {per:9.1f} us  {share:5.1f}%  [{family(rname)}] {label}  (id {rid})")
     emit("")
     emit(
+        "## per recipe id (one step): multiplicity, union, dominant node"
+        "  <- how many launches each recipe contributes"
+    )
+    unit0 = list(units[0]) if units else list(range(len(launches)))
+    by_rid: dict[int, list[int]] = defaultdict(list)
+    for i in unit0:
+        by_rid[launches[i][2]].append(i)
+    emit(
+        f"  one step = {len(unit0)} launches of {len(by_rid)} distinct recipes"
+        f" (a recipe is launched many times: once per layer)"
+    )
+    for rid, idxs in sorted(
+        by_rid.items(),
+        key=lambda kv: -sum(launch_union.get(i, 0.0) for i in kv[1]),
+    ):
+        total = sum(launch_union.get(i, 0.0) for i in idxs)
+        names: dict[str, float] = defaultdict(float)
+        for i in idxs:
+            for node, iv in per_launch_name.get(i, {}).items():
+                names[node] += merge(iv)
+        top = sorted(names.items(), key=lambda kv: -kv[1])[:2]
+        dom = top[0][0] if top else "?"
+        emit(
+            f"  id {rid:<6} launches {len(idxs):3d}  union/step {total:9.1f} us"
+            f"  per-launch {total / len(idxs):7.1f} us  dominant {dom}"
+            f"  [{family(dom)}]"
+        )
+    emit("")
+    emit(
         f"## top {args.top} node names by union (per unit; the union is per node, not per launch)"
     )
     name_totals: dict[str, float] = defaultdict(float)
@@ -655,6 +792,59 @@ def main(argv=None) -> int:
     for fam in sorted(mapping, key=lambda f: -len(mapping[f])):
         sample = sorted(mapping[fam])[:3]
         emit(f"  {fam:<18} {len(mapping[fam]):3d} names  e.g. {', '.join(sample)}")
+
+    if args.compare is not None:
+        emit("")
+        emit(f"## substitution check against {args.compare}")
+        try:
+            other = summarize(args.compare)
+        except (OSError, ValueError) as error:
+            emit(f"  could not read it: {error}")
+        else:
+            here = {
+                "recipe_ids": sorted({ts_rid for _ts, _dur, ts_rid in launches}),
+                "recipe_names": sorted(
+                    {n for n in launch_rname.values() if n}
+                ),
+                "median_nodes": nodes_per_launch[len(nodes_per_launch) // 2]
+                if nodes_per_launch
+                else 0,
+                "engines": sorted(labels),
+                "launches": len(launches),
+                "path": args.trace,
+            }
+            emit(
+                f"  launches: this {here['launches']} (period {period}),"
+                f" other {other['launches']}"
+            )
+            emit(
+                f"  recipe ids: this {len(here['recipe_ids'])},"
+                f" other {len(other['recipe_ids'])}"
+                f"  -> identical set:"
+                f" {'YES' if here['recipe_ids'] == other['recipe_ids'] else 'NO'}"
+            )
+            if here["recipe_ids"] != other["recipe_ids"]:
+                only_here = sorted(set(here["recipe_ids"]) - set(other["recipe_ids"]))
+                only_other = sorted(set(other["recipe_ids"]) - set(here["recipe_ids"]))
+                emit(f"    only here: {only_here[:20]}")
+                emit(f"    only there: {only_other[:20]}")
+            emit(
+                f"  recipe names: this {len(here['recipe_names'])},"
+                f" other {len(other['recipe_names'])}"
+            )
+            emit(
+                f"  device intervals per launch (median): this {here['median_nodes']},"
+                f" other {other['median_nodes']}"
+                f"  -> {'MATCH' if here['median_nodes'] == other['median_nodes'] else 'DIFFER'}"
+            )
+            emit(
+                f"  engine types: this {here['engines']}, other {other['engines']}"
+                f"  -> {'MATCH' if here['engines'] == other['engines'] else 'DIFFER'}"
+            )
+            emit(
+                "  a substitution is valid only if the recipe set and the node counts agree;"
+                " the union itself is then read at the substituted context, not at 512k."
+            )
 
     text = "\n".join(lines) + "\n"
     print(text, end="")

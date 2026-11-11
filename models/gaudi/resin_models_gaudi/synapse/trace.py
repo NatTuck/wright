@@ -195,12 +195,19 @@ def perfetto_trace(
     ``decode_passes`` completions per case, written as compressed Chrome traces."""
     if type(decode_passes) is not int or decode_passes < 1:
         raise ValueError("decode_passes must be a positive integer")
+    # A prefill cohort at 512k is 250 chunk-steps x ~109 launches; two of them overflow any
+    # trace buffer worth allocating (measured ~830 device events per launch, so one cohort is
+    # ~2e7 events). One cohort still covers every chunk position, which is what a prefill
+    # union table needs; RESIN_TRACE_PREFILL_PASSES=2 restores the old default.
+    prefill_passes = int(os.environ.get("RESIN_TRACE_PREFILL_PASSES", "1"))
+    if prefill_passes < 1:
+        raise ValueError("RESIN_TRACE_PREFILL_PASSES must be a positive integer")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
 
     def trace(case, run_pass):
         name = f"{case.phase}-ctx{case.context_length}-b{case.batch_size}-rank{rank:03}"
-        passes = decode_passes if case.phase == "decode" else 2
+        passes = decode_passes if case.phase == "decode" else prefill_passes
         unit = "decode completions" if case.phase == "decode" else "prefill cohorts"
         device.sync()
         device.prof_start()
@@ -247,6 +254,8 @@ def perfetto_trace(
                     "profile_phase": "profileApi",
                     "resin_prof_trace_type": os.environ.get("RESIN_PROF_TRACE_TYPE"),
                     "output_per_invocation": ["json"],
+                    "trace_buffer_size": os.environ.get("RESIN_PROF_BUFFER"),
+                    "trace_buffer_location": os.environ.get("RESIN_PROF_LOCATION"),
                     "DUMP_POST_GRAPHS": os.environ.get("DUMP_POST_GRAPHS"),
                     "HABANA_PROFILE": os.environ.get("HABANA_PROFILE"),
                     "tsv": str(tsv),
