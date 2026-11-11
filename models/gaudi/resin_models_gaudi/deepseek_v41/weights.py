@@ -649,6 +649,33 @@ def _engram_maps() -> None:
         )
 
 
+def _drop_engram_maps() -> None:
+    """Stop using the maps, then unmap them: the mode and the registry change FIRST.
+
+    ``_ENGRAM_MAPS`` is what ``engram_rows`` reads, so it is cleared before anything is closed: a
+    gather that starts while the drop is running sees "no maps" and takes the pooled path, never a
+    live view over memory that is about to be unmapped. ``np.frombuffer`` exports a buffer on the
+    mmap and ``close()`` raises ``BufferError`` while an export is alive, so each map's numpy views
+    are dropped before its close. A close that still fails (a gather on another thread holding a
+    view) is logged and skipped: the fallback has already happened, and no monitor failure may take
+    a request down.
+    """
+    global _ENGRAM_MODE
+    _ENGRAM_MODE = "pooled"
+    while _ENGRAM_MAPS:
+        layer = next(iter(_ENGRAM_MAPS))
+        weight, scale, mapping, raw = _ENGRAM_MAPS.pop(layer)
+        # the three views are the exported buffers; nothing else refers to them once popped
+        del weight, scale, raw
+        try:
+            mapping.close()
+        except Exception as error:  # a monitor must never take the server down
+            logger.warning(
+                f"engram gather: unmapping layer {layer} failed ({error}); "
+                f"the pooled gather no longer reads it"
+            )
+
+
 def _engram_monitor() -> None:
     """Fall back to the pooled gather if the tables stopped being resident."""
     global _ENGRAM_MODE, _ENGRAM_RESIDENT, _ENGRAM_LAST_CHECK
@@ -662,7 +689,7 @@ def _engram_monitor() -> None:
         _ENGRAM_RESIDENT = _engram_residency(
             _ENGRAM_CHECKPOINT, _ENGRAM_SHARDS, sample=True
         )
-    except OSError as error:  # a monitor must never take the server down
+    except Exception as error:  # a monitor must never take the server down
         logger.warning(f"engram gather: residency check failed ({error}); keeping mmap")
         return
     if _ENGRAM_RESIDENT < _ENGRAM_RESIDENT_FLOOR:
@@ -670,10 +697,13 @@ def _engram_monitor() -> None:
             f"engram gather: shards {_ENGRAM_RESIDENT:.1%} resident, below the "
             f"{_ENGRAM_RESIDENT_FLOOR:.0%} floor - falling back to the pooled gather"
         )
-        _ENGRAM_MODE = "pooled"
-        for _, _, mapping, _ in _ENGRAM_MAPS.values():
-            mapping.close()
-        _ENGRAM_MAPS.clear()
+        try:
+            _drop_engram_maps()
+        except Exception as error:  # a monitor must never take the server down
+            logger.warning(
+                f"engram gather: could not unmap the tables ({error}); the pooled gather "
+                f"reads around them"
+            )
 
 
 # The dequantised value of a row element is OCP[code] * 2^(scale - 127), so a 256 x 256 table of
