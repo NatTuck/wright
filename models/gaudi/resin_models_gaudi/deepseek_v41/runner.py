@@ -66,6 +66,25 @@ MAX_BATCH = 64
 profile_step = os.environ.get("RESIN_GAUDI_PROFILE_STEP") == "1"
 
 
+def _family(name: str) -> str:
+    """The rollup family of a recipe name, for the per-recipe device table."""
+    if name.startswith("ds41_attn_pre"):
+        return "attn_pre"
+    if name.startswith("ds41_attn_out"):
+        return "attn_out"
+    if name.startswith("ds41_attn"):
+        return "attn"
+    if name.startswith("ds41_ffn"):
+        return "ffn"
+    if name.startswith("ds41_engram"):
+        return "engram"
+    if name.startswith("ds41_index"):
+        return "index"
+    if name.startswith("ds41_head"):
+        return "head"
+    return "other"
+
+
 class DeepSeekV41GaudiRunner:
     """``ManagedRunner`` over ``DeepSeekV41Gaudi``; tensor parallel over ``groups``' attention replica."""
 
@@ -237,6 +256,31 @@ class DeepSeekV41GaudiRunner:
             self._context.before(sequence, pos0, first, ids),
         )  # fmt: skip
 
+    def _report_recipe_device(self) -> None:
+        """Print the per-recipe device table and the per-family rollup, then clear them.
+
+        Called from BOTH branches. It used to live in the decode branch alone, so a prefill step's
+        table was never printed - and worse, was carried into the next decode step's table (the
+        first decode step after a prefill printed 218 calls, its own 109 plus the prefill's 109).
+        """
+        total = sum(e[1] for e in LAUNCH_BY_RECIPE.values())
+        calls = sum(e[0] for e in LAUNCH_BY_RECIPE.values())
+        fams: dict[str, list] = {}
+        for name, (c, secs, _w) in LAUNCH_BY_RECIPE.items():
+            slot = fams.setdefault(_family(name), [0, 0.0])
+            slot[0] += c
+            slot[1] += secs
+        info(
+            f"recipe-device: {calls} calls, {1000 * total:.1f} ms total "
+            f"(sum over recipes = the step's device occupancy)"
+        )
+        for fam, (c, secs) in sorted(fams.items(), key=lambda kv: -kv[1][1]):
+            info(
+                f"  family {fam:<10} calls {c:>5} total {1000 * secs:7.1f} ms "
+                f"mean {1e6 * secs / c:6.1f} us"
+            )
+        LAUNCH_BY_RECIPE.clear()
+
     def forward(self, plan) -> ForwardOutput:
         t_enter = time.perf_counter() if profile_step else 0.0
         self._harvest()
@@ -288,6 +332,9 @@ class DeepSeekV41GaudiRunner:
                     last = s + len(chunk) >= len(ids)
                     # the logits this chunk needs: scored columns, the sampled column, or none
                     need = "all" if len(cols) else len(chunk) - 1 if last else None
+                    if profile_step:
+                        # per chunk: a prefill step is one launch, so its counters start empty
+                        reset_launch_stats()
                     T = model.launch(
                         chunk,
                         p + np.arange(len(chunk)),
@@ -296,6 +343,9 @@ class DeepSeekV41GaudiRunner:
                         logits=need,
                     )
                     self._context.seen(sequence, p, chunk)
+                    if profile_step and _RECIPE_DEVICE and LAUNCH_BY_RECIPE:
+                        info(f"prefill step T={T} chunk={len(chunk)} pos0={p}")
+                        self._report_recipe_device()
                     if len(cols):
                         scores.add(s + cols, model.logits_host(T)[cols])
                     if last:
@@ -342,39 +392,7 @@ class DeepSeekV41GaudiRunner:
                     step_wall = 1000 * (end - t_step)
                     self._last_step_end = end
                     if _RECIPE_DEVICE and LAUNCH_BY_RECIPE:
-                        total = sum(e[1] for e in LAUNCH_BY_RECIPE.values())
-                        calls = sum(e[0] for e in LAUNCH_BY_RECIPE.values())
-                        fams: dict[str, list] = {}
-                        for name, (c, secs, _w) in LAUNCH_BY_RECIPE.items():
-                            if name.startswith("ds41_attn_pre"):
-                                fam = "attn_pre"
-                            elif name.startswith("ds41_attn_out"):
-                                fam = "attn_out"
-                            elif name.startswith("ds41_attn"):
-                                fam = "attn"
-                            elif name.startswith("ds41_ffn"):
-                                fam = "ffn"
-                            elif name.startswith("ds41_engram"):
-                                fam = "engram"
-                            elif name.startswith("ds41_index"):
-                                fam = "index"
-                            elif name.startswith("ds41_head"):
-                                fam = "head"
-                            else:
-                                fam = "other"
-                            slot = fams.setdefault(fam, [0, 0.0])
-                            slot[0] += c
-                            slot[1] += secs
-                        info(
-                            f"recipe-device: {calls} calls, {1000 * total:.1f} ms total "
-                            f"(sum over recipes = the step's device occupancy)"
-                        )
-                        for fam, (c, secs) in sorted(fams.items(), key=lambda kv: -kv[1][1]):
-                            info(
-                                f"  family {fam:<10} calls {c:>5} total {1000 * secs:7.1f} ms "
-                                f"mean {1e6 * secs / c:6.1f} us"
-                            )
-                        LAUNCH_BY_RECIPE.clear()
+                        self._report_recipe_device()
                     if _SYNC_TIMES:
                         import statistics as _st
 
