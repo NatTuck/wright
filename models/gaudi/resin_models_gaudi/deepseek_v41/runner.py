@@ -48,7 +48,10 @@ from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
 from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params
 from resin_models_gaudi.synapse.progress import info
 from resin_models_gaudi.glm5_3_flash.model import (
+    SECOND_SYNC_BY_RECIPE,
     _RECIPE_DEVICE,
+    _SYNC_OVERHEAD_COUNT,
+    _SYNC_OVERHEAD_TOTAL,
     _SYNC_TIMES,
     _SYNC_TOTAL,
     diagnostics,
@@ -64,6 +67,10 @@ from resin_models_gaudi.synapse.runtime import open_device
 PREFILL_CHUNK_SIZE = TMAX
 MAX_BATCH = 64
 profile_step = os.environ.get("RESIN_GAUDI_PROFILE_STEP") == "1"
+# The per-recipe host cost of one submission with no sync - bind + launch, 44 us, measured on this
+# arm in one boot (notes/opt-manual-fixes.md: 44 us bind+launch of the ~102 us per-submission cost).
+# A constant per call, so the corrected device column subtracts it per recipe and stays additive.
+HOST_CALL_S = 44e-6
 
 
 def _family(name: str) -> str:
@@ -199,6 +206,11 @@ class DeepSeekV41GaudiRunner:
             _Completion
         ] = []  # enqueued steps whose samples are not yet recorded in _context
         self.continuations = 0
+        # the last step's per-recipe rows and second-sync times, kept past the table's clear so
+        # the per-recipe top-10 below can print them (it used to read the cleared dict, so it
+        # never printed a single row)
+        self._recipe_snapshot: list[tuple] = []
+        self._sync_snapshot: dict[str, list] = {}
 
     @property
     def kv_pool_bytes(self) -> int:
@@ -262,24 +274,49 @@ class DeepSeekV41GaudiRunner:
         Called from BOTH branches. It used to live in the decode branch alone, so a prefill step's
         table was never printed - and worse, was carried into the next decode step's table (the
         first decode step after a prefill printed 218 calls, its own 109 plus the prefill's 109).
+
+        Two corrections turn the raw bracket into a device number. ``host`` is the bind+launch cost
+        of a submission with no sync (HOST_CALL_S, measured on this arm); ``sync overhead`` is the
+        second sync, issued on an already-drained queue, summed over the step. Both are subtracted
+        per recipe, not from the total, so a family's corrected union stays additive.
         """
         total = sum(e[1] for e in LAUNCH_BY_RECIPE.values())
         calls = sum(e[0] for e in LAUNCH_BY_RECIPE.values())
+        overhead = _SYNC_OVERHEAD_TOTAL[0]
+        host = calls * HOST_CALL_S
         fams: dict[str, list] = {}
         for name, (c, secs, _w) in LAUNCH_BY_RECIPE.items():
-            slot = fams.setdefault(_family(name), [0, 0.0])
+            fam = _family(name)
+            slot = fams.setdefault(fam, [0, 0.0, 0.0])
             slot[0] += c
             slot[1] += secs
+            slot[2] += SECOND_SYNC_BY_RECIPE.get(name, (0, 0.0))[1]
         info(
-            f"recipe-device: {calls} calls, {1000 * total:.1f} ms total "
-            f"(sum over recipes = the step's device occupancy)"
+            f"recipe-device: {calls} calls, {1000 * total:.1f} ms raw bracket "
+            f"(bind+launch+one sync per recipe; the sum over recipes is the step's device "
+            f"occupancy plus {calls} sync calls)"
         )
-        for fam, (c, secs) in sorted(fams.items(), key=lambda kv: -kv[1][1]):
+        info(
+            f"  host {1000 * host:.1f} ms ({calls} x {1e6 * HOST_CALL_S:.0f} us bind+launch), "
+            f"sync_overhead {1000 * overhead:.1f} ms "
+            f"({1e6 * overhead / calls:.1f} us/call over {_SYNC_OVERHEAD_COUNT[0]} second syncs)"
+        )
+        info(
+            f"  device corrected {1000 * (total - host - overhead):.1f} ms "
+            f"= {1000 * total:.1f} - {1000 * host:.1f} - {1000 * overhead:.1f}"
+        )
+        for fam, (c, secs, ovh) in sorted(fams.items(), key=lambda kv: -kv[1][1]):
+            corrected = secs - c * HOST_CALL_S - ovh
             info(
-                f"  family {fam:<10} calls {c:>5} total {1000 * secs:7.1f} ms "
-                f"mean {1e6 * secs / c:6.1f} us"
+                f"  family {fam:<10} calls {c:>5} raw {1000 * secs:7.1f} ms "
+                f"corrected {1000 * corrected:7.1f} ms mean {1e6 * corrected / c:6.1f} us"
             )
+        self._recipe_snapshot = sorted(LAUNCH_BY_RECIPE.items(), key=lambda kv: -kv[1][1])
+        self._sync_snapshot = dict(SECOND_SYNC_BY_RECIPE)
         LAUNCH_BY_RECIPE.clear()
+        SECOND_SYNC_BY_RECIPE.clear()
+        _SYNC_OVERHEAD_TOTAL[0] = 0.0
+        _SYNC_OVERHEAD_COUNT[0] = 0
 
     def forward(self, plan) -> ForwardOutput:
         t_enter = time.perf_counter() if profile_step else 0.0
@@ -426,13 +463,14 @@ class DeepSeekV41GaudiRunner:
                             f"p90 {1e6 * ordered[int(0.9 * (len(ordered) - 1))]:.1f} "
                             f"max {1e6 * ordered[-1]:.1f}"
                         )
-                        for name, (calls, secs, workspace) in sorted(
-                            LAUNCH_BY_RECIPE.items(), key=lambda kv: -kv[1][1]
-                        )[:10]:
+                        for name, (calls, secs, workspace) in self._recipe_snapshot[:10]:
+                            ovh = self._sync_snapshot.get(name, (0, 0.0))[1]
+                            corrected = secs - calls * HOST_CALL_S - ovh
                             info(
                                 f"  recipe {name[:44]:<44} calls {calls:>3} "
-                                f"total {1e3 * secs:6.2f} ms "
-                                f"per-call {1e6 * secs / calls:6.1f} us "
+                                f"raw {1e3 * secs:6.2f} ms "
+                                f"corrected {1e3 * corrected:6.2f} ms "
+                                f"per-call {1e6 * corrected / calls:6.1f} us "
                                 f"workspace {workspace / 2**20:7.1f} MiB"
                             )
                     info(

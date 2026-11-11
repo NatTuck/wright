@@ -74,6 +74,14 @@ _SYNC_PENDING = [False]
 # the sum of the diagnostic syncs is the serialised device time for the window
 _SYNC_TOTAL = [0.0]
 _SYNC_TIMES: list[float] = []
+# The control for the bracket: a SECOND sync issued immediately after the first, on a queue the
+# first already drained, measures what one sync call costs by itself. Every (t1 - t0) in this mode
+# carries that constant, so it is accumulated here per step (and per recipe) and subtracted in the
+# corrected column. If it were negligible the second sync would read ~0 and the raw column would
+# stand; it is not, so it does not.
+_SYNC_OVERHEAD_TOTAL = [0.0]
+_SYNC_OVERHEAD_COUNT = [0]
+SECOND_SYNC_BY_RECIPE: dict[str, list] = {}
 
 from resin_models_gaudi.synapse.graph import (
     LAUNCH_BY_RECIPE,
@@ -1390,6 +1398,7 @@ class _Op:
             # no launch), "none" (neither). "bind" and "none" produce garbage tokens and exist only to
             # time the host floor - never leave them on for a correctness run.
             started = time.perf_counter()
+            second = 0.0
             if _LAUNCH_MODE == "none":
                 ok = True
             elif _LAUNCH_MODE == "bind":
@@ -1398,6 +1407,20 @@ class _Op:
                 ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
                 # inside the timed region on purpose: this mode measures the recipe, not the call
                 self.recipe.device.sync()
+                # The control the bracket needs: the queue is drained now, so this second sync has
+                # nothing to wait for and its cost is the sync call itself - the constant that
+                # every (t1 - t0) above carries. Subtracted from elapsed below, so the raw column
+                # keeps its old meaning and the corrected one can be derived from it.
+                t_second = time.perf_counter()
+                self.recipe.device.sync()
+                second = time.perf_counter() - t_second
+                _SYNC_OVERHEAD_TOTAL[0] += second
+                _SYNC_OVERHEAD_COUNT[0] += 1
+                entry2 = SECOND_SYNC_BY_RECIPE.get(self.recipe.name)
+                if entry2 is None:
+                    entry2 = SECOND_SYNC_BY_RECIPE[self.recipe.name] = [0, 0.0]
+                entry2[0] += 1
+                entry2[1] += second
             elif _LAZY_BIND:
                 # the profiling branch has to honour lazy bind too, or a gate run measures the
                 # unmodified path while reporting the flag as on (found the hard way)
@@ -1418,7 +1441,7 @@ class _Op:
                 _SYNC_PENDING[0] = _SYNC_COUNT[0] % _SYNC_EVERY == 0
             else:
                 ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
-            elapsed = time.perf_counter() - started
+            elapsed = time.perf_counter() - started - second
             if _SYNC_PENDING[0]:
                 _SYNC_PENDING[0] = False
                 _sync_started = time.perf_counter()
