@@ -469,6 +469,28 @@ RG_API int rg_prof_start() {
     CHK(synProfilerStart(rg_trace_type(), g_dev));
     return 0;
 }
+// RESIN_PROF_DUMP_UNION=<path> writes the raw bytes of every event's `arguments` union beside
+// the TSV, with the buffer bounds. Which member of that union is live depends on `ph`, and the
+// header does not say which; this dump is how the mapping was read off a real trace instead of
+// guessed, and it is how a later trace can be re-checked.
+static void rg_dump_union(const char* path, synTraceEvent* ev, size_t entries,
+                          const std::vector<unsigned char>& buf) {
+    FILE* f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "[prof] cannot write %s\n", path); return; }
+    fprintf(f, "# buf_base=0x%llx buf_bytes=%zu entries=%zu\n",
+            (unsigned long long)reinterpret_cast<uintptr_t>(buf.data()), buf.size(), entries);
+    fprintf(f, "ph\tengine_type\tengine_index\tname\tcategory\tunion_hex\n");
+    for (size_t i = 0; i < entries; i++) {
+        auto& e = ev[i];
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(&e.arguments);
+        char hex[129];
+        for (int b = 0; b < 64; b++) snprintf(hex + 2 * b, 3, "%02x", raw[b]);
+        fprintf(f, "%c\t%u\t%u\t%s\t%s\t%s\n", e.type ? e.type : '?', e.engineType,
+                e.engineIndex, e.name ? e.name : "", e.category ? e.category : "", hex);
+    }
+    fclose(f);
+}
+
 RG_API int rg_prof_stop(const char* tsv_path) {
     CHK(synStreamSynchronize(g_stream));
     CHK(synProfilerStop(rg_trace_type(), g_dev));
@@ -480,14 +502,30 @@ RG_API int rg_prof_stop(const char* tsv_path) {
     if (!f) { snprintf(g_err, sizeof(g_err), "prof_stop: cannot write %s", tsv_path); return -1; }
     fprintf(f, "ph\tengine_type\tengine_index\tts\tdur\tname\tcategory\tmeta\trecipe_id\trecipe_name\n");
     auto* ev = reinterpret_cast<synTraceEvent*>(buf.data());
+    // Columns 9-10 come from the union's event-args member (synapse_common_types.h:451-461), which
+    // is what carries recipeId (uint16, line 455) and recipeName (line 456). The union is tagged by
+    // `ph` and the header never spells the tag out: a metadata event ('M') stores {name, group} at
+    // the same offset (synapse_common_types.h:478-482), so reading recipeId/recipeName off an M row
+    // prints a truncated pointer as the id and raw bytes as the name -- measured on a device+host
+    // trace, the M rows are the only rows with non-UTF-8 bytes, which is what broke parsers. Every
+    // other phase seen in a trace ('X' device and host spans, 'B'/'E' pairs, 'i' instants, 'f'
+    // flow) reads a plausible recipeId and a name that is either empty or a recipe name. So the two
+    // columns are emitted for every phase except 'M', and a literal '-' marks the M rows.
     for (size_t i = 0; i < entries; i++) {
         auto& e = ev[i];
-        fprintf(f, "%c\t%u\t%u\t%.3Lf\t%.3Lf\t%s\t%s\t%s\t%u\t%s\n", e.type ? e.type : '?', e.engineType, e.engineIndex,
+        fprintf(f, "%c\t%u\t%u\t%.3Lf\t%.3Lf\t%s\t%s\t%s", e.type ? e.type : '?', e.engineType, e.engineIndex,
                 e.timestamp, e.duration, e.name ? e.name : "", e.category ? e.category : "",
-                (e.type == 'M' && e.arguments.name) ? e.arguments.name : "",
-                (unsigned)e.arguments.recipeId, e.arguments.recipeName ? e.arguments.recipeName : "");
+                (e.type == 'M' && e.arguments.name) ? e.arguments.name : "");
+        if (e.type == 'M') {
+            fprintf(f, "\t-\t-\n");
+        } else {
+            fprintf(f, "\t%u\t%s\n", (unsigned)e.arguments.recipeId,
+                    e.arguments.recipeName ? e.arguments.recipeName : "");
+        }
     }
     fclose(f);
+    const char* dump = getenv("RESIN_PROF_DUMP_UNION");
+    if (dump && *dump) rg_dump_union(dump, ev, entries, buf);
     return int(entries);
 }
 
