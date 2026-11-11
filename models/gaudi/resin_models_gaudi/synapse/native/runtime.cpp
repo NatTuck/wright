@@ -446,34 +446,46 @@ RG_API int rg_launch(int ri) {
 }
 
 // ---------------------------------------------------------------- profiling
+// The trace type is selectable because the plugin phase and the requested type must agree:
+// profileApi + synTraceAll collects host API events only, and the device phase rejects a
+// mismatched type with a generic status 26. RESIN_PROF_TRACE_TYPE=all|device|host.
+static synTraceType rg_trace_type() {
+    const char* t = getenv("RESIN_PROF_TRACE_TYPE");
+    if (!t) return synTraceAll;
+    if (!strcmp(t, "device")) return synTraceDevice;
+    if (!strcmp(t, "host")) return synTraceHost;
+    return synTraceAll;
+}
 RG_API int rg_prof_start() {
     uint32_t bytes = 0;
     synStatus s = synProfilerQueryRequiredMemory(g_dev, &bytes);
     if (s != synSuccess && s != synUnsupported) { fail(s, "synProfilerQueryRequiredMemory"); return -1; }
+    fprintf(stderr, "[prof] required_bytes=%u type=%d\n", bytes, (int)rg_trace_type());
     if (bytes) {
         uint64_t buf = 0;
         CHK(synDeviceMalloc(g_dev, bytes, 0, 0, &buf));
         CHK(synProfilerSetUserBuffer(g_dev, (void*)buf));
     }
-    CHK(synProfilerStart(synTraceAll, g_dev));
+    CHK(synProfilerStart(rg_trace_type(), g_dev));
     return 0;
 }
 RG_API int rg_prof_stop(const char* tsv_path) {
     CHK(synStreamSynchronize(g_stream));
-    CHK(synProfilerStop(synTraceAll, g_dev));
+    CHK(synProfilerStop(rg_trace_type(), g_dev));
     size_t bytes = 0, entries = 0;
-    CHK(synProfilerGetTrace(synTraceAll, g_dev, synTraceFormatTEF, nullptr, &bytes, &entries));
+    CHK(synProfilerGetTrace(rg_trace_type(), g_dev, synTraceFormatTEF, nullptr, &bytes, &entries));
     std::vector<unsigned char> buf(bytes);
-    CHK(synProfilerGetTrace(synTraceAll, g_dev, synTraceFormatTEF, buf.data(), &bytes, &entries));
+    CHK(synProfilerGetTrace(rg_trace_type(), g_dev, synTraceFormatTEF, buf.data(), &bytes, &entries));
     FILE* f = fopen(tsv_path, "w");
     if (!f) { snprintf(g_err, sizeof(g_err), "prof_stop: cannot write %s", tsv_path); return -1; }
-    fprintf(f, "ph\tengine_type\tengine_index\tts\tdur\tname\tcategory\tmeta\n");
+    fprintf(f, "ph\tengine_type\tengine_index\tts\tdur\tname\tcategory\tmeta\trecipe_id\trecipe_name\n");
     auto* ev = reinterpret_cast<synTraceEvent*>(buf.data());
     for (size_t i = 0; i < entries; i++) {
         auto& e = ev[i];
-        fprintf(f, "%c\t%u\t%u\t%.3Lf\t%.3Lf\t%s\t%s\t%s\n", e.type ? e.type : '?', e.engineType, e.engineIndex,
+        fprintf(f, "%c\t%u\t%u\t%.3Lf\t%.3Lf\t%s\t%s\t%s\t%u\t%s\n", e.type ? e.type : '?', e.engineType, e.engineIndex,
                 e.timestamp, e.duration, e.name ? e.name : "", e.category ? e.category : "",
-                (e.type == 'M' && e.arguments.name) ? e.arguments.name : "");
+                (e.type == 'M' && e.arguments.name) ? e.arguments.name : "",
+                (unsigned)e.arguments.recipeId, e.arguments.recipeName ? e.arguments.recipeName : "");
     }
     fclose(f);
     return int(entries);
