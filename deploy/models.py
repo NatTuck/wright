@@ -261,6 +261,36 @@ MODEL_SPECS = {
         prefill_chunk_size=2048,
         media=False,
     ),
+    # Text only: four cards, with the Engram tables left in the checkpoint file and gathered on the
+    # host. The 8-card preset keeps them on the cards; at four cards they do not fit - 188.8 GiB of
+    # tables against 95 GiB free per card - so this preset is host-only, and it pre-warms them
+    # because the host gather is 3.8x faster on a resident table (STATUS.md sections 9-10).
+    "deepseek_v41-gaudi2-tp4": ModelSpec(
+        name="deepseek_v41-gaudi2-tp4",
+        family="deepseek_v41",
+        accelerator="gaudi2",
+        checkpoint=Checkpoint(
+            repo_id="deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            revision="1bae0e1088993b9b82de08f59de5be5a34e42170",
+            directory="",
+            required_files=("config.json", "tokenizer.json", "tokenizer_config.json"),
+            patterns=("*.json", "model*.safetensors"),
+        ),
+        model_mount="/models/deepseek-v41-flash-1017",
+        model_volume="resin-deepseek-v41-flash-1017-models-v1",
+        gpu="HL-225",
+        label="deepseek_v41-gaudi2-tp4",
+        world_size=4,
+        attn_tp=4,
+        context_length=512_000,
+        max_batch_size=8,
+        draft_tokens=0,
+        prefill_chunk_size=2048,
+        media=False,
+        engram="host",
+        engram_gather="auto",
+        engram_prewarm=True,
+    ),
     # Text only: the GGUF has no Pixtral tower; the tokenizer and chat template come from
     # the official release (its vocabulary equals the GGUF's, id for id).
     "mistral_large4-gaudi2": ModelSpec(
