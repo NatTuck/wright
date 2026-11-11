@@ -34,6 +34,10 @@ from resin_models_gaudi.qwen3_5.checkpoint import _POOL, kperm, tperm
 
 # chunks of rows handed to the read pool for one Engram gather: enough to fill 32 workers four times
 _ENGRAM_CHUNKS = 128
+# Below this many rows the gather reads inline. The pool costs ~1.7 ms per call whatever the row
+# count, so it pays for a prefill chunk (49,152 rows: 2.4 s pooled against 138 s inline, cold) and
+# does not pay for a decode step (24 rows: 1.85 ms pooled against 0.15 ms inline, warm).
+_ENGRAM_POOL_ROWS = 256
 
 DTYPES = {
     "BF16": np.uint16,
@@ -481,9 +485,15 @@ def _engram_bytes(src: Safetensors, name: str, rows: np.ndarray, width: int) -> 
         for i in range(*bounds):
             os.preadv(fd, [view[i * width : (i + 1) * width]], start + int(rows[i]) * width)
 
-    if len(rows):
+    if len(rows) >= _ENGRAM_POOL_ROWS:
         step = -(-len(rows) // min(len(rows), _ENGRAM_CHUNKS))
-        list(_POOL.map(read, ((i, min(i + step, len(rows))) for i in range(0, len(rows), step))))
+        list(
+            _POOL.map(
+                read, ((i, min(i + step, len(rows))) for i in range(0, len(rows), step))
+            )
+        )
+    elif len(rows):
+        read((0, len(rows)))
     return out
 
 
