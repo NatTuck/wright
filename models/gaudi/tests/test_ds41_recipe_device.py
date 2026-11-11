@@ -9,14 +9,19 @@ The documented formula (cases/wright/measurements/profile/SUMMARY-recipe-device.
 
 so the second-sync control is subtracted ONCE, in the corrected column. The code used to take it
 out of the bracket as well (`elapsed = ... - second`), which subtracted it twice and left the
-corrected column ~3.5% low. These tests pin the bracket's meaning with a scripted clock.
+corrected column ~3.5% low. These tests pin the bracket with a scripted clock, and the PRINTED
+column by going through `_report_recipe_device` - re-adding `- overhead` where the number is
+reported must fail here, not just where it is measured.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
+from resin_models_gaudi.deepseek_v41 import runner as R
 from resin_models_gaudi.glm5_3_flash import model as M
 
 
@@ -59,16 +64,21 @@ def recipe_device(monkeypatch):
     M._SYNC_OVERHEAD_COUNT[0] = 0
 
 
+def _scripted_clock(monkeypatch, ticks):
+    """Replace the module's `time`, not the shared one: patching `time.perf_counter` globally makes
+    every library call in the test eat a tick (or raise StopIteration)."""
+    monkeypatch.setattr(M, "time", SimpleNamespace(perf_counter=lambda: next(ticks)))
+
+
 def test_the_bracket_keeps_the_second_sync(recipe_device, monkeypatch):
     """raw is `t1 - t0` as measured: the control is inside it, and subtracted only in corrected.
 
     Scripted clock: start 0.0, first sync done 1.0, second sync 1.0 -> 1.5, bracket ends 2.0.
-    So the bracket is 2.0 ms of which 0.5 ms is the control, and
+    So the bracket is 2.0 s of which 0.5 s is the control, and
         corrected = raw - host - sync_overhead = 2.0 - 44us - 0.5
     A double subtraction shows up as raw == 1.5 here.
     """
-    clock = iter([0.0, 1.0, 1.5, 2.0])
-    monkeypatch.setattr(M.time, "perf_counter", lambda: next(clock))
+    _scripted_clock(monkeypatch, iter([0.0, 1.0, 1.5, 2.0]))
 
     M._Op(_Recipe(), {"x": 0}).run(object())
 
@@ -81,13 +91,41 @@ def test_the_bracket_keeps_the_second_sync(recipe_device, monkeypatch):
     assert M._SYNC_OVERHEAD_COUNT[0] == 1
     assert M.LAST_CALLS == [pytest.approx(2.0)]
 
-    # the printed corrected column, exactly as runner._report_recipe_device computes it
-    from resin_models_gaudi.deepseek_v41.runner import HOST_CALL_S
-
-    corrected = raw - calls * HOST_CALL_S - overhead
-    assert corrected == pytest.approx(1.5 - HOST_CALL_S)
+    corrected = raw - calls * R.HOST_CALL_S - overhead
+    assert corrected == pytest.approx(1.5 - R.HOST_CALL_S)
     # and it is NOT the doubly-subtracted 1.0 - host
-    assert corrected != pytest.approx(1.0 - HOST_CALL_S)
+    assert corrected != pytest.approx(1.0 - R.HOST_CALL_S)
+
+
+def test_the_reported_corrected_column_subtracts_the_control_once(
+    recipe_device, monkeypatch
+):
+    """Through `_report_recipe_device`, where the number is printed.
+
+    Both subtraction sites in that function are checked: the step total and the per-family row.
+    Re-adding the overhead at either leaves the bracket test above green and fails this one.
+    """
+    _scripted_clock(monkeypatch, iter([0.0, 1.0, 1.5, 2.0]))
+    M._Op(_Recipe(), {"x": 0}).run(object())
+    calls, raw, _workspace = M.LAUNCH_BY_RECIPE[_Recipe.name]
+    overhead = M.SECOND_SYNC_BY_RECIPE[_Recipe.name][1]
+
+    lines: list[str] = []
+    monkeypatch.setattr(R, "info", lines.append)
+    R.DeepSeekV41GaudiRunner._report_recipe_device(
+        SimpleNamespace(_recipe_snapshot=None, _sync_snapshot=None)
+    )
+
+    corrected_ms = 1000 * (raw - calls * R.HOST_CALL_S - overhead)
+    doubly_ms = 1000 * (raw - calls * R.HOST_CALL_S - 2 * overhead)
+
+    total = [line for line in lines if line.startswith("  device corrected")]
+    family = [line for line in lines if line.startswith("  family")]
+    assert len(total) == 1 and len(family) == 1, lines
+    assert f"{corrected_ms:.1f} ms" in total[0], total[0]
+    assert f"{doubly_ms:.1f} ms" not in total[0], total[0]
+    assert f"{corrected_ms:.1f} ms" in family[0], family[0]
+    assert f"{doubly_ms:.1f} ms" not in family[0], family[0]
 
 
 def test_many_calls_stay_additive(recipe_device, monkeypatch):
@@ -96,8 +134,7 @@ def test_many_calls_stay_additive(recipe_device, monkeypatch):
     for _ in range(3):
         ticks += [base, base + 1.0, base + 1.5, base + 2.0]
         base += 2.0
-    clock = iter(ticks)
-    monkeypatch.setattr(M.time, "perf_counter", lambda: next(clock))
+    _scripted_clock(monkeypatch, iter(ticks))
 
     for _ in range(3):
         M._Op(_Recipe(), {"x": 0}).run(object())
