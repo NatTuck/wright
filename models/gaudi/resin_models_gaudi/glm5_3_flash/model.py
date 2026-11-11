@@ -1409,8 +1409,11 @@ class _Op:
                 self.recipe.device.sync()
                 # The control the bracket needs: the queue is drained now, so this second sync has
                 # nothing to wait for and its cost is the sync call itself - the constant that
-                # every (t1 - t0) above carries. Subtracted from elapsed below, so the raw column
-                # keeps its old meaning and the corrected one can be derived from it.
+                # every (t1 - t0) above carries. It stays IN the bracket and is accumulated here
+                # per step and per recipe, to be subtracted once, in the corrected column:
+                #     raw = sum(t1 - t0);  corrected = raw - host - sync_overhead
+                # (measurements/profile/SUMMARY-recipe-device.txt). Taking it out of elapsed as
+                # well subtracted the control twice and put the corrected column ~3.5% low.
                 t_second = time.perf_counter()
                 self.recipe.device.sync()
                 second = time.perf_counter() - t_second
@@ -1441,7 +1444,7 @@ class _Op:
                 _SYNC_PENDING[0] = _SYNC_COUNT[0] % _SYNC_EVERY == 0
             else:
                 ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
-            elapsed = time.perf_counter() - started - second
+            elapsed = time.perf_counter() - started
             if _SYNC_PENDING[0]:
                 _SYNC_PENDING[0] = False
                 _sync_started = time.perf_counter()

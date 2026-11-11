@@ -279,6 +279,13 @@ class DeepSeekV41GaudiRunner:
         of a submission with no sync (HOST_CALL_S, measured on this arm); ``sync overhead`` is the
         second sync, issued on an already-drained queue, summed over the step. Both are subtracted
         per recipe, not from the total, so a family's corrected union stays additive.
+
+        The raw bracket is ``sum(t1 - t0)`` exactly as measured - the second sync is INSIDE it and
+        is not taken out here or in ``_Op.run``. Subtracting it twice (once from the bracket, once
+        from the corrected column) put the corrected column ~3.5% low and contradicted the formula
+        in measurements/profile/SUMMARY-recipe-device.txt, which is the reference:
+
+            raw = sum over recipes of (t1 - t0);  corrected = raw - host - sync_overhead
         """
         total = sum(e[1] for e in LAUNCH_BY_RECIPE.values())
         calls = sum(e[0] for e in LAUNCH_BY_RECIPE.values())
