@@ -1362,6 +1362,16 @@ class _Op:
                 ok = True
             elif _LAUNCH_MODE == "bind":
                 ok = lib.rg_bind_slots(*self.args) >= 0
+            elif _LAZY_BIND:
+                # the profiling branch has to honour lazy bind too, or a gate run measures the
+                # unmodified path while reporting the flag as on (found the hard way)
+                if not getattr(self, "_bound", False):
+                    ok = lib.rg_bind_slots(*self.args) >= 0
+                    self._bound = ok
+                else:
+                    ok = True
+                if ok and lib.rg_launch(self.args[0]) < 0:
+                    ok = False
             elif _SYNC_EVERY:
                 # the clean host/device separator: never let the queue build, so the per-call time
                 # collapses to the pure host call cost if blocking was what we were measuring
