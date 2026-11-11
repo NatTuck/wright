@@ -503,20 +503,23 @@ RG_API int rg_prof_stop(const char* tsv_path) {
     fprintf(f, "ph\tengine_type\tengine_index\tts\tdur\tname\tcategory\tmeta\trecipe_id\trecipe_name\n");
     auto* ev = reinterpret_cast<synTraceEvent*>(buf.data());
     // Columns 9-10 come from the union's event-args member (synapse_common_types.h:451-461), which
-    // is what carries recipeId (uint16, line 455) and recipeName (line 456). The union is tagged by
-    // `ph` and the header never spells the tag out: a metadata event ('M') stores {name, group} at
-    // the same offset (synapse_common_types.h:478-482), so reading recipeId/recipeName off an M row
-    // prints a truncated pointer as the id and raw bytes as the name -- measured on a device+host
-    // trace, the M rows are the only rows with non-UTF-8 bytes, which is what broke parsers. Every
-    // other phase seen in a trace ('X' device and host spans, 'B'/'E' pairs, 'i' instants, 'f'
-    // flow) reads a plausible recipeId and a name that is either empty or a recipe name. So the two
-    // columns are emitted for every phase except 'M', and a literal '-' marks the M rows.
+    // is what carries recipeId (uint16, line 455) and recipeName (line 456). The union is untagged
+    // and `ph` selects the member, but the header never spells that out: a metadata event ('M')
+    // stores {name, group} at the same offset (synapse_common_types.h:478-482) and a counter event
+    // ('C') stores counter doubles (lines 463-469). Reading the recipe fields off either prints
+    // stale bytes -- measured on a 1801-event trace every 'M' row's recipeName pointer lay outside
+    // the returned buffer (368 of 368) and its "recipeId" was the low half of a name pointer
+    // (51380, 54192, 13107 across traces), which is where the non-UTF-8 bytes that broke parsers
+    // came from. Every other phase in a measured trace carries the event args: 'X' (host API and
+    // device spans), 'B'/'E' pairs, 'i' instants, 'V' (the Recipe Start marker the per-invocation
+    // attribution keys on) and 'f' flow. So those phases get the two columns and 'M'/'C' get '-'.
+    static const auto has_recipe_args = [](char ph) { return ph != 'M' && ph != 'C'; };
     for (size_t i = 0; i < entries; i++) {
         auto& e = ev[i];
         fprintf(f, "%c\t%u\t%u\t%.3Lf\t%.3Lf\t%s\t%s\t%s", e.type ? e.type : '?', e.engineType, e.engineIndex,
                 e.timestamp, e.duration, e.name ? e.name : "", e.category ? e.category : "",
                 (e.type == 'M' && e.arguments.name) ? e.arguments.name : "");
-        if (e.type == 'M') {
+        if (!has_recipe_args(e.type)) {
             fprintf(f, "\t-\t-\n");
         } else {
             fprintf(f, "\t%u\t%s\n", (unsigned)e.arguments.recipeId,
