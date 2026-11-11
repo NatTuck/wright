@@ -744,10 +744,18 @@ def main(argv=None) -> int:
     # 49,128,810 events and is complete by every detector below. So a capacity division carries
     # no information about truncation, and it is printed only so a reader can see the configured
     # size next to what was recorded.
+    # Both numbers are printed, and their ratio too, because a reader quotes it -- but the ratio
+    # is INFORMATION, not a check. `traceBufferSize` does not bound the recorded event count: a
+    # prefill trace configured for 256 MiB recorded 49,128,810 events (~1171% of the nominal
+    # capacity at 64 B/event) and is complete by every detector below. A capacity division
+    # therefore says nothing about truncation, and it must never be able to refuse a trace.
+    capacity_events = max(buffer_bytes // 64, 1)
     emit(
         f"  events observed = {len(rows)}; buffer configured {buffer_bytes / 2**20:.0f} MiB"
-        f" ({buffer_note}) -- the ratio of the two is NOT a check: traceBufferSize does not bound"
-        f" the recorded count (measured: 256 MiB configured, 49,128,810 events, complete)"
+        f" ({buffer_note}) = ~{capacity_events} events at ~64 B/event,"
+        f" so this trace is {100 * len(rows) / capacity_events:.1f}% of the nominal capacity"
+        f" -- that ratio is NOT a check: traceBufferSize does not bound the recorded count"
+        f" (measured: this trace is COMPLETE at 1171% of it)"
     )
     emit("")
     emit("## what detects a LOST event (a span cannot: it is invariant to interior loss)")
