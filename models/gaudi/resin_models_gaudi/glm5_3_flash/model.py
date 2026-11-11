@@ -61,9 +61,12 @@ _LAUNCH_MODE = os.environ.get("RESIN_GAUDI_PROFILE_LAUNCH_MODE", "full")
 # only in the GLM MTP path and LaunchPlan.patch, so a DeepSeek decode step re-binds 109 identical
 # slot/address arrays every token (~36 us each, ~3.9 ms/step). Default OFF until the token gate
 # proves it bit-identical: RESIN_GAUDI_LAZY_BIND=1 to try it.
+# NEVER enable it for the GLM MTP path: six sites mutate _Op addresses (glm5_3_flash/model.py
+# 805-835, graph.py:331) and lazy bind would leave them stale - silent corruption, not a crash.
 _LAZY_BIND = os.environ.get("RESIN_GAUDI_LAZY_BIND") == "1"
 _SYNC_EVERY = int(os.environ.get("RESIN_GAUDI_PROFILE_SYNC_EVERY", "0") or 0)
 _SYNC_COUNT = [0]
+_SYNC_PENDING = [False]
 
 from resin_models_gaudi.synapse.graph import (
     LAUNCH_BY_RECIPE,
@@ -1331,7 +1334,7 @@ class Staged:
 class _Op:
     """One launch: a recipe and its bindings as prepared slot / address arrays."""
 
-    __slots__ = ("recipe", "slots", "addresses", "args")
+    __slots__ = ("recipe", "slots", "addresses", "args", "_bound")
 
     def __init__(self, recipe: Recipe, names: dict[str, int]) -> None:
         self.recipe = recipe
@@ -1364,11 +1367,15 @@ class _Op:
                 # collapses to the pure host call cost if blocking was what we were measuring
                 ok = lib.rg_bind_slots(*self.args) >= 0 and lib.rg_launch(self.args[0]) >= 0
                 _SYNC_COUNT[0] += 1
-                if _SYNC_COUNT[0] % _SYNC_EVERY == 0:
-                    self.recipe.device.sync()
+                # the sync is deliberately OUTSIDE the timed interval: inside it, one call in N
+                # carried a full device wait and the median rose instead of collapsing (15j)
+                _SYNC_PENDING[0] = _SYNC_COUNT[0] % _SYNC_EVERY == 0
             else:
                 ok = lib.rg_bind_slots(*self.args) >= 0 and lib.rg_launch(self.args[0]) >= 0
             elapsed = time.perf_counter() - started
+            if _SYNC_PENDING[0]:
+                _SYNC_PENDING[0] = False
+                self.recipe.device.sync()
             if not ok:
                 self.recipe.device.check(-1, f"launch {self.recipe.name}")
             LAUNCH_STATS["calls"] += 1
