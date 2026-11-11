@@ -34,7 +34,8 @@ Usage:
     trace_union.py TRACE [--label TEXT] [--out FILE] [--top N] [--period N] [--rank N]
 
 Exit status 2 means the trace has no device execution events: a pre-flight failure, not a
-measurement.
+measurement. Exit status 1 means the trace FAILED a truncation assertion: the numbers are not
+printed, because a trace that cannot be shown to cover the cohort it claims is not quotable.
 """
 from __future__ import annotations
 
@@ -577,15 +578,26 @@ def main(argv=None) -> int:
     # issued. Two independent checks: the units must partition the launches exactly, and every
     # interval that carries a recipe_id must have found its launch.
     expected_units = None
-    config_path = args.trace.with_name(
-        args.trace.name.replace(".tsv", "-config.json").replace(".json.gz", "-config.json")
-    )
+    config: dict = {}
+    config_name = args.trace.name
+    for suffix in (".json.gz", ".tsv", ".json"):
+        if config_name.endswith(suffix):
+            config_name = config_name[: -len(suffix)] + "-config.json"
+            break
+    config_path = args.trace.with_name(config_name)
     if config_path.exists():
         try:
-            expected_units = json.loads(config_path.read_text()).get("passes")
+            config = json.loads(config_path.read_text())
+            expected_units = config.get("passes")
         except (OSError, ValueError):
-            expected_units = None
+            config, expected_units = {}, None
+    phase = config.get("phase") or args.trace.name.split("-", 1)[0]
     launches_cover = len(units) * period == len(launches) if launches else False
+    # Fail closed: a trace that cannot be shown to cover the cohort it claims is not quotable.
+    # Every one of these checks was derived from the trace itself until --expect-seconds existed,
+    # and a 16-chunk trace covering 102 ms of a 16.38 s cohort passed all of them (STATUS.md 13).
+    # So a failed - or unperformed - check refuses the trace instead of warning and printing on.
+    blockers: list[str] = []
 
     lines: list[str] = []
 
@@ -617,18 +629,48 @@ def main(argv=None) -> int:
     emit(f"device events present: {'YES' if intervals else 'NO'}")
     emit("")
     emit("## truncation check (the only protection against reading a buffer overflow)")
+    if not launches:
+        blockers.append(
+            "no Recipe Start rows: the window cannot be split into units, so truncation "
+            "cannot be detected"
+        )
+    elif not launches_cover:
+        blockers.append(
+            f"units x period ({len(units)} x {period} = {len(units) * period}) does not equal "
+            f"the {len(launches)} Recipe Start rows: the trace is truncated or mis-split"
+        )
     emit(
         f"  Recipe Start rows = {len(launches)};  units {len(units)} x period {period}"
         f" = {len(units) * period}  -> {'PASS' if launches_cover else 'FAIL'}"
     )
     if expected_units is not None:
+        if len(units) != expected_units:
+            blockers.append(
+                f"units detected ({len(units)}) != passes recorded in the trace config "
+                f"({expected_units}): the trace is truncated or mis-split"
+            )
+        if phase == "prefill" and expected_units < 2:
+            blockers.append(
+                f"the trace records {expected_units} prefill pass: a truncated trace still shows "
+                f"one unit, so the unit check cannot see truncation - record 2 or more "
+                f"(RESIN_TRACE_PREFILL_PASSES)"
+            )
         emit(
             f"  passes recorded in the trace config = {expected_units},"
             f" units detected = {len(units)}  ->"
             f" {'PASS' if len(units) == expected_units else 'FAIL (truncated or mis-split)'}"
         )
     else:
+        blockers.append(
+            "no <case>-config.json beside the trace: the recorded pass count is the check that "
+            "detects truncation, so it cannot be performed"
+        )
         emit("  passes in the trace config: no <case>-config.json beside this trace")
+    if unattributed:
+        blockers.append(
+            f"{unattributed} intervals carry a recipe_id that found no launch: Recipe Start rows "
+            f"were lost, so the trace is truncated"
+        )
     emit(
         f"  intervals carrying a recipe_id that found no launch = {unattributed}"
         f"  -> {'PASS' if unattributed == 0 else 'FAIL (lost Recipe Start rows)'}"
@@ -636,24 +678,34 @@ def main(argv=None) -> int:
     # The buffer size is a config value, so read it rather than assume it: the device refused
     # 1 GiB outright (scal_allocate_buffer rc -5) once the KV pool was reserved, so the
     # working size is a property of this run.
+    window = total_span / 1e6
     if args.expect_seconds:
-        window = total_span / 1e6
         ratio = window / args.expect_seconds if args.expect_seconds else 0.0
+        if not 0.8 <= ratio <= 1.2:
+            blockers.append(
+                f"trace device window {window:.3f} s against the harness's prefill_seconds "
+                f"{args.expect_seconds:.3f} s (ratio {ratio:.3f}): the trace is a fragment of "
+                f"the cohort, not the cohort"
+            )
         emit(
             f"  harness prefill_seconds = {args.expect_seconds:.3f} s;"
             f" trace device window = {window:.3f} s -> ratio {ratio:.3f}"
             f"  -> {'PASS' if 0.8 <= ratio <= 1.2 else 'FAIL (the trace is a fragment, not the cohort)'}"
         )
+    elif phase == "prefill":
+        blockers.append(
+            "prefill trace without --expect-seconds: the only check that can see a fragment is "
+            "the harness's own prefill_seconds, so the cohort cannot be confirmed"
+        )
+        emit("  harness prefill_seconds: NOT GIVEN (--expect-seconds is required for prefill)")
     buffer_bytes = 0x8000000
     buffer_note = "default assumption"
-    if config_path.exists():
+    raw_buffer = config.get("trace_buffer_size") or ""
+    if isinstance(raw_buffer, str) and raw_buffer:
         try:
-            cfg = json.loads(config_path.read_text())
-            raw = cfg.get("trace_buffer_size") or ""
-            if isinstance(raw, str) and raw:
-                buffer_bytes = int(raw, 0)
-                buffer_note = f"from {config_path.name}"
-        except (OSError, ValueError):
+            buffer_bytes = int(raw_buffer, 0)
+            buffer_note = f"from {config_path.name}"
+        except ValueError:
             pass
     capacity_events = max(buffer_bytes // 64, 1)
     emit(
@@ -662,8 +714,31 @@ def main(argv=None) -> int:
         f"  -> {100 * len(rows) / capacity_events:.1f}% full"
     )
     if len(rows) > capacity_events:
+        blockers.append(
+            f"{len(rows)} events observed but the buffer holds ~{capacity_events}: this trace "
+            f"lost events to a buffer overflow"
+        )
         emit("  WARNING: more events than the buffer holds -> this trace may be TRUNCATED")
     emit("")
+    if blockers:
+        # Refuse, and do not print a single accounting number: a reader who quotes one of them
+        # cannot tell it came from a fragment. The refusal is written to --out as well, so a
+        # stale report from an earlier run cannot be mistaken for this trace's.
+        emit("## REFUSED - this trace cannot be quoted")
+        for reason in blockers:
+            emit(f"  - {reason}")
+        emit("")
+        emit(
+            "  The accounting below is suppressed on purpose. Re-capture with a buffer that "
+            "holds the whole cohort (RESIN_PROF_BUFFER), two or more passes, and the harness's "
+            "own prefill_seconds for --expect-seconds."
+        )
+        text = "\n".join(lines) + "\n"
+        print(text, end="")
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(text)
+        return 1
     emit("## the step, three numbers on the same scope (mean over the repeating units)")
     emit(
         f"  (a) merged union over every device interval = {merged_unit_mean:10.1f} us"

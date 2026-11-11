@@ -195,11 +195,15 @@ def perfetto_trace(
     ``decode_passes`` completions per case, written as compressed Chrome traces."""
     if type(decode_passes) is not int or decode_passes < 1:
         raise ValueError("decode_passes must be a positive integer")
-    # A prefill cohort at 512k is 250 chunk-steps x ~109 launches; two of them overflow any
+    # A prefill cohort at 512k is 250 chunk-steps x ~109 launches and two of them overflow any
     # trace buffer worth allocating (measured ~830 device events per launch, so one cohort is
-    # ~2e7 events). One cohort still covers every chunk position, which is what a prefill
-    # union table needs; RESIN_TRACE_PREFILL_PASSES=2 restores the old default.
-    prefill_passes = int(os.environ.get("RESIN_TRACE_PREFILL_PASSES", "1"))
+    # ~2e7 events). Two is still the DEFAULT, because it is the only setting under which the
+    # truncation check can fail: with one pass a truncated trace still shows exactly one unit and
+    # the "units detected == passes recorded" assertion passes by construction. That is the
+    # failure STATUS.md section 13 records - a 102 ms fragment read as a 16.38 s cohort - so a
+    # buffer that cannot hold two cohorts must be raised (RESIN_PROF_BUFFER), and a trace that
+    # does not fit is now REFUSED by trace_union rather than quoted.
+    prefill_passes = int(os.environ.get("RESIN_TRACE_PREFILL_PASSES", "2"))
     if prefill_passes < 1:
         raise ValueError("RESIN_TRACE_PREFILL_PASSES must be a positive integer")
     directory = Path(directory)
