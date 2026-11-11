@@ -190,6 +190,35 @@ def test_mx8_rows_pads_k_to_tau_blocks():
     np.testing.assert_array_equal(tau.row_scales, natural.row_scales)
 
 
+def test_engram_lut_is_bit_identical_to_the_expression_it_replaced():
+    """All 65,536 (scale, code) pairs against the per-element code the table replaced.
+
+    The comment above `_ENGRAM_LUT` claims bit-identity, so the claim is checked rather than
+    trusted. The scope matters: the replaced expression formed its exponent in f32
+    (`s.astype(np.float32) - 127`) and cast once, and the table does the same, so they agree at
+    every byte including 254 and 255. A form that formed the exponent in float64 would NOT agree -
+    the last two assertions pin where and how, so nobody "fixes" the table toward float64 without
+    seeing that it would change the output dtype.
+    """
+    from resin_models_gaudi.deepseek_v41.weights import _ENGRAM_LUT
+
+    codes = np.arange(256, dtype=np.uint8).reshape(1, 256)
+    for scale in range(256):
+        s = np.full((1, 8), scale, np.uint8)
+        with np.errstate(over="ignore", invalid="ignore"):
+            old = OCP[codes] * np.exp2(s.astype(np.float32) - 127).repeat(32, axis=1)
+            old = old.astype(np.float32)
+        new = _ENGRAM_LUT[s.reshape(1, 8)[:, :, None], codes.reshape(1, 8, 32)].reshape(1, 256)
+        np.testing.assert_array_equal(new, old)
+
+    # the scope: a float64 exponent is finite where the f32 table is not, at 254 and 255
+    wide254 = OCP * np.exp2(254.0 - 127.0)
+    table254 = _ENGRAM_LUT[254].astype(np.float64)
+    assert int(np.count_nonzero(np.isfinite(wide254) & ~np.isfinite(table254))) == 126
+    assert not np.any(np.isfinite(_ENGRAM_LUT[255]))
+    assert np.all(np.isfinite(OCP * np.exp2(255.0 - 127.0)))  # finite in float64, not in f32
+
+
 def test_expert_k_per_expert_when_the_tensor_spreads_too_far():
     """One exponent for the tensor when every block stays exact under it, else each expert's own."""
     from resin_models_gaudi.deepseek_v41.weights import expert_k

@@ -708,11 +708,30 @@ def _engram_monitor() -> None:
 
 # The dequantised value of a row element is OCP[code] * 2^(scale - 127), so a 256 x 256 table of
 # every (scale, code) pair turns the whole expand into one fancy index instead of a chain of
-# 12.6M-element temporaries. Built in float64 and cast once, which is exactly what the per-element
-# expression computed, so the output is bit-identical.
+# 12.6M-element temporaries. It is bit-identical to the code it replaced - `OCP[w] *
+# np.exp2(s.astype(np.float32) - 127)`, then one cast to f32 - at EVERY scale byte 0..255: all
+# 65,536 pairs are compared, not assumed (test_engram_lut_is_bit_identical_to_the_expression_it_replaced).
+#
+# That claim is scoped to f32 output, and the scope is what makes it true. The exponent is formed in
+# f32, as the replaced code formed it, so from scale 247 up some codes overflow to inf exactly where
+# the old form did; and a table kept in float64 would NOT match here: at 254 the 126 codes with
+# |value| >= 2 are inf in f32 (448 * 2^127 = 7.6e40) and at 255 all 256 are. That is not a defect to
+# repair - f32 cannot represent those magnitudes, so matching a float64 table would mean changing the
+# gather's output dtype, not fixing a table.
+#
+# No such byte can reach this table from a checkpoint, and the argument is checkable:
+#   * an E8M0 byte b means 2^(b-127); 255 is NaN by the format (manual ch3), not a number, and a
+#     valid checkpoint cannot carry NaN as a scale;
+#   * 254 would mean the block's values are ~2^127, while the E4M3 codes they scale top out at
+#     448 = 2^8.8 - the quantiser would have had to scale the block up by ~2^118 beyond its largest
+#     code. Nothing does that: `mx8_rows` derives each row scale as the smallest power of two that
+#     puts the row's largest value at 240, so a real scale sits within a few exponents of
+#     log2(row max), and real Engram scales are in the low hundreds at most;
+#   * so 254/255 would require a corrupt or hand-built `.scale` tensor (or a caller passing
+#     something that is not a checkpoint scale). That is a broken file, where the correct action is
+#     to reject the byte at load - and this table is NOT that check: the gather does not scan for
+#     0xFF, unlike the expert path's `kernel_k`, which raises.
 with np.errstate(over="ignore", invalid="ignore"):
-    # a scale byte above ~154 overflows f32, as it did in the per-element expression; the checkpoint
-    # never carries one, and both forms produce the same inf there
     _ENGRAM_LUT = (
         OCP[None, :] * np.exp2(np.arange(256, dtype=np.float32) - 127.0)[:, None]
     ).astype(np.float32)
