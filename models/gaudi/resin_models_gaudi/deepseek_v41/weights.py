@@ -490,6 +490,7 @@ _ENGRAM_GATHER_MODES = ("pooled", "mmap", "auto")
 _ENGRAM_RESIDENT_FLOOR = 0.95
 # how often the monitor re-checks residency while mmap is in use
 _ENGRAM_CHECK_SECONDS = 30.0
+_PAGE_BYTES = 4096
 _ENGRAM_MODE = "pooled"
 _ENGRAM_RESIDENT = 0.0
 _ENGRAM_MAPS: dict[int, tuple] = {}
@@ -587,6 +588,9 @@ def _engram_residency(checkpoint: Path, shards: dict[int, str], sample: bool = F
 
 
 def _mincore_fraction(path: Path, offset: int, length: int) -> float:
+    # mmap needs a page-aligned file offset (EINVAL otherwise), and the sampled monitor asks for
+    # windows at fractions of the file size.
+    offset = offset // _PAGE_BYTES * _PAGE_BYTES
     length = min(length, path.stat().st_size - offset)
     pages = (length + 4095) // 4096
     fd = os.open(path, os.O_RDONLY)
@@ -641,9 +645,13 @@ def _engram_monitor() -> None:
     if now - _ENGRAM_LAST_CHECK < _ENGRAM_CHECK_SECONDS:
         return
     _ENGRAM_LAST_CHECK = now
-    _ENGRAM_RESIDENT = _engram_residency(
-        _ENGRAM_CHECKPOINT, _ENGRAM_SHARDS, sample=True
-    )
+    try:
+        _ENGRAM_RESIDENT = _engram_residency(
+            _ENGRAM_CHECKPOINT, _ENGRAM_SHARDS, sample=True
+        )
+    except OSError as error:  # a monitor must never take the server down
+        logger.warning(f"engram gather: residency check failed ({error}); keeping mmap")
+        return
     if _ENGRAM_RESIDENT < _ENGRAM_RESIDENT_FLOOR:
         logger.warning(
             f"engram gather: shards {_ENGRAM_RESIDENT:.1%} resident, below the "
