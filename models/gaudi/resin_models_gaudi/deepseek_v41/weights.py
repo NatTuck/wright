@@ -676,6 +676,24 @@ def _engram_monitor() -> None:
         _ENGRAM_MAPS.clear()
 
 
+# The dequantised value of a row element is OCP[code] * 2^(scale - 127), so a 256 x 256 table of
+# every (scale, code) pair turns the whole expand into one fancy index instead of a chain of
+# 12.6M-element temporaries. Built in float64 and cast once, which is exactly what the per-element
+# expression computed, so the output is bit-identical.
+with np.errstate(over="ignore", invalid="ignore"):
+    # a scale byte above ~154 overflows f32, as it did in the per-element expression; the checkpoint
+    # never carries one, and both forms produce the same inf there
+    _ENGRAM_LUT = (
+        OCP[None, :] * np.exp2(np.arange(256, dtype=np.float32) - 127.0)[:, None]
+    ).astype(np.float32)
+
+
+def _engram_expand(w: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """(n, 256) f32 rows from (n, 256) E4M3 codes and (n, 8) E8M0 scales."""
+    n = len(w)
+    return _ENGRAM_LUT[s.reshape(n, 8)[:, :, None], w.reshape(n, 8, 32)].reshape(n, 256)
+
+
 def engram_rows(src: Safetensors, layer: int, rows: np.ndarray) -> np.ndarray:
     """Rows of an Engram table, dequantized (n, 256) f32.
 
@@ -697,8 +715,7 @@ def engram_rows(src: Safetensors, layer: int, rows: np.ndarray) -> np.ndarray:
         w = _engram_bytes(src, f"{name}.weight", ids, 256)
         s = _engram_bytes(src, f"{name}.scale", ids, 8)
     read = time.perf_counter() - started if _ENGRAM_PROFILE else 0.0
-    out = OCP[w] * np.exp2(s.astype(np.float32) - 127).repeat(32, axis=1)
-    out = out.astype(np.float32)
+    out = _engram_expand(w, s)
     if _ENGRAM_PROFILE:
         _ENGRAM_STATS["read"] += read
         _ENGRAM_STATS["expand"] += time.perf_counter() - started - read
