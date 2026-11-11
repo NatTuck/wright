@@ -1331,6 +1331,31 @@ class Staged:
             self.result()
 
 
+
+def _do_bind(lib, args):
+    """rg_bind_slots with a counter: the step profile reports binds per step, so a flag that is set
+    but never consulted on the running path is visible before any token comparison."""
+    LAUNCH_STATS["binds"] = LAUNCH_STATS.get("binds", 0) + 1
+    return lib.rg_bind_slots(*args)
+
+
+def _do_launch(lib, handle):
+    LAUNCH_STATS["launches"] = LAUNCH_STATS.get("launches", 0) + 1
+    return lib.rg_launch(handle)
+
+
+
+def diagnostics() -> str:
+    """The resolved diagnostics, read from the constants the code branches on (not os.environ), so a
+    boot log cannot disagree with the behaviour."""
+    from resin_models_gaudi.synapse.graph import _PROFILE_STEP
+
+    return (
+        f"diagnostics: lazy_bind={_LAZY_BIND} launch_mode={_LAUNCH_MODE} "
+        f"sync_every={_SYNC_EVERY} step_profile={_PROFILE_STEP}"
+    )
+
+
 class _Op:
     """One launch: a recipe and its bindings as prepared slot / address arrays."""
 
@@ -1361,27 +1386,27 @@ class _Op:
             if _LAUNCH_MODE == "none":
                 ok = True
             elif _LAUNCH_MODE == "bind":
-                ok = lib.rg_bind_slots(*self.args) >= 0
+                ok = _do_bind(lib, self.args) >= 0
             elif _LAZY_BIND:
                 # the profiling branch has to honour lazy bind too, or a gate run measures the
                 # unmodified path while reporting the flag as on (found the hard way)
                 if not getattr(self, "_bound", False):
-                    ok = lib.rg_bind_slots(*self.args) >= 0
+                    ok = _do_bind(lib, self.args) >= 0
                     self._bound = ok
                 else:
                     ok = True
-                if ok and lib.rg_launch(self.args[0]) < 0:
+                if ok and _do_launch(lib, self.args[0]) < 0:
                     ok = False
             elif _SYNC_EVERY:
                 # the clean host/device separator: never let the queue build, so the per-call time
                 # collapses to the pure host call cost if blocking was what we were measuring
-                ok = lib.rg_bind_slots(*self.args) >= 0 and lib.rg_launch(self.args[0]) >= 0
+                ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
                 _SYNC_COUNT[0] += 1
                 # the sync is deliberately OUTSIDE the timed interval: inside it, one call in N
                 # carried a full device wait and the median rose instead of collapsing (15j)
                 _SYNC_PENDING[0] = _SYNC_COUNT[0] % _SYNC_EVERY == 0
             else:
-                ok = lib.rg_bind_slots(*self.args) >= 0 and lib.rg_launch(self.args[0]) >= 0
+                ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
             elapsed = time.perf_counter() - started
             if _SYNC_PENDING[0]:
                 _SYNC_PENDING[0] = False
@@ -1400,13 +1425,13 @@ class _Op:
             return
         if _LAZY_BIND:
             if not getattr(self, "_bound", False):
-                if lib.rg_bind_slots(*self.args) < 0:
+                if _do_bind(lib, self.args) < 0:
                     self.recipe.device.check(-1, f"bind {self.recipe.name}")
                 self._bound = True
-            if lib.rg_launch(self.args[0]) < 0:
+            if _do_launch(lib, self.args[0]) < 0:
                 self.recipe.device.check(-1, f"launch {self.recipe.name}")
             return
-        if lib.rg_bind_slots(*self.args) < 0 or lib.rg_launch(self.args[0]) < 0:
+        if _do_bind(lib, self.args) < 0 or _do_launch(lib, self.args[0]) < 0:
             self.recipe.device.check(-1, f"launch {self.recipe.name}")
 
 

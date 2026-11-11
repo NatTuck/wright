@@ -47,7 +47,13 @@ from resin_models_gaudi.mistral_large4 import parallel
 from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
 from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params
 from resin_models_gaudi.synapse.progress import info
-from resin_models_gaudi.synapse.graph import LAUNCH_STATS, reset_launch_stats
+from resin_models_gaudi.glm5_3_flash.model import diagnostics
+from resin_models_gaudi.synapse.graph import (
+    LAUNCH_BY_RECIPE,
+    LAST_CALLS,
+    LAUNCH_STATS,
+    reset_launch_stats,
+)
 from resin_models_gaudi.synapse.runtime import open_device
 
 PREFILL_CHUNK_SIZE = TMAX
@@ -160,6 +166,8 @@ class DeepSeekV41GaudiRunner:
             cache_layout=self.cache_layout,
         )
         self.compiles_at_start = self._compiles_seen = self.device.compile_count
+        if profile_step:
+            info(diagnostics())
         self._context = EngramContext(
             cfg.engram_max_ngram_size - 1, geometry.window_blocks(self.model.capacity)
         )
@@ -328,8 +336,39 @@ class DeepSeekV41GaudiRunner:
                     sample_wall = 1000 * (end - t_sample)
                     step_wall = 1000 * (end - t_step)
                     self._last_step_end = end
+                    if LAST_CALLS:
+                        # test A: cost by position in the step. A filling queue shows later calls slower.
+                        n = len(LAST_CALLS)
+                        first = [1e6 * x for x in LAST_CALLS[:10]]
+                        middle = [1e6 * x for x in LAST_CALLS[n // 2 - 5 : n // 2 + 5]]
+                        last = [1e6 * x for x in LAST_CALLS[-10:]]
+                        info(
+                            "launch order us: first "
+                            + " ".join(f"{x:.0f}" for x in first)
+                            + " | middle "
+                            + " ".join(f"{x:.0f}" for x in middle)
+                            + " | last "
+                            + " ".join(f"{x:.0f}" for x in last)
+                        )
+                        ordered = sorted(LAST_CALLS)
+                        info(
+                            f"launch dist us: min {1e6 * ordered[0]:.1f} "
+                            f"median {1e6 * ordered[len(ordered) // 2]:.1f} "
+                            f"p90 {1e6 * ordered[int(0.9 * (len(ordered) - 1))]:.1f} "
+                            f"max {1e6 * ordered[-1]:.1f}"
+                        )
+                        for name, (calls, secs, workspace) in sorted(
+                            LAUNCH_BY_RECIPE.items(), key=lambda kv: -kv[1][1]
+                        )[:10]:
+                            info(
+                                f"  recipe {name[:44]:<44} calls {calls:>3} "
+                                f"total {1e3 * secs:6.2f} ms "
+                                f"per-call {1e6 * secs / calls:6.1f} us "
+                                f"workspace {workspace / 2**20:7.1f} MiB"
+                            )
                     info(
                         f"step profile T={T} rows={len(rows)}: launches={LAUNCH_STATS['calls']} "
+                        f"binds={LAUNCH_STATS.get('binds', 0)} launch_calls={LAUNCH_STATS.get('launches', 0)} "
                         f"enqueue={enqueue:.1f} ms, launch_wall={launch_wall:.1f} ms, "
                         f"sync+d2h={sample_wall:.1f} ms, step_wall={step_wall:.1f} ms, "
                         f"residual={step_wall - enqueue - sample_wall:.1f} ms; "
