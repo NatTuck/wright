@@ -97,7 +97,16 @@ DSPARK_ROWS = (
 )
 RADIX_MIN = 16384  # decode steps whose columns see more index keys pick their top 512 by radix passes
 J = 24  # Engram rows per column: (max n-gram - 1) x heads
-WORKSPACE_RESERVE = 3 << 30
+# The step tables and the shared workspace are reserved out of the arena. The floor is 4 GiB, not 3,
+# because one recipe needs more than 3: ds41_ffn_paged_T1024 wants 3,600,731,648 B = 3,433.9 MiB =
+# 3.35 GiB (MEASURED with rg_recipe_workspace, STATUS.md §4b) and a 3 GiB floor left it short by
+# 0.46 GiB, so it failed to compile with synDeviceMalloc status=26. Reproduced twice: the 131,072
+# boot (which died at this recipe) and the 8,206 load, plus the settling test that compiled this one
+# recipe ALONE at 131,072 against 2.89 GiB free (§4b) - same weights, same recipe, only max_seq_len
+# differs. The formula's second term already covers the large contexts (5.56 GiB at 512,000), so the
+# floor only decides short ones; raising it costs ~0.5 GiB of arena = ~200 slabs = 0.56 of a 512k
+# sequence (359 slabs) or ~2 sequences at 128k (103 slabs).
+WORKSPACE_RESERVE = 4 << 30
 _HOST_EVENT = 60  # 60, 61: the pinned table copies' uploads
 _STAGE_EVENT = 56  # 56, 57: the sampler's staging copies
 
