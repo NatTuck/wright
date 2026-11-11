@@ -230,11 +230,16 @@ class Graph:
 # issuing them. Every launch on this path goes through Recipe.launch or LaunchPlan.run.
 _PROFILE_STEP = os.environ.get("RESIN_GAUDI_PROFILE_STEP") == "1"
 LAUNCH_STATS = {"calls": 0, "seconds": 0.0}
+# recipe name -> [calls, seconds, workspace bytes]; workspace is read once per recipe
+LAUNCH_BY_RECIPE: dict[str, list] = {}
+# per-call times of the last step, for the distribution
+LAST_CALLS: list[float] = []
 
 
 def reset_launch_stats() -> None:
     LAUNCH_STATS["calls"] = 0
     LAUNCH_STATS["seconds"] = 0.0
+    LAST_CALLS.clear()
 
 
 @dataclass(slots=True)
