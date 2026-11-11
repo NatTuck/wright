@@ -680,18 +680,34 @@ def main(argv=None) -> int:
     # working size is a property of this run.
     window = total_span / 1e6
     if args.expect_seconds:
-        ratio = window / args.expect_seconds if args.expect_seconds else 0.0
+        # Compare ONE cohort's window, not the whole trace: a trace with k recorded passes of the
+        # same cohort spans k x prefill_seconds, so dividing the whole-trace window by a single
+        # cohort's duration fails by construction for any k > 1 -- and k >= 2 is exactly what the
+        # pass-count check requires. The per-unit window (max end - min start within a unit) is
+        # the right quantity: it does not assume the passes are contiguous, and it keeps fragment
+        # detection intact, because two passes each covering half a cohort give a mean unit window
+        # of half the harness's seconds and still FAIL.
+        mean_unit_window = (sum(unit_span) / len(unit_span) / 1e6) if unit_span else 0.0
+        ratio = mean_unit_window / args.expect_seconds if args.expect_seconds else 0.0
         if not 0.8 <= ratio <= 1.2:
             blockers.append(
-                f"trace device window {window:.3f} s against the harness's prefill_seconds "
-                f"{args.expect_seconds:.3f} s (ratio {ratio:.3f}): the trace is a fragment of "
-                f"the cohort, not the cohort"
+                f"mean per-unit device window {mean_unit_window:.3f} s against the harness's "
+                f"prefill_seconds {args.expect_seconds:.3f} s (ratio {ratio:.3f}): the units are "
+                f"not whole cohorts, so the trace is a fragment"
             )
         emit(
-            f"  harness prefill_seconds = {args.expect_seconds:.3f} s;"
-            f" trace device window = {window:.3f} s -> ratio {ratio:.3f}"
-            f"  -> {'PASS' if 0.8 <= ratio <= 1.2 else 'FAIL (the trace is a fragment, not the cohort)'}"
+            f"  harness prefill_seconds = {args.expect_seconds:.3f} s (ONE cohort);"
+            f" mean per-unit device window = {mean_unit_window:.3f} s over {len(unit_span)} units"
+            f" -> ratio {ratio:.3f}"
+            f"  -> {'PASS' if 0.8 <= ratio <= 1.2 else 'FAIL (the units are fragments, not cohorts)'}"
         )
+        if len(unit_span) > 1:
+            emit(
+                f"    per-unit windows: unit 0 {unit_span[0] / 1e6:.3f} s,"
+                f" min {min(unit_span) / 1e6:.3f} s, max {max(unit_span) / 1e6:.3f} s"
+                f"   (the whole trace spans {window:.3f} s = {len(unit_span)} units, which is why"
+                f" the whole-trace window is not the quantity compared)"
+            )
     elif phase == "prefill":
         blockers.append(
             "prefill trace without --expect-seconds: the only check that can see a fragment is "
