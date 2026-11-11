@@ -756,8 +756,12 @@ def engram_rows(src: Safetensors, layer: int, rows: np.ndarray) -> np.ndarray:
     _engram_monitor()
     ids = np.asarray(rows, np.int64).reshape(-1)
     started = time.perf_counter() if _ENGRAM_PROFILE else 0.0
-    if _ENGRAM_MODE == "mmap" and layer in _ENGRAM_MAPS:
-        weight, scale, _, _ = _ENGRAM_MAPS[layer]
+    # one lookup, not `in` then index: the two-step form has a KeyError window if a second thread
+    # drops the maps between them (it cannot open today - the monitor runs on this thread - but the
+    # single lookup costs nothing and does not depend on that)
+    mapped = _ENGRAM_MAPS.get(layer) if _ENGRAM_MODE == "mmap" else None
+    if mapped is not None:
+        weight, scale, _, _ = mapped
         w, s = weight[ids], scale[ids]
     else:
         name = f"layers.{layer}.engram.embed"
