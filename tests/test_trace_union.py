@@ -111,7 +111,8 @@ def test_one_pass_cannot_be_checked_and_is_refused(tmp_path, capsys):
     trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json", units=1, passes=1)
     status, out = run(capsys, trace, "--expect-seconds", "0.002")
     assert status == 1
-    assert "records 1 prefill pass" in out
+    # The message no longer says "prefill": the vacuous-unit argument holds in either phase.
+    assert "records 1 pass" in out
     assert "## the step, three numbers" not in out
 
 
@@ -150,3 +151,47 @@ def test_the_refusal_is_written_to_out_so_a_stale_report_cannot_be_quoted(tmp_pa
     assert report.read_text() == out
     assert "REFUSED" in report.read_text()
     assert "three numbers" not in report.read_text()
+
+
+def test_a_decode_config_carrying_prefill_seconds_is_not_compared_against_it(
+    tmp_path, capsys
+):
+    """`prefill_seconds` is a COHORT's wall time, so it only gates a prefill trace.
+
+    A decode unit is a step. A decode config that happened to carry `prefill_seconds` would be
+    compared against the wrong quantity and refused spuriously -- so the config fallback is
+    phase-gated, and a decode trace can only be given a number explicitly. Absurd value on
+    purpose: 100 s against a decode step window must be ignored, not fatal.
+    """
+    trace = write_trace(tmp_path / "decode-ctx512000-b1-rank000.json", phase="decode")
+    beside = trace.with_name(trace.name.replace(".json", "-config.json"))
+    config = json.loads(beside.read_text())
+    config["prefill_seconds"] = 100.0
+    beside.write_text(json.dumps(config))
+
+    status, out = run(capsys, trace)
+    assert status == 0, out
+    assert "## the step, three numbers" in out
+    assert "harness prefill_seconds" not in out, out
+
+
+def test_a_one_unit_decode_trace_is_refused_because_it_cannot_show_a_fragment(
+    tmp_path, capsys
+):
+    """The vacuous-unit argument is not a prefill argument.
+
+    With ONE unit, "units detected == passes recorded" is true by construction in EITHER phase,
+    so a truncated decode trace passes every internal check. A trace that cannot show a missing
+    unit cannot show a fragment, so a single-unit decode trace is refused with that reason.
+    """
+    trace = write_trace(
+        tmp_path / "decode-ctx512000-b1-rank000.json",
+        phase="decode",
+        units=1,
+        passes=1,
+    )
+    status, out = run(capsys, trace)
+    assert status == 1, out
+    assert "records 1 pass" in out
+    assert "cannot see truncation" in out
+    assert "## the step, three numbers" not in out

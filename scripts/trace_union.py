@@ -649,11 +649,16 @@ def main(argv=None) -> int:
                 f"units detected ({len(units)}) != passes recorded in the trace config "
                 f"({expected_units}): the trace is truncated or mis-split"
             )
-        if phase == "prefill" and expected_units < 2:
+        if expected_units < 2:
+            # Not a prefill argument: with ONE unit, "units detected == passes recorded" is true
+            # by construction in EITHER phase, so a truncated trace passes every internal check
+            # and a fragment cannot be seen. A trace that cannot show a missing unit cannot show
+            # a fragment, whichever phase it records.
             blockers.append(
-                f"the trace records {expected_units} prefill pass: a truncated trace still shows "
-                f"one unit, so the unit check cannot see truncation - record 2 or more "
-                f"(RESIN_TRACE_PREFILL_PASSES)"
+                f"the trace records {expected_units} pass, so it shows {expected_units} unit: a"
+                f" truncated trace would also show exactly one, so the unit check cannot see"
+                f" truncation in any phase - record 2 or more"
+                f" (RESIN_TRACE_PREFILL_PASSES for prefill, decode_passes for decode)"
             )
         emit(
             f"  passes recorded in the trace config = {expected_units},"
@@ -686,7 +691,11 @@ def main(argv=None) -> int:
     # (a number from another boot, or one an operator typed, is a weaker claim).
     expect_seconds = args.expect_seconds
     expect_source = "from the command line (--expect-seconds)"
-    if expect_seconds is None:
+    if expect_seconds is None and phase == "prefill":
+        # `prefill_seconds` is ONE COHORT's wall time, so it is only comparable to a prefill
+        # unit's window. A decode unit is a step, and a decode config that happened to carry this
+        # field would be compared against the wrong quantity and spuriously refused; the phase
+        # gate means a decode trace can only be given a number explicitly.
         from_config = config.get("prefill_seconds")
         if isinstance(from_config, (int, float)) and from_config > 0:
             expect_seconds = float(from_config)
