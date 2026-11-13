@@ -15,6 +15,8 @@ prefix cache starts from cached blocks (``EngramContext``).
 from __future__ import annotations
 
 import json
+import os
+import time
 import warnings
 from pathlib import Path
 
@@ -40,15 +42,54 @@ from resin_models_gaudi.deepseek_v41.model import (
     Row,
     Shape,
 )
+from resin_models_gaudi.glm5_3_flash.model import (
+    _RECIPE_DEVICE,
+    _SYNC_OVERHEAD_COUNT,
+    _SYNC_OVERHEAD_TOTAL,
+    _SYNC_TIMES,
+    _SYNC_TOTAL,
+    SECOND_SYNC_BY_RECIPE,
+    diagnostics,
+)
 from resin_models_gaudi.glm5_3_flash.runner import _Scorer
 from resin_models_gaudi.mistral_large4 import parallel
 from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
 from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params
+from resin_models_gaudi.synapse.graph import (
+    LAST_CALLS,
+    LAUNCH_BY_RECIPE,
+    LAUNCH_STATS,
+    reset_launch_stats,
+)
 from resin_models_gaudi.synapse.progress import info
 from resin_models_gaudi.synapse.runtime import open_device
 
 PREFILL_CHUNK_SIZE = TMAX
 MAX_BATCH = 64
+profile_step = os.environ.get("RESIN_GAUDI_PROFILE_STEP") == "1"
+# The per-recipe host cost of one submission with no sync - bind + launch, 44 us, measured on this
+# arm in one boot (notes/opt-manual-fixes.md: 44 us bind+launch of the ~102 us per-submission cost).
+# A constant per call, so the corrected device column subtracts it per recipe and stays additive.
+HOST_CALL_S = 44e-6
+
+
+def _family(name: str) -> str:
+    """The rollup family of a recipe name, for the per-recipe device table."""
+    if name.startswith("ds41_attn_pre"):
+        return "attn_pre"
+    if name.startswith("ds41_attn_out"):
+        return "attn_out"
+    if name.startswith("ds41_attn"):
+        return "attn"
+    if name.startswith("ds41_ffn"):
+        return "ffn"
+    if name.startswith("ds41_engram"):
+        return "engram"
+    if name.startswith("ds41_index"):
+        return "index"
+    if name.startswith("ds41_head"):
+        return "head"
+    return "other"
 
 
 class DeepSeekV41GaudiRunner:
@@ -67,6 +108,8 @@ class DeepSeekV41GaudiRunner:
         parent_capacity: int | None = None,
         num_layers: int | None = None,
         engram: str = "card",
+        engram_gather: str = "auto",
+        engram_prewarm: bool = False,
         draft_tokens: int = 0,
         log=info,
     ) -> None:
@@ -134,7 +177,8 @@ class DeepSeekV41GaudiRunner:
             barrier = lambda: parallel.barrier(groups.replica.handle)  # noqa: E731
         self.model = DeepSeekV41Gaudi(
             self.device, checkpoint, cfg, capacity=capacity, max_seq_len=max_seq_len, rank=rank, nranks=nranks,
-            layers=num_layers, engram=engram, barrier=barrier, log=log if rank == 0 else (lambda *_: None),
+            layers=num_layers, engram=engram, engram_gather=engram_gather, engram_prewarm=engram_prewarm,
+            barrier=barrier, log=log if rank == 0 else (lambda *_: None),
             dspark=speculative,
         )  # fmt: skip
         if barrier is not None:
@@ -153,6 +197,8 @@ class DeepSeekV41GaudiRunner:
             cache_layout=self.cache_layout,
         )
         self.compiles_at_start = self._compiles_seen = self.device.compile_count
+        if profile_step:
+            info(diagnostics())
         self._context = EngramContext(
             cfg.engram_max_ngram_size - 1, geometry.window_blocks(self.model.capacity)
         )
@@ -160,6 +206,11 @@ class DeepSeekV41GaudiRunner:
             _Completion
         ] = []  # enqueued steps whose samples are not yet recorded in _context
         self.continuations = 0
+        # the last step's per-recipe rows and second-sync times, kept past the table's clear so
+        # the per-recipe top-10 below can print them (it used to read the cleared dict, so it
+        # never printed a single row)
+        self._recipe_snapshot: list[tuple] = []
+        self._sync_snapshot: dict[str, list] = {}
 
     @property
     def kv_pool_bytes(self) -> int:
@@ -217,8 +268,67 @@ class DeepSeekV41GaudiRunner:
             self._context.before(sequence, pos0, first, ids),
         )  # fmt: skip
 
+    def _report_recipe_device(self) -> None:
+        """Print the per-recipe device table and the per-family rollup, then clear them.
+
+        Called from BOTH branches. It used to live in the decode branch alone, so a prefill step's
+        table was never printed - and worse, was carried into the next decode step's table (the
+        first decode step after a prefill printed 218 calls, its own 109 plus the prefill's 109).
+
+        Two corrections turn the raw bracket into a device number. ``host`` is the bind+launch cost
+        of a submission with no sync (HOST_CALL_S, measured on this arm); ``sync overhead`` is the
+        second sync, issued on an already-drained queue, summed over the step. Both are subtracted
+        per recipe, not from the total, so a family's corrected union stays additive.
+
+        The raw bracket is ``sum(t1 - t0)`` exactly as measured - the second sync is INSIDE it and
+        is not taken out here or in ``_Op.run``. Subtracting it twice (once from the bracket, once
+        from the corrected column) put the corrected column ~3.5% low and contradicted the formula
+        in measurements/profile/SUMMARY-recipe-device.txt, which is the reference:
+
+            raw = sum over recipes of (t1 - t0);  corrected = raw - host - sync_overhead
+        """
+        total = sum(e[1] for e in LAUNCH_BY_RECIPE.values())
+        calls = sum(e[0] for e in LAUNCH_BY_RECIPE.values())
+        overhead = _SYNC_OVERHEAD_TOTAL[0]
+        host = calls * HOST_CALL_S
+        fams: dict[str, list] = {}
+        for name, (c, secs, _w) in LAUNCH_BY_RECIPE.items():
+            fam = _family(name)
+            slot = fams.setdefault(fam, [0, 0.0, 0.0])
+            slot[0] += c
+            slot[1] += secs
+            slot[2] += SECOND_SYNC_BY_RECIPE.get(name, (0, 0.0))[1]
+        info(
+            f"recipe-device: {calls} calls, {1000 * total:.1f} ms raw bracket "
+            f"(bind+launch+one sync per recipe; the sum over recipes is the step's device "
+            f"occupancy plus {calls} sync calls)"
+        )
+        info(
+            f"  host {1000 * host:.1f} ms ({calls} x {1e6 * HOST_CALL_S:.0f} us bind+launch), "
+            f"sync_overhead {1000 * overhead:.1f} ms "
+            f"({1e6 * overhead / calls:.1f} us/call over {_SYNC_OVERHEAD_COUNT[0]} second syncs)"
+        )
+        info(
+            f"  device corrected {1000 * (total - host - overhead):.1f} ms "
+            f"= {1000 * total:.1f} - {1000 * host:.1f} - {1000 * overhead:.1f}"
+        )
+        for fam, (c, secs, ovh) in sorted(fams.items(), key=lambda kv: -kv[1][1]):
+            corrected = secs - c * HOST_CALL_S - ovh
+            info(
+                f"  family {fam:<10} calls {c:>5} raw {1000 * secs:7.1f} ms "
+                f"corrected {1000 * corrected:7.1f} ms mean {1e6 * corrected / c:6.1f} us"
+            )
+        self._recipe_snapshot = sorted(LAUNCH_BY_RECIPE.items(), key=lambda kv: -kv[1][1])
+        self._sync_snapshot = dict(SECOND_SYNC_BY_RECIPE)
+        LAUNCH_BY_RECIPE.clear()
+        SECOND_SYNC_BY_RECIPE.clear()
+        _SYNC_OVERHEAD_TOTAL[0] = 0.0
+        _SYNC_OVERHEAD_COUNT[0] = 0
+
     def forward(self, plan) -> ForwardOutput:
+        t_enter = time.perf_counter() if profile_step else 0.0
         self._harvest()
+        t_harvest = time.perf_counter() if profile_step else 0.0
         self._check_compiles()
         if any(media is not None for media in plan.media):
             raise NotImplementedError(
@@ -227,6 +337,7 @@ class DeepSeekV41GaudiRunner:
         cache = PagedCachePlan.from_plan(
             plan, self.cache_layout, decode_lookahead=self.lookahead
         )
+        t_cache = time.perf_counter() if profile_step else 0.0
         batch = cache.batch
         if batch.num_sequences > self.max_batch_size:
             raise ValueError(f"{batch.num_sequences} rows exceed {self.max_batch_size}")
@@ -236,6 +347,7 @@ class DeepSeekV41GaudiRunner:
         if prompt and batch.phase != BatchPhase.PREFILL:
             raise ValueError("prompt logprobs are scored by prefill plans")
         params = plan_params(plan, self.vocab_size)
+        t_params = time.perf_counter() if profile_step else 0.0
         wanted = [p.top_logprobs for p in plan.sampling_params if p.logprobs]
         if wanted and max(wanted) > TOP_MAX:
             raise NotImplementedError(f"top_logprobs above {TOP_MAX}")
@@ -264,6 +376,9 @@ class DeepSeekV41GaudiRunner:
                     last = s + len(chunk) >= len(ids)
                     # the logits this chunk needs: scored columns, the sampled column, or none
                     need = "all" if len(cols) else len(chunk) - 1 if last else None
+                    if profile_step:
+                        # per chunk: a prefill step is one launch, so its counters start empty
+                        reset_launch_stats()
                     T = model.launch(
                         chunk,
                         p + np.arange(len(chunk)),
@@ -272,6 +387,9 @@ class DeepSeekV41GaudiRunner:
                         logits=need,
                     )
                     self._context.seen(sequence, p, chunk)
+                    if profile_step and _RECIPE_DEVICE and LAUNCH_BY_RECIPE:
+                        info(f"prefill step T={T} chunk={len(chunk)} pos0={p}")
+                        self._report_recipe_device()
                     if len(cols):
                         scores.add(s + cols, model.logits_host(T)[cols])
                     if last:
@@ -299,12 +417,81 @@ class DeepSeekV41GaudiRunner:
                     for r in part
                 ]
                 sl = slice(g, g + len(rows))
+                if profile_step:
+                    reset_launch_stats()
+                    t_step = time.perf_counter()
+                    t_rows = t_step
                 T = model.launch(tokens[sl], positions[sl], rows)
                 for r in part:
                     self._context.seen(
                         int(batch.sequence_ids[r]), int(positions[r]), tokens[r : r + 1]
                     )
+                t_sample = time.perf_counter() if profile_step else 0.0
                 outs.append(model.sample_launched(Shape(T, False), params[sl]))
+                if profile_step:
+                    end = time.perf_counter()
+                    enqueue = 1000 * LAUNCH_STATS["seconds"]
+                    launch_wall = 1000 * (t_sample - t_step)
+                    sample_wall = 1000 * (end - t_sample)
+                    step_wall = 1000 * (end - t_step)
+                    self._last_step_end = end
+                    if _RECIPE_DEVICE and LAUNCH_BY_RECIPE:
+                        self._report_recipe_device()
+                    if _SYNC_TIMES:
+                        import statistics as _st
+
+                        info(
+                            f"sync profile: {len(_SYNC_TIMES)} syncs, "
+                            f"total {1000 * _SYNC_TOTAL[0]:.1f} ms, "
+                            f"median {1000 * _st.median(_SYNC_TIMES):.1f} ms, "
+                            f"max {1000 * max(_SYNC_TIMES):.1f} ms "
+                            f"(sum of syncs = serialised device time for the window)"
+                        )
+                        _SYNC_TOTAL[0] = 0.0
+                        _SYNC_TIMES.clear()
+                    if LAST_CALLS:
+                        # test A: cost by position in the step. A filling queue shows later calls slower.
+                        n = len(LAST_CALLS)
+                        first = [1e6 * x for x in LAST_CALLS[:10]]
+                        middle = [1e6 * x for x in LAST_CALLS[n // 2 - 5 : n // 2 + 5]]
+                        last = [1e6 * x for x in LAST_CALLS[-10:]]
+                        info(
+                            "launch order us: first "
+                            + " ".join(f"{x:.0f}" for x in first)
+                            + " | middle "
+                            + " ".join(f"{x:.0f}" for x in middle)
+                            + " | last "
+                            + " ".join(f"{x:.0f}" for x in last)
+                        )
+                        ordered = sorted(LAST_CALLS)
+                        info(
+                            f"launch dist us: min {1e6 * ordered[0]:.1f} "
+                            f"median {1e6 * ordered[len(ordered) // 2]:.1f} "
+                            f"p90 {1e6 * ordered[int(0.9 * (len(ordered) - 1))]:.1f} "
+                            f"max {1e6 * ordered[-1]:.1f}"
+                        )
+                        for name, (calls, secs, workspace) in self._recipe_snapshot[:10]:
+                            ovh = self._sync_snapshot.get(name, (0, 0.0))[1]
+                            corrected = secs - calls * HOST_CALL_S - ovh
+                            info(
+                                f"  recipe {name[:44]:<44} calls {calls:>3} "
+                                f"raw {1e3 * secs:6.2f} ms "
+                                f"corrected {1e3 * corrected:6.2f} ms "
+                                f"per-call {1e6 * corrected / calls:6.1f} us "
+                                f"workspace {workspace / 2**20:7.1f} MiB"
+                            )
+                    info(
+                        f"step profile T={T} rows={len(rows)}: launches={LAUNCH_STATS['calls']} "
+                        f"binds={LAUNCH_STATS.get('binds', 0)} launch_calls={LAUNCH_STATS.get('launches', 0)} "
+                        f"enqueue={enqueue:.1f} ms, launch_wall={launch_wall:.1f} ms, "
+                        f"sync+d2h={sample_wall:.1f} ms, step_wall={step_wall:.1f} ms, "
+                        f"residual={step_wall - enqueue - sample_wall:.1f} ms; "
+                        f"pre={1000 * (t_rows - t_enter):.1f} ms "
+                        f"(harvest {1000 * (t_harvest - t_enter):.1f}, "
+                        f"cache_plan {1000 * (t_cache - t_harvest):.1f}, "
+                        f"params {1000 * (t_params - t_cache):.1f}, "
+                        f"rows {1000 * (t_rows - t_params):.1f})"
+                    )
         tok, lp, top_ids, top_lp = (np.concatenate(x) for x in zip(*outs, strict=True))
         counts = np.ones(len(tok), np.int64)
         columns = (
@@ -314,6 +501,10 @@ class DeepSeekV41GaudiRunner:
         )
         if prompt:
             columns.update(Qwen3_5GaudiRunner._prompt_columns(plan, prompt_scores))
+        if profile_step and getattr(self, "_last_step_end", None) is not None:
+            info(
+                f"step post: {1000 * (time.perf_counter() - self._last_step_end):.1f} ms"
+            )
         return ForwardOutput(
             token_ids=np.asarray(tok, np.uint32),
             token_indptr=np.arange(len(tok) + 1, dtype=np.uint32),
@@ -354,6 +545,17 @@ class DeepSeekV41GaudiRunner:
             or any(media is not None for media in plan.media)
             or not self.model.hashed(Shape(MAX_T, False))
         ):
+            # The last clause is load-bearing in host mode, and it is not a bug to "fix": with the
+            # Engram tables on the host, `hashed` is False for every decode shape, so every decode
+            # plan takes this synchronous path. That is what makes host-mode decode correct - a
+            # fresh plan carries the previous step's sampled tokens in `batch.token_ids`, so the
+            # Engram hash and `Row.before` see real tokens. Drop the clause to keep a continuation
+            # and the Engine hands over a *conservative bound*, one position stale
+            # (crates/resin-core/src/engine.rs: "the longest possible previous output"), which
+            # model.py's `tokens is None` ValueError then rejects; drop that check too and the
+            # stale token is hashed and recorded in EngramContext, poisoning every later
+            # Row.before for the sequence - wrong text, no error. Host mode has no overlap to
+            # recover anyway: the next step's rows need this step's sampled token on the host.
             self._harvest()
             return self.forward(plan)
         self._check_compiles()

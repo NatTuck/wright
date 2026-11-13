@@ -4,8 +4,11 @@ DS41_CHECKPOINT set, also on real tensors of layer 0."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import struct
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -188,6 +191,41 @@ def test_mx8_rows_pads_k_to_tau_blocks():
     np.testing.assert_array_equal(tau.row_scales, natural.row_scales)
 
 
+def test_engram_lut_is_bit_identical_to_the_expression_it_replaced():
+    """All 65,536 (scale, code) pairs against the per-element code the table replaced.
+
+    The comment above `_ENGRAM_LUT` claims bit-identity, so the claim is checked rather than
+    trusted. The scope matters: the replaced expression formed its exponent in f32
+    (`s.astype(np.float32) - 127`) and cast once, and the table does the same, so they agree at
+    every byte including 254 and 255. A form that formed the exponent in float64 would NOT agree -
+    the last two assertions pin where and how, so nobody "fixes" the table toward float64 without
+    seeing that it would change the output dtype.
+    """
+    from resin_models_gaudi.deepseek_v41.weights import _ENGRAM_LUT
+
+    codes = np.arange(256, dtype=np.uint8).reshape(1, 256)
+    for scale in range(256):
+        s = np.full((1, 8), scale, np.uint8)
+        with np.errstate(over="ignore", invalid="ignore"):
+            old = OCP[codes] * np.exp2(s.astype(np.float32) - 127).repeat(32, axis=1)
+            old = old.astype(np.float32)
+        new = _ENGRAM_LUT[s.reshape(1, 8)[:, :, None], codes.reshape(1, 8, 32)].reshape(1, 256)
+        np.testing.assert_array_equal(new, old)
+
+    # The branch's actual change is f64 -> f32 for the exponent, so pin where the two tables diverge:
+    # MEASURED, they are equal for scales 0..246 and differ from 247 up (448 * 2^120 leaves f32
+    # range). A future change back to f64 fails here, which is the point.
+    f64 = OCP[None, :] * np.exp2(np.arange(256, dtype=np.float64) - 127.0)[:, None]
+    differing = [
+        s for s in range(256) if not np.array_equal(_ENGRAM_LUT[s].astype(np.float64), f64[s])
+    ]
+    assert differing == list(range(247, 256))
+    # and the two figures the comment states, which are the whole reason 254/255 are called out
+    assert int(np.count_nonzero(np.isfinite(f64[254]) & ~np.isfinite(_ENGRAM_LUT[254]))) == 126
+    assert not np.any(np.isfinite(_ENGRAM_LUT[255]))
+    assert np.all(np.isfinite(f64[255]))  # finite in float64, not in f32
+
+
 def test_expert_k_per_expert_when_the_tensor_spreads_too_far():
     """One exponent for the tensor when every block stays exact under it, else each expert's own."""
     from resin_models_gaudi.deepseek_v41.weights import expert_k
@@ -196,3 +234,162 @@ def test_expert_k_per_expert_when_the_tensor_spreads_too_far():
     assert expert_k(narrow).tolist() == [125 - 132, 125 - 132]
     wide = np.array([[100, 110], [120, 125]], np.uint8)  # 25 exponents over the tensor, <= 13 per expert
     assert expert_k(wide).tolist() == [110 - 132, 125 - 132]
+
+
+# ------------------------------------------------------------------ the host Engram gather
+# The residency monitor runs inside `engram_rows`, i.e. inside a request. Its fallback path used to
+# raise BufferError out of `mapping.close()` (numpy still held an exported buffer on the mmap) and
+# it closed before clearing the registry, so a residency drop mid-request killed the request and
+# left live numpy arrays over unmapped memory. These two tests drive the fallback directly; both
+# fail on that code and neither needs a device.
+@pytest.fixture
+def engram_gather(tmp_path, monkeypatch):
+    """One Engram layer's shard mapped through the gather's own mmap path.
+
+    Yields (module, reader, row ids, expected rows) with ``_ENGRAM_MODE == "mmap"`` and the maps
+    live. Restores every module global it touches and unmaps what is left, so no test leaks state.
+    """
+    from resin_models_gaudi.deepseek_v41 import weights as W
+
+    rows, name = 64, "model-00001-of-00001.safetensors"
+    rng = np.random.default_rng(7)
+    codes = rng.integers(0, 0x78, (rows, 256), dtype=np.uint8)  # finite E4M3 codes only
+    scales = rng.integers(120, 129, (rows, 8), dtype=np.uint8)
+    write_safetensors(
+        tmp_path / name,
+        {
+            "layers.0.engram.embed.weight": ("F8_E4M3", codes),
+            "layers.0.engram.embed.scale": ("F8_E8M0", scales),
+        },
+    )
+    expected = (
+        OCP[codes] * np.exp2(scales.astype(np.float64) - 127.0).repeat(32, axis=1)
+    ).astype(np.float32)
+
+    names = (
+        "_ENGRAM_MODE",
+        "_ENGRAM_RESIDENT",
+        "_ENGRAM_MAPS",
+        "_ENGRAM_CHECKPOINT",
+        "_ENGRAM_SHARDS",
+        "_ENGRAM_LAST_CHECK",
+    )
+    saved = {field: getattr(W, field) for field in names}
+    W._ENGRAM_MAPS = {}
+    W._ENGRAM_MODE, W._ENGRAM_RESIDENT = "mmap", 1.0
+    W._ENGRAM_CHECKPOINT, W._ENGRAM_SHARDS = tmp_path, {0: name}
+    W._ENGRAM_LAST_CHECK = time.monotonic() - 1000.0  # past the re-check interval
+    try:
+        W._engram_maps()
+        ids = np.array([3, 0, 63, 17], np.int64)
+        yield W, reader(tmp_path), ids, expected
+    finally:
+        for _weight, _scale, mapping, _raw in W._ENGRAM_MAPS.values():
+            try:
+                mapping.close()
+            except Exception:  # noqa: BLE001 - teardown must not mask the test's failure
+                pass
+        for field, value in saved.items():
+            setattr(W, field, value)
+
+
+def _below_the_floor(monkeypatch, W):
+    """Make the periodic residency check read a table that fell out of page cache."""
+    monkeypatch.setattr(W, "_engram_residency", lambda *a, **k: 0.0)
+    # the gather itself calls the monitor, which stamps the interval: force the next call past it
+    W._ENGRAM_LAST_CHECK = time.monotonic() - 1000.0
+
+
+@contextmanager
+def _wright_warnings():
+    """The WARNING records this module's logger emits, collected directly.
+
+    Not `caplog`: caplog sees records through the root handler, so a test elsewhere in the session
+    that turns off propagation or replaces the handlers silently empties it - which made this
+    assertion pass alone and fail in the full suite.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Collect()
+    logger = logging.getLogger("wright")
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_engram_monitor_falls_back_without_raising(engram_gather, monkeypatch):
+    """A residency drop mid-request: the gather must switch to pooled, not kill the request.
+
+    RED on the old code: `mapping.close()` raised BufferError (numpy held the mmap's exported
+    buffer) and `except OSError` did not catch it, so this call escaped into the request.
+    """
+    W, src, ids, expected = engram_gather
+    assert W._ENGRAM_MODE == "mmap" and set(W._ENGRAM_MAPS) == {0}
+    np.testing.assert_array_equal(W.engram_rows(src, 0, ids), expected[ids])
+
+    # count the close, so "views dropped before close" cannot pass by never closing at all
+    layer = next(iter(W._ENGRAM_MAPS))
+    closed: list = []
+
+    class _Counting:
+        def __init__(self, mapping):
+            self.mapping = mapping
+
+        def close(self):
+            closed.append(self.mapping)
+            self.mapping.close()
+
+    weight, scale, mapping, raw = W._ENGRAM_MAPS[layer]
+    W._ENGRAM_MAPS[layer] = (weight, scale, _Counting(mapping), raw)
+    # and drop the test's own references: a view held here would keep the mmap's export alive and
+    # turn this into the racing-gather case (the other test), not the clean one
+    del weight, scale, mapping, raw
+
+    _below_the_floor(monkeypatch, W)
+    with _wright_warnings() as records:
+        W._engram_monitor()  # must not raise
+
+    assert W._ENGRAM_MODE == "pooled"
+    assert W._ENGRAM_MAPS == {}
+    # the mapping was really closed, and the close did not fail (the views were gone first)
+    assert len(closed) == 1 and closed[0].closed
+    assert not any("unmapping" in record.getMessage() for record in records)
+    # and the request it was called from still gets its rows, now from the pooled gather
+    np.testing.assert_array_equal(W.engram_rows(src, 0, ids), expected[ids])
+
+
+def test_engram_monitor_falls_back_even_when_close_fails(engram_gather, monkeypatch):
+    """The contract is "a monitor failure never takes a request down", not "close() works".
+
+    The unmap is best-effort: the mode and the registry are what the gather reads, so they must
+    change first and the fallback must happen even when closing the mapping itself fails.
+    """
+
+    class Unclosable:
+        """Stands in for the mmap: `close()` fails the way a racing gather would make it fail."""
+
+        def __init__(self, mapping):
+            self.mapping = mapping  # keep the real map alive so the views stay valid
+
+        def close(self):
+            raise OSError(5, "Input/output error")
+
+    W, src, ids, expected = engram_gather
+    layer, (weight, scale, mapping, raw) = next(iter(W._ENGRAM_MAPS.items()))
+    W._ENGRAM_MAPS[layer] = (weight, scale, Unclosable(mapping), raw)
+
+    _below_the_floor(monkeypatch, W)
+    with _wright_warnings() as records:
+        W._engram_monitor()  # must not raise even though close() does
+
+    assert W._ENGRAM_MODE == "pooled"
+    assert W._ENGRAM_MAPS == {}
+    assert any("unmap" in record.getMessage() for record in records)
+    np.testing.assert_array_equal(W.engram_rows(src, 0, ids), expected[ids])
+

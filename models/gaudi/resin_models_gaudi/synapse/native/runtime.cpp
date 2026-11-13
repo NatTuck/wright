@@ -446,36 +446,89 @@ RG_API int rg_launch(int ri) {
 }
 
 // ---------------------------------------------------------------- profiling
+// The trace type is selectable because the plugin phase and the requested type must agree:
+// profileApi + synTraceAll collects host API events only, and the device phase rejects a
+// mismatched type with a generic status 26. RESIN_PROF_TRACE_TYPE=all|device|host.
+static synTraceType rg_trace_type() {
+    const char* t = getenv("RESIN_PROF_TRACE_TYPE");
+    if (!t) return synTraceAll;
+    if (!strcmp(t, "device")) return synTraceDevice;
+    if (!strcmp(t, "host")) return synTraceHost;
+    return synTraceAll;
+}
 RG_API int rg_prof_start() {
     uint32_t bytes = 0;
     synStatus s = synProfilerQueryRequiredMemory(g_dev, &bytes);
     if (s != synSuccess && s != synUnsupported) { fail(s, "synProfilerQueryRequiredMemory"); return -1; }
+    fprintf(stderr, "[prof] required_bytes=%u type=%d\n", bytes, (int)rg_trace_type());
     if (bytes) {
         uint64_t buf = 0;
         CHK(synDeviceMalloc(g_dev, bytes, 0, 0, &buf));
         CHK(synProfilerSetUserBuffer(g_dev, (void*)buf));
     }
-    CHK(synProfilerStart(synTraceAll, g_dev));
+    CHK(synProfilerStart(rg_trace_type(), g_dev));
     return 0;
 }
-RG_API int rg_prof_stop(const char* tsv_path) {
-    CHK(synStreamSynchronize(g_stream));
-    CHK(synProfilerStop(synTraceAll, g_dev));
-    size_t bytes = 0, entries = 0;
-    CHK(synProfilerGetTrace(synTraceAll, g_dev, synTraceFormatTEF, nullptr, &bytes, &entries));
-    std::vector<unsigned char> buf(bytes);
-    CHK(synProfilerGetTrace(synTraceAll, g_dev, synTraceFormatTEF, buf.data(), &bytes, &entries));
-    FILE* f = fopen(tsv_path, "w");
-    if (!f) { snprintf(g_err, sizeof(g_err), "prof_stop: cannot write %s", tsv_path); return -1; }
-    fprintf(f, "ph\tengine_type\tengine_index\tts\tdur\tname\tcategory\tmeta\n");
-    auto* ev = reinterpret_cast<synTraceEvent*>(buf.data());
+// RESIN_PROF_DUMP_UNION=<path> writes the raw bytes of every event's `arguments` union beside
+// the TSV, with the buffer bounds. Which member of that union is live depends on `ph`, and the
+// header does not say which; this dump is how the mapping was read off a real trace instead of
+// guessed, and it is how a later trace can be re-checked.
+static void rg_dump_union(const char* path, synTraceEvent* ev, size_t entries,
+                          const std::vector<unsigned char>& buf) {
+    FILE* f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "[prof] cannot write %s\n", path); return; }
+    fprintf(f, "# buf_base=0x%llx buf_bytes=%zu entries=%zu\n",
+            (unsigned long long)reinterpret_cast<uintptr_t>(buf.data()), buf.size(), entries);
+    fprintf(f, "ph\tengine_type\tengine_index\tname\tcategory\tunion_hex\n");
     for (size_t i = 0; i < entries; i++) {
         auto& e = ev[i];
-        fprintf(f, "%c\t%u\t%u\t%.3Lf\t%.3Lf\t%s\t%s\t%s\n", e.type ? e.type : '?', e.engineType, e.engineIndex,
-                e.timestamp, e.duration, e.name ? e.name : "", e.category ? e.category : "",
-                (e.type == 'M' && e.arguments.name) ? e.arguments.name : "");
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(&e.arguments);
+        char hex[129];
+        for (int b = 0; b < 64; b++) snprintf(hex + 2 * b, 3, "%02x", raw[b]);
+        fprintf(f, "%c\t%u\t%u\t%s\t%s\t%s\n", e.type ? e.type : '?', e.engineType,
+                e.engineIndex, e.name ? e.name : "", e.category ? e.category : "", hex);
     }
     fclose(f);
+}
+
+RG_API int rg_prof_stop(const char* tsv_path) {
+    CHK(synStreamSynchronize(g_stream));
+    CHK(synProfilerStop(rg_trace_type(), g_dev));
+    size_t bytes = 0, entries = 0;
+    CHK(synProfilerGetTrace(rg_trace_type(), g_dev, synTraceFormatTEF, nullptr, &bytes, &entries));
+    std::vector<unsigned char> buf(bytes);
+    CHK(synProfilerGetTrace(rg_trace_type(), g_dev, synTraceFormatTEF, buf.data(), &bytes, &entries));
+    FILE* f = fopen(tsv_path, "w");
+    if (!f) { snprintf(g_err, sizeof(g_err), "prof_stop: cannot write %s", tsv_path); return -1; }
+    fprintf(f, "ph\tengine_type\tengine_index\tts\tdur\tname\tcategory\tmeta\trecipe_id\trecipe_name\n");
+    auto* ev = reinterpret_cast<synTraceEvent*>(buf.data());
+    // Columns 9-10 come from the union's event-args member (synapse_common_types.h:451-461), which
+    // is what carries recipeId (uint16, line 455) and recipeName (line 456). The union is untagged
+    // and `ph` selects the member, but the header never spells that out: a metadata event ('M')
+    // stores {name, group} at the same offset (synapse_common_types.h:478-482) and a counter event
+    // ('C') stores counter doubles (lines 463-469). Reading the recipe fields off either prints
+    // stale bytes -- measured on a 1801-event trace every 'M' row's recipeName pointer lay outside
+    // the returned buffer (368 of 368) and its "recipeId" was the low half of a name pointer
+    // (51380, 54192, 13107 across traces), which is where the non-UTF-8 bytes that broke parsers
+    // came from. Every other phase in a measured trace carries the event args: 'X' (host API and
+    // device spans), 'B'/'E' pairs, 'i' instants, 'V' (the Recipe Start marker the per-invocation
+    // attribution keys on) and 'f' flow. So those phases get the two columns and 'M'/'C' get '-'.
+    static const auto has_recipe_args = [](char ph) { return ph != 'M' && ph != 'C'; };
+    for (size_t i = 0; i < entries; i++) {
+        auto& e = ev[i];
+        fprintf(f, "%c\t%u\t%u\t%.3Lf\t%.3Lf\t%s\t%s\t%s", e.type ? e.type : '?', e.engineType, e.engineIndex,
+                e.timestamp, e.duration, e.name ? e.name : "", e.category ? e.category : "",
+                (e.type == 'M' && e.arguments.name) ? e.arguments.name : "");
+        if (!has_recipe_args(e.type)) {
+            fprintf(f, "\t-\t-\n");
+        } else {
+            fprintf(f, "\t%u\t%s\n", (unsigned)e.arguments.recipeId,
+                    e.arguments.recipeName ? e.arguments.recipeName : "");
+        }
+    }
+    fclose(f);
+    const char* dump = getenv("RESIN_PROF_DUMP_UNION");
+    if (dump && *dump) rg_dump_union(dump, ev, entries, buf);
     return int(entries);
 }
 

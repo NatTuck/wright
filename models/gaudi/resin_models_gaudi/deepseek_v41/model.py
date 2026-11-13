@@ -22,6 +22,7 @@ Engram hash ids are computed on the host from each row's last tokens (``Row.befo
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -43,6 +44,7 @@ from resin_models_gaudi.deepseek_v41.cache import (
 from resin_models_gaudi.deepseek_v41.rope import cs_table, layer_frequencies
 from resin_models_gaudi.deepseek_v41.weights import (
     RankSlices,
+    configure_engram_gather,
     engram_hash_tables,
     engram_rows,
     engram_table,
@@ -53,6 +55,7 @@ from resin_models_gaudi.deepseek_v41.weights import (
     reader,
     split64,
     table_rows,
+    take_engram_profile,
 )
 from resin_models_gaudi.glm5_3_flash.layers import sample_graph
 from resin_models_gaudi.glm5_3_flash.model import (
@@ -71,6 +74,8 @@ from resin_models_gaudi.synapse.runtime import Device
 
 DECODE_BUCKETS = (1, 2, 4, 8, 16)
 PREFILL_BUCKETS = (32, 128, 512, 1024, 2048)
+_PROFILE_ENGRAM = os.environ.get("RESIN_GAUDI_PROFILE_ENGRAM") == "1"
+
 PAGED_T = 128  # prefill launches this wide decode each routed expert once per page of its rows
 MAX_T = DECODE_BUCKETS[-1]
 TMAX = PREFILL_BUCKETS[-1]
@@ -92,7 +97,23 @@ DSPARK_ROWS = (
 )
 RADIX_MIN = 16384  # decode steps whose columns see more index keys pick their top 512 by radix passes
 J = 24  # Engram rows per column: (max n-gram - 1) x heads
-WORKSPACE_RESERVE = 3 << 30
+# The step tables and the shared workspace are reserved out of the arena. The floor is 4 GiB, not 3,
+# because one recipe needs more than 3: ds41_ffn_paged_T1024 wants 3,600,731,648 B = 3,433.9 MiB =
+# 3.35 GiB (MEASURED with rg_recipe_workspace, STATUS.md §4b) and a 3 GiB floor left it short by
+# 0.46 GiB, so it failed to compile with synDeviceMalloc status=26. Reproduced twice: the 131,072
+# boot (which died at this recipe) and the 8,206 load, plus the settling test that compiled this one
+# recipe ALONE at 131,072 against 2.89 GiB free (§4b) - same weights, same recipe, only max_seq_len
+# differs.
+#
+# What the fix COSTS, computed from the formula below (TMAX = 2048, and the +1 GiB is inside the
+# max) - "about 0.5 GiB" is neither the short-context figure nor the long-context one:
+#   * below ~227k the second term is under 3 GiB, so the floor decides on both sides and the delta
+#     is exactly +1.00 GiB. That is the regime this fix is about: 8,206 and 131,072 both pay 1.00.
+#   * from ~227k the second term passes 3 GiB and the delta tapers (0.688 GiB at 262,144),
+#     reaching zero at ~342k.
+#   * at 512,000 the second term is 5.44 GiB and decides on both sides, so the delta is ZERO: every
+#     512k measurement in this tree was taken with a reserve the 3.35 GiB recipe already fit inside.
+WORKSPACE_RESERVE = 4 << 30
 _HOST_EVENT = 60  # 60, 61: the pinned table copies' uploads
 _STAGE_EVENT = 56  # 56, 57: the sampler's staging copies
 
@@ -291,6 +312,8 @@ class DeepSeekV41Gaudi:
         layers: int | None = None,
         recipes: RecipeCache | None = None,
         engram: str = "card",
+        engram_gather: str = "auto",
+        engram_prewarm: bool = False,
         gather: bool = True,
         weights: dict[str, int] | None = None,
         barrier: Callable[[], None] | None = None,
@@ -349,6 +372,15 @@ class DeepSeekV41Gaudi:
         t0 = time.time()
         self.w = weights if weights is not None else self._load(barrier)
         log(f"ds41 rank {rank}/{nranks}: weights in {time.time() - t0:.0f} s")
+        if self.engram_layers and engram == "host":
+            # the host gather reads the tables out of the checkpoint file; choose how
+            configure_engram_gather(
+                self.checkpoint,
+                self.engram_layers,
+                mode=engram_gather,
+                prewarm=engram_prewarm,
+                log=log,
+            )
         self.eg_vocab = 0
         if self.engram_layers and engram == "card":
             self._hash_tables()
@@ -1131,6 +1163,10 @@ class DeepSeekV41Gaudi:
         if prefill and len(rows) != 1:
             raise ValueError("a prefill step runs one row")
         if tokens is None and not self.hashed(s):
+            # Keep this check: it is the invariant that device tokens need the tables on the cards.
+            # In host mode it cannot fire, because runner.enqueue diverts every decode plan to
+            # forward() (which passes real tokens) when `hashed` is False. Relaxing it lets a
+            # continuation's stale bound token reach `v["tok"]` and poison the Engram hash.
             raise ValueError(
                 "device tokens need a decode step with the Engram tables on the cards"
             )
@@ -1139,6 +1175,8 @@ class DeepSeekV41Gaudi:
         self._host_turn ^= 1
         if self._host_pending[k]:
             dev.wait(_HOST_EVENT + k)
+        profile = _PROFILE_ENGRAM
+        t_fill = time.perf_counter() if profile else 0.0
         counts = self._fill(
             k,
             tb,
@@ -1146,7 +1184,9 @@ class DeepSeekV41Gaudi:
             np.asarray(positions),
             rows,
         )
+        t_h2d = time.perf_counter() if profile else 0.0
         dev.h2d_async(self.table, self.host[k][: tb.nbytes])
+        t_launch = time.perf_counter() if profile else 0.0
         dev.record(_HOST_EVENT + k)
         self._host_pending[k] = True
         if tokens is None:
@@ -1222,6 +1262,18 @@ class DeepSeekV41Gaudi:
                 self.logits + 4 * d.vocab * int(logits), self.logits_all, d.vocab
             )
             self._column = True
+        if profile:
+            dev.sync()
+            gather = take_engram_profile()
+            total = time.perf_counter() - t_fill
+            self.log(
+                f"engram profile T={s.T} rows={gather['rows']}: fill {1000 * (t_h2d - t_fill):.1f} ms "
+                f"(gather {1000 * (gather['read'] + gather['expand']):.1f} = read "
+                f"{1000 * gather['read']:.1f} + expand {1000 * gather['expand']:.1f}), "
+                f"h2d {1000 * (t_launch - t_h2d):.1f} ms ({tb.nbytes / 2**20:.1f} MiB), "
+                f"enqueue+sync {1000 * (time.perf_counter() - t_launch):.1f} ms, "
+                f"total {1000 * total:.1f} ms"
+            )
         return T
 
     # ------------------------------------------------------------------ DSpark

@@ -103,6 +103,9 @@ def server_arguments(
     parallel: int = -1,
     batch_size: int | None = None,
     draft_tokens: int | None = None,
+    engram: str | None = None,
+    engram_gather: str | None = None,
+    engram_prewarm: bool | None = None,
     model_draft: Path | None = None,
     device: str | None = None,
     ranks: int | None = None,
@@ -130,6 +133,8 @@ def server_arguments(
         ("--max-batch-size", parallel if parallel > 0 else None),
         ("--prefill-chunk-size", batch_size),
         ("--draft-tokens", draft_tokens),
+        ("--engram", engram),
+        ("--engram-gather", engram_gather),
         ("--assistant-checkpoint", model_draft),
         ("--gpu", device_modules(device) if device else None),
         ("--ranks", ranks),
@@ -142,6 +147,8 @@ def server_arguments(
     ):
         if value is not None:
             line += [flag, str(value)]
+    if engram_prewarm is not None:
+        line += ["--engram-prewarm" if engram_prewarm else "--no-engram-prewarm"]
     line += [
         "--numa",
         numa.value,
@@ -337,6 +344,34 @@ def serve(
             rich_help_panel=_WRIGHT,
         ),
     ] = None,
+    engram: Annotated[
+        str | None,
+        typer.Option(
+            metavar="MODE",
+            help="Where the DeepSeek-V4.1 Engram tables live: 'card' or 'host'. Host keeps them "
+            "in the checkpoint's file and gathers rows each step, which is what makes four cards "
+            "possible. (default: the model's)",
+            rich_help_panel=_WRIGHT,
+        ),
+    ] = None,
+    engram_gather: Annotated[
+        str | None,
+        typer.Option(
+            metavar="HOW",
+            help="How the host gather reads the tables: 'pooled', 'mmap', or 'auto' by measured "
+            "page-cache residency. (default: the model's)",
+            rich_help_panel=_WRIGHT,
+        ),
+    ] = None,
+    engram_prewarm: Annotated[
+        bool | None,
+        typer.Option(
+            "--engram-prewarm/--no-engram-prewarm",
+            help="Read the two Engram shards once at startup (189 GiB, ~114 s) so the gather can "
+            "map them. (default: the model's)",
+            rich_help_panel=_WRIGHT,
+        ),
+    ] = None,
     spin_wait: Annotated[
         float | None,
         typer.Option(
@@ -433,6 +468,9 @@ def serve(
         parallel=parallel,
         batch_size=batch_size,
         draft_tokens=spec_draft_n_max,
+        engram=engram,
+        engram_gather=engram_gather,
+        engram_prewarm=engram_prewarm,
         model_draft=model_draft,
         device=device,
         ranks=None if ranks == 4 and preset.endswith("-tp4") else ranks,

@@ -12,6 +12,7 @@ import ctypes as C
 import mmap
 import os
 import tempfile
+import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -223,6 +224,22 @@ class Graph:
             self.destroyed = True
 
 
+# RESIN_GAUDI_PROFILE_STEP=1 counts the launches a step issues and the host time it spends
+# issuing them. Every launch on this path goes through Recipe.launch or LaunchPlan.run.
+_PROFILE_STEP = os.environ.get("RESIN_GAUDI_PROFILE_STEP") == "1"
+LAUNCH_STATS = {"calls": 0, "seconds": 0.0}
+# recipe name -> [calls, seconds, workspace bytes]; workspace is read once per recipe
+LAUNCH_BY_RECIPE: dict[str, list] = {}
+# per-call times of the last step, for the distribution
+LAST_CALLS: list[float] = []
+
+
+def reset_launch_stats() -> None:
+    LAUNCH_STATS["calls"] = 0
+    LAUNCH_STATS["seconds"] = 0.0
+    LAST_CALLS.clear()
+
+
 @dataclass(slots=True)
 class Recipe:
     """A compiled graph; persistent tensors are bound by name or slot before launch."""
@@ -268,6 +285,12 @@ class Recipe:
         return int(self.device.lib.rg_recipe_workspace(self.handle))
 
     def launch(self) -> None:
+        if _PROFILE_STEP:
+            started = time.perf_counter()
+            self.device.check(self.device.lib.rg_launch(self.handle), f"launch {self.name}")
+            LAUNCH_STATS["calls"] += 1
+            LAUNCH_STATS["seconds"] += time.perf_counter() - started
+            return
         self.device.check(self.device.lib.rg_launch(self.handle), f"launch {self.name}")
 
 
@@ -308,6 +331,15 @@ class LaunchPlan:
     def run(self) -> None:
         lib = self.device.lib
         bind, launch = lib.rg_bind_slots, lib.rg_launch
+        if _PROFILE_STEP:
+            started = time.perf_counter()
+            for handle, slots, addresses, n, name in self._steps:
+                bind(handle, slots, addresses, n)
+                if launch(handle) < 0:
+                    self.device.check(-1, f"launch {name}")
+            LAUNCH_STATS["calls"] += len(self._steps)
+            LAUNCH_STATS["seconds"] += time.perf_counter() - started
+            return
         for handle, slots, addresses, n, name in self._steps:
             bind(handle, slots, addresses, n)
             if launch(handle) < 0:

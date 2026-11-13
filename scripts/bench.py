@@ -271,6 +271,13 @@ def _rank(
     run = (rank, port, report_path, model, checkpoint, case_values, topology, options)
     from resin_models_gaudi.synapse.runtime import claim_card
 
+    if options.get("trace_dir"):
+        # Synapse reads the profiler configuration when it initialises, and that happens when the
+        # card is claimed - so the profiler has to be configured *before* claim_card, not after.
+        # Configured after, synProfilerStart fails with status=18 (Unsupported operation).
+        from resin_models_gaudi.synapse.trace import enable_profiler
+
+        enable_profiler(Path(tempfile.mkdtemp(prefix="resin-synapse-profiler-")))
     with claim_card(rank, numa=options["numa"]) as claim:
         if claim is None:
             raise RuntimeError(f"rank {rank} found no free Gaudi card")
@@ -299,11 +306,6 @@ def _run_rank(
     )
 
     spec = get_model(model)
-    if options.get("trace_dir"):
-        from resin_models_gaudi.synapse.trace import enable_profiler
-
-        # The profiler is configured before the device opens and armed per trace.
-        enable_profiler(Path(tempfile.mkdtemp(prefix="resin-synapse-profiler-")))
     groups = None
     if topology.world_size > 1:
         # A Gloo control plane; the runner owns HCCL. Loading takes minutes per rank.

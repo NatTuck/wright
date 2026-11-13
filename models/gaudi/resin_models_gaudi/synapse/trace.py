@@ -3,6 +3,19 @@
 Device activity is recorded between ``Device.prof_start`` and ``prof_stop``. Call
 ``enable_profiler`` before the device opens. Events are written as a Chrome trace whose
 processes are engine types and whose threads are engine instances.
+
+The configuration below is not free to choose: it is the only combination measured to emit
+device execution records (cases/wright/measurements/profile/matrix/README.md).
+
+  * ``profilePhase`` must be ``profileApi``. ``profileDevice`` is refused by the HwTrace
+    plugin itself ("Profiler phase is not Profile instrumentation (API mode)"), which
+    surfaces as the generic ``synProfilerStart`` status 26. ``profileDevice`` is not even in
+    ``libhw_trace.so``'s phase vocabulary.
+  * the trace *type* selects the device records: ``RESIN_PROF_TRACE_TYPE=device``
+    (``synTraceDevice``). ``synTraceAll`` on this plugin returns host API calls only.
+  * ``outputPerInvocation`` does not gate device records; json alone is the smallest.
+  * the device emits ``B``/``E`` *pairs* with ``dur=0``; a duration is ``ts(E) - ts(B)``.
+    ``recipe_id`` is populated on device rows, ``recipe_name`` almost never.
 """
 
 from __future__ import annotations
@@ -11,20 +24,74 @@ import csv
 import gzip
 import json
 import os
-import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
-_PHASES = {"B", "E", "X", "i", "M"}
+_PHASES = {"B", "E", "X", "i", "M", "V"}
+# `V` is the per-launch `Recipe Start` record: one per recipe launch, carrying the
+# recipe_id and the launch's duration. It is the only program-order marker in a device
+# trace, so a parser needs it to tell one launch of a recipe from the next.
 
 
-def enable_profiler(directory: str | Path) -> None:
+def enable_profiler(
+    directory: str | Path, *, phase: str = "profileApi", trace_type: str = "device"
+) -> None:
     """Configure this process's Synapse profiler (before ``open_device``); the profiler's
-    own output files go to ``directory``."""
+    own output files go to ``directory``.
+
+    ``phase`` defaults to ``profileApi`` because that is the only phase the HwTrace plugin
+    accepts (``profileDevice`` is refused, and is not in the plugin's vocabulary at all).
+    ``trace_type`` is what ``rg_prof_start`` passes to ``synProfilerStart``; ``device`` is
+    the one that emits device execution records.
+
+    Two further settings come from the plugin's own embedded schema
+    (``libhw_trace.so``: ``{"archProfileUnits": ..., "generalOptions": ..., "parseOptions": ...}``)
+    and both are needed for a 512k prefill:
+
+      * ``generalOptions.traceBufferSize`` defaults to ``"0x5000000"`` (80 MiB), which a
+        512k prefill overruns. Raised here to ``RESIN_PROF_BUFFER`` (default ``"0x8000000"``,
+        128 MiB); ``traceBufferLocation`` (``dram``/``host``/``auto``) is pinned explicitly.
+      * ``archProfileUnits.gaudi2.TPC.Gaudi2TpcAdvancedProfiling`` and
+        ``.../MME/Gaudi2MmeAdvancedProfiling`` default to **false**, and with them false the
+        device records are sync-point markers only (categories ``SP n``), not per-kernel
+        records. They are turned on here (``RESIN_PROF_ADVANCED=0`` restores the default).
+        They live under ``archProfileUnits``, NOT under ``generalOptions``: a key in the
+        wrong section is silently ignored by the deserializer.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     json_only = {"value": True}
     off = {"value": False}
+    on = {"value": True}
+    advanced = os.environ.get("RESIN_PROF_ADVANCED", "1") == "1"
+    buffer_size = os.environ.get("RESIN_PROF_BUFFER", "0x8000000")
+    location = os.environ.get("RESIN_PROF_LOCATION", "dram")
+    values = {
+        "generalOptions": {
+            "arch": {"value": "gaudi2"},
+            "profilePhase": {"value": phase},
+            "traceBufferSize": {"value": buffer_size},
+            "traceBufferLocation": {"value": location},
+        },
+        "parseOptions": {
+            "outputPerInvocation": {
+                "binary": off,
+                "csv": off,
+                "dbgInfo": off,
+                "hltv": off,
+                "hltvWithHost": off,
+                "json": json_only,
+                "text": off,
+            }
+        },
+    }
+    if advanced:
+        values["archProfileUnits"] = {
+            "gaudi2": {
+                "TPC": {"Gaudi2TpcAdvancedProfiling": on},
+                "MME": {"Gaudi2MmeAdvancedProfiling": on},
+            }
+        }
     config = {
         "GeneralSettings": {
             "values": {
@@ -41,23 +108,7 @@ def enable_profiler(directory: str | Path) -> None:
             {
                 "lib": "libhw_trace.so",
                 "name": "HwTrace",
-                "values": {
-                    "generalOptions": {
-                        "arch": {"value": "gaudi2"},
-                        "profilePhase": {"value": "profileApi"},
-                    },
-                    "parseOptions": {
-                        "outputPerInvocation": {
-                            "binary": off,
-                            "csv": off,
-                            "dbgInfo": off,
-                            "hltv": off,
-                            "hltvWithHost": off,
-                            "json": json_only,
-                            "text": off,
-                        }
-                    },
-                },
+                "values": values,
             },
         ],
     }
@@ -65,12 +116,37 @@ def enable_profiler(directory: str | Path) -> None:
     path.write_text(json.dumps(config))
     os.environ["HABANA_PROFILE"] = "1"
     os.environ["HABANA_PROF_CONFIG"] = str(path)
+    # The native side reads this to choose synTraceType; without it the type is synTraceAll,
+    # which on this plugin returns host API calls and no device records.
+    os.environ["RESIN_PROF_TRACE_TYPE"] = trace_type
+    (directory / "trace-config.json").write_text(
+        json.dumps(
+            {
+                "profile_phase": phase,
+                "trace_type": trace_type,
+                "output_per_invocation": ["json"],
+                "plugins": ["HostProfiler", "HwTrace"],
+                "trace_buffer_size": buffer_size,
+                "trace_buffer_location": location,
+                "tpc_mme_advanced_profiling": advanced,
+                "DUMP_POST_GRAPHS": os.environ.get("DUMP_POST_GRAPHS"),
+                "HOME": os.environ.get("HOME"),
+                "HABANA_PROFILE": os.environ.get("HABANA_PROFILE"),
+                "resin_prof_trace_type": os.environ.get("RESIN_PROF_TRACE_TYPE"),
+                "config": str(path),
+            },
+            indent=2,
+        )
+    )
 
 
 def chrome_events(tsv: str | Path) -> list[dict]:
     """The profiler's TSV events (``rg_prof_stop``) as Chrome trace events."""
     events = []
-    with open(tsv, newline="") as source:
+    # latin-1, not utf-8: the ``ph=M`` metadata rows carry binary garbage in the union
+    # columns (the writer reads that union as recipe fields), and a strict decode aborts
+    # the whole trace. See measurements/profile/matrix/README.md.
+    with open(tsv, newline="", encoding="latin-1") as source:
         for row in csv.DictReader(source, delimiter="\t"):
             phase = row["ph"]
             if phase not in _PHASES:
@@ -84,12 +160,25 @@ def chrome_events(tsv: str | Path) -> list[dict]:
             }
             if row["category"]:
                 event["cat"] = row["category"]
-            if phase == "X":
+            if phase in ("X", "V"):
                 event["dur"] = float(row["dur"])
             elif phase == "M":
                 event["args"] = {"name": row["meta"]}
             elif phase == "i":
                 event["s"] = "t"
+            if phase != "M":
+                # recipe identity is what makes a device row attributable; it is populated
+                # on device rows and on the `V`/Recipe Start rows, never on metadata rows.
+                # `-` is the writer's "this phase carries no event args" marker (M and C
+                # rows); `0`/empty means the member is live with no recipe.
+                args = event.get("args") or {}
+                recipe = (row.get("recipe_id") or "").strip()
+                if recipe.isdigit() and recipe != "0":
+                    args["recipe_id"] = int(recipe)
+                if row.get("recipe_name") and row["recipe_name"] != "-":
+                    args["recipe_name"] = row["recipe_name"]
+                if args:
+                    event["args"] = args
             events.append(event)
     return events
 
@@ -106,23 +195,78 @@ def perfetto_trace(
     ``decode_passes`` completions per case, written as compressed Chrome traces."""
     if type(decode_passes) is not int or decode_passes < 1:
         raise ValueError("decode_passes must be a positive integer")
+    # A prefill cohort at 512k is 250 chunk-steps x ~109 launches and two of them overflow any
+    # trace buffer worth allocating (measured ~830 device events per launch, so one cohort is
+    # ~2e7 events). Two is still the DEFAULT, because it is the only setting under which the
+    # truncation check can fail: with one pass a truncated trace still shows exactly one unit and
+    # the "units detected == passes recorded" assertion passes by construction. That is the
+    # failure STATUS.md section 13 records - a 102 ms fragment read as a 16.38 s cohort - so a
+    # buffer that cannot hold two cohorts must be raised (RESIN_PROF_BUFFER), and a trace that
+    # does not fit is now REFUSED by trace_union rather than quoted.
+    prefill_passes = int(os.environ.get("RESIN_TRACE_PREFILL_PASSES", "2"))
+    if prefill_passes < 1:
+        raise ValueError("RESIN_TRACE_PREFILL_PASSES must be a positive integer")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
 
     def trace(case, run_pass):
         name = f"{case.phase}-ctx{case.context_length}-b{case.batch_size}-rank{rank:03}"
-        passes = decode_passes if case.phase == "decode" else 2
+        passes = decode_passes if case.phase == "decode" else prefill_passes
         unit = "decode completions" if case.phase == "decode" else "prefill cohorts"
         device.sync()
         device.prof_start()
+        # The raw TSV is the attributable artifact (it carries recipe_id and both halves of
+        # every B/E pair); the Chrome JSON is a view of it. Keep both.
+        tsv = directory / f"{name}.tsv"
+        pass_results = []
         try:
             for _ in range(passes):
-                run_pass()
+                pass_results.append(run_pass())
         finally:
-            with tempfile.TemporaryDirectory(prefix="resin-synapse-trace-") as staging:
-                tsv = Path(staging) / f"{name}.tsv"
-                device.prof_stop(tsv)
-                events = chrome_events(tsv)
+            device.prof_stop(tsv)
+
+        # WRITE THE CONFIG BEFORE THE CHROME JSON. The JSON is the artifact that grows to
+        # gigabytes and gets killed; the config is a kilobyte and must not die with it. Our own
+        # 8192 prefill run is the proof: the hook died inside the JSON write and took the config
+        # with it, so the pass count had to be reconstructed by hand and the completeness
+        # argument had to fall back on triangulation.
+        #
+        # `prefill_seconds` here is the harness's own timing for the passes just traced (the
+        # trace pass returns the seconds it spent per prefill cohort), so trace_union can gate a
+        # trace against the run that produced it instead of a number an operator typed.
+        seconds = [
+            float(result["seconds"])
+            for result in pass_results
+            if isinstance(result, dict) and isinstance(result.get("seconds"), (int, float))
+        ]
+        config_values = {
+            "phase": case.phase,
+            "context_length": case.context_length,
+            "batch_size": case.batch_size,
+            "shared_prefix_tokens": case.shared_prefix_tokens,
+            "rank": rank,
+            "passes": passes,
+            "unit": unit,
+            "model": (metadata or {}).get("model"),
+            "checkpoint": (metadata or {}).get("checkpoint"),
+            "hardware": (metadata or {}).get("hardware"),
+            "profile_phase": "profileApi",
+            "resin_prof_trace_type": os.environ.get("RESIN_PROF_TRACE_TYPE"),
+            "output_per_invocation": ["json"],
+            "trace_buffer_size": os.environ.get("RESIN_PROF_BUFFER"),
+            "trace_buffer_location": os.environ.get("RESIN_PROF_LOCATION"),
+            "DUMP_POST_GRAPHS": os.environ.get("DUMP_POST_GRAPHS"),
+            "HOME": os.environ.get("HOME"),
+            "HABANA_PROFILE": os.environ.get("HABANA_PROFILE"),
+            "tsv": str(tsv),
+        }
+        if seconds:
+            config_values["prefill_seconds"] = sum(seconds) / len(seconds)
+            config_values["prefill_seconds_per_pass"] = seconds
+        (directory / f"{name}-config.json").write_text(
+            json.dumps(config_values, indent=2)
+        )
+        events = chrome_events(tsv)
         busy = sum(event["ph"] in ("B", "X") and event["pid"] != 0 for event in events)
         trace_data = {
             "traceEvents": events,

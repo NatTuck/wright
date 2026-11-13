@@ -31,6 +31,7 @@ from deploy.models import (
     checkpoint_weight_bytes,
     create_recipe,
     create_runner,
+    engram_table_bytes,
     gaudi_supports_ranks,
     get_model,
     require_checkpoint,
@@ -44,10 +45,25 @@ logger = logging.getLogger("wright")
 EXIT_REPORTED = 78
 # A rank exits with this code when a signal stops it during the load.
 EXIT_STOPPED = 79
-# Recipe workspaces and slack that the KV pool leaves free on a card.
-_WORKSPACE_BYTES = 3 << 30
 # Rank 0 and its followers need this long to shut down after the drain.
 _SHUTDOWN_SECONDS = 60.0
+
+
+def workspace_bytes() -> int:
+    """Recipe workspaces and slack that the KV pool leaves free on a card, for the pre-load estimate.
+
+    Read from the model family with the largest reserve instead of duplicated here: a second constant
+    that has to agree with the loader's is the defect that produced the short-context load failure
+    (deepseek_v41's floor went 3 -> 4 GiB when `ds41_ffn_paged_T1024` turned out to need 3.35 GiB,
+    and this estimate kept saying 3). The other families are smaller - glm5_3_flash 3 GiB, qwen3_5
+    2 GiB, mistral_large4 0.5 GiB - so taking the largest is also the conservative estimate.
+
+    Imported lazily: the estimate runs once at startup, and the module that defines the constant is
+    the one being served.
+    """
+    from resin_models_gaudi.deepseek_v41.model import WORKSPACE_RESERVE
+
+    return WORKSPACE_RESERVE
 
 
 def batch_tokens(runner, prefill_chunk_size: int) -> int:
@@ -65,7 +81,7 @@ def current_device_free() -> int:
 def estimate_kv_pool(free: int, weight_bytes: int, ranks: int) -> None:
     """The limit on the KV pool, before the load: what the weights leave free on one card. Graph
     buffers and the memory share of the preset take more, so the report after the load is smaller."""
-    left = free - weight_bytes // ranks - _WORKSPACE_BYTES
+    left = free - weight_bytes // ranks - workspace_bytes()
     logger.info(
         f"KV pool: at most {left / 2**30:.0f} GiB per card, {left * ranks / 2**30:.0f} GiB in "
         f"total, from {free / 2**30:.0f} GiB free and {weight_bytes / ranks / 2**30:.0f} GiB of "
@@ -174,6 +190,26 @@ def argument_parser() -> argparse.ArgumentParser:
         "--num-layers",
         type=positive_int,
         help="test only: run the first N layers of a tensor-parallel preset, skip the fit check",
+    )
+    parser.add_argument(
+        "--engram",
+        choices=("card", "host"),
+        help="where the DeepSeek Engram tables live: on the cards, or in the checkpoint's file, "
+        "gathered on the host each step (default: the preset's)",
+    )
+    parser.add_argument(
+        "--engram-gather",
+        choices=("pooled", "mmap", "auto"),
+        help="how the host Engram gather reads the checkpoint: one preadv per row through a thread "
+        "pool, a mapped shard gathered with numpy, or auto by measured page-cache residency "
+        "(default: the preset's)",
+    )
+    parser.add_argument(
+        "--engram-prewarm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="read the two Engram shards once at startup (189 GiB, ~114 s) so the gather can map "
+        "them; without it the gather stays on the pooled path (default: the preset's)",
     )
     parser.add_argument(
         "--numa",
@@ -289,6 +325,15 @@ def _validate(parser, args, spec) -> None:
         and not 0 < args.gpu_memory_utilization < 1
     ):
         parser.error("--gpu-memory-utilization takes a value above 0 and below 1")
+    if spec.family != "deepseek_v41" and (
+        args.engram is not None
+        or args.engram_gather is not None
+        or args.engram_prewarm is not None
+    ):
+        parser.error(
+            f"{spec.name} has no Engram tables; --engram, --engram-gather and --engram-prewarm "
+            "are DeepSeek-V4.1 only"
+        )
     problem = check_listen_address(args.host, args.port)
     if problem is not None:
         parser.error(problem)
@@ -415,6 +460,11 @@ def serve_gaudi_ranks(parser, args, spec) -> None:
 
     ranks = args.ranks or spec.world_size
     draft_tokens = spec.draft_tokens if args.draft_tokens is None else args.draft_tokens
+    engram = args.engram or spec.engram
+    engram_gather = args.engram_gather or spec.engram_gather
+    engram_prewarm = (
+        spec.engram_prewarm if args.engram_prewarm is None else args.engram_prewarm
+    )
     if args.gpu_memory_utilization is not None:
         parser.error(f"{spec.name} sizes its KV cache from free memory on every rank")
     try:
@@ -450,6 +500,10 @@ def serve_gaudi_ranks(parser, args, spec) -> None:
         numa=args.numa,
         checkpoint=str(checkpoint),
         weight_bytes=checkpoint_weight_bytes(spec, checkpoint),
+        engram=engram,
+        engram_gather=engram_gather,
+        engram_prewarm=engram_prewarm,
+        engram_bytes=engram_table_bytes(spec, checkpoint) if engram == "host" else 0,
         tokenizer=None if args.tokenizer is None else str(args.tokenizer),
         alias=args.alias,
         assistant=(
@@ -519,7 +573,7 @@ def _startup_problem(options: dict, states: list[tuple[int, int] | None]) -> str
         )
     if options["num_layers"] is None:
         free = min(state[1] for state in states if state is not None)
-        share = options["weight_bytes"] // len(states)
+        share = (options["weight_bytes"] - options["engram_bytes"]) // len(states)
         if share > free:
             return (
                 f"{options['model']} does not fit at {len(states)} ranks: its weights need "
@@ -568,7 +622,7 @@ def _serve_claimed_rank(rank: int, options: dict, claim) -> None:
         if options["num_layers"] is None:
             estimate_kv_pool(
                 min(state[1] for state in states if state is not None),
-                options["weight_bytes"],
+                options["weight_bytes"] - options["engram_bytes"],
                 ranks,
             )
     groups = ParallelGroups.create(topology, device_backend="gloo", timeout=timeout)
@@ -584,6 +638,9 @@ def _serve_claimed_rank(rank: int, options: dict, claim) -> None:
         draft_tokens=options["draft_tokens"],
         assistant_checkpoint=options["assistant"],
         num_layers=options["num_layers"],
+        engram=options["engram"],
+        engram_gather=options["engram_gather"],
+        engram_prewarm=options["engram_prewarm"],
     )
     worker = DistributedWorker(runner, groups)
     engine = None

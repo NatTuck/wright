@@ -67,6 +67,13 @@ class ModelSpec:
     max_batch_size: int = 128
     prefill_chunk_size: int = 4096
     draft_tokens: int = 0
+    # Where the DeepSeek Engram tables live: "card" (this rank's rows, hashed on the device) or
+    # "host" (read from the checkpoint each step; 4 cards cannot hold both tables).
+    engram: str = "card"
+    # How the host gather reads the tables: "pooled", "mmap", or "auto" by measured residency.
+    engram_gather: str = "auto"
+    # Read the two Engram shards once at startup so the gather can map them.
+    engram_prewarm: bool = False
     gpu_memory_utilization: float = 0.9
     expert_backend: str = "flashinfer"
     memory: int = 256 * 1024
@@ -253,6 +260,36 @@ MODEL_SPECS = {
         draft_tokens=0,
         prefill_chunk_size=2048,
         media=False,
+    ),
+    # Text only: four cards, with the Engram tables left in the checkpoint file and gathered on the
+    # host. The 8-card preset keeps them on the cards; at four cards they do not fit - 188.8 GiB of
+    # tables against 95 GiB free per card - so this preset is host-only, and it pre-warms them
+    # because the host gather is 3.8x faster on a resident table (STATUS.md sections 9-10).
+    "deepseek_v41-gaudi2-tp4": ModelSpec(
+        name="deepseek_v41-gaudi2-tp4",
+        family="deepseek_v41",
+        accelerator="gaudi2",
+        checkpoint=Checkpoint(
+            repo_id="deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            revision="1bae0e1088993b9b82de08f59de5be5a34e42170",
+            directory="",
+            required_files=("config.json", "tokenizer.json", "tokenizer_config.json"),
+            patterns=("*.json", "model*.safetensors"),
+        ),
+        model_mount="/models/deepseek-v41-flash-1017",
+        model_volume="resin-deepseek-v41-flash-1017-models-v1",
+        gpu="HL-225",
+        label="deepseek_v41-gaudi2-tp4",
+        world_size=4,
+        attn_tp=4,
+        context_length=512_000,
+        max_batch_size=8,
+        draft_tokens=0,
+        prefill_chunk_size=2048,
+        media=False,
+        engram="host",
+        engram_gather="auto",
+        engram_prewarm=True,
     ),
     # Text only: the GGUF has no Pixtral tower; the tokenizer and chat template come from
     # the official release (its vocabulary equals the GGUF's, id for id).
@@ -476,6 +513,9 @@ def create_runner(
     gpu_memory_utilization: float | None = None,
     assistant_checkpoint: str | Path | None = None,
     num_layers: int | None = None,
+    engram: str | None = None,
+    engram_gather: str | None = None,
+    engram_prewarm: bool | None = None,
 ):
     """Construct one runner with model-specific cache geometry and draft support."""
     spec = get_model(model)
@@ -496,6 +536,9 @@ def create_runner(
             else Path(assistant_checkpoint)
         ),
         num_layers=num_layers,
+        engram=engram,
+        engram_gather=engram_gather,
+        engram_prewarm=engram_prewarm,
     )
 
 
@@ -512,6 +555,9 @@ def _create_gaudi_runner(
     gpu_memory_utilization: float | None,
     assistant: Path | None = None,
     num_layers: int | None = None,
+    engram: str | None = None,
+    engram_gather: str | None = None,
+    engram_prewarm: bool | None = None,
 ):
     """One Gaudi card per rank, selected by ``hpu:N`` (its accel index) or the first free one."""
     if spec.family == "glm5_3_flash":
@@ -553,6 +599,9 @@ def _create_gaudi_runner(
             max_batch_size=max_batch_size,
             max_seq_len=context_length + draft_tokens,
             num_layers=num_layers,
+            engram=spec.engram if engram is None else engram,
+            engram_gather=spec.engram_gather if engram_gather is None else engram_gather,
+            engram_prewarm=spec.engram_prewarm if engram_prewarm is None else engram_prewarm,
             draft_tokens=draft_tokens,
         )
     if spec.family == "mistral_large4":
@@ -673,6 +722,15 @@ def checkpoint_weight_bytes(spec: ModelSpec, checkpoint: Path) -> int:
         for path in root.iterdir()
         if path.suffix in (".gguf", ".safetensors")
     )
+
+
+def engram_table_bytes(spec: ModelSpec, checkpoint: Path) -> int:
+    """The Engram tables' bytes in the checkpoint: 256 E4M3 bytes and 8 E8M0 scale bytes per row.
+    The host path reads these rows from the file and never copies them to a card."""
+    if spec.family != "deepseek_v41":
+        return 0
+    text = json.loads((checkpoint / "config.json").read_text())["text_config"]
+    return sum(text["engram_num_embeddings"]) * 264
 
 
 def validate_gaudi_options(

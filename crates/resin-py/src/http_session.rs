@@ -13,6 +13,7 @@ use pyo3::{
     types::PyDict,
 };
 use pythonize::pythonize;
+use resin_core::steptimer::{self, Slot};
 use resin_http::{
     EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
 };
@@ -257,6 +258,7 @@ impl Session {
         self.active.len()
     }
     pub fn admit(&mut self, job: GenerationJob) {
+        let _admit = steptimer::span(Slot::Admit);
         if let Some(metrics) = &self.metrics {
             metrics.observe_queue_time(job.enqueued_at.elapsed().as_secs_f64());
         }
@@ -345,6 +347,7 @@ fn process(
         }
         let mut finished = tokens.is_empty().then_some(CompletionReason::Length);
         let mut scores = std::mem::take(&mut request.stream.scores);
+        let parse_span = steptimer::span(Slot::ProcessParse);
         let parsed = (|| -> PyResult<Vec<GenerationEvent>> {
             let mut output = std::mem::take(&mut request.stream.events);
             if tokens.is_empty() {
@@ -413,6 +416,8 @@ fn process(
             }
             Ok(output)
         })();
+        drop(parse_span);
+        let _flush = steptimer::span(Slot::ProcessFlush);
         let delivered = match parsed {
             Ok(events) => {
                 request.stream.events = events;
@@ -427,6 +432,7 @@ fn process(
                 false
             }
         };
+        drop(_flush);
         if !delivered {
             // A full output queue belongs to this client only. Never wait
             // for it from the one inference actor and stall every request.
@@ -740,12 +746,14 @@ impl NativeHttpSession {
         Ok(())
     }
     fn process(&self, py: Python<'_>, events: Vec<Py<TokenEvent>>) -> PyResult<HttpEvents> {
+        let _process = steptimer::span(Slot::Process);
         let events = events
             .into_iter()
             .map(|event| event.bind(py).borrow().clone())
             .collect();
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         inner.0.process(events).map_err(PyRuntimeError::new_err)?;
+        let _drain = steptimer::span(Slot::ProcessDrain);
         let mut output = Vec::new();
         inner.1.retain(|id, receiver| {
             let mut finished = false;

@@ -1,0 +1,197 @@
+"""`trace_union.py` refuses a trace that cannot be shown to cover the cohort it claims.
+
+The tool's truncation checks were all derived from the trace itself, and a 16-chunk trace covering
+102 ms of a 16.38 s cohort passed every one of them (cases/wright/STATUS.md section 13). The
+`--expect-seconds` gate is the check that can see that, so the assertions fail CLOSED: a failed or
+unperformed check refuses the trace and suppresses every accounting number. These are synthetic
+traces - no device, no profiler.
+"""
+
+from __future__ import annotations
+
+import json
+
+from scripts.trace_union import main
+
+PERIOD = 2  # launches per unit, and distinct recipe ids per unit
+
+
+def write_trace(path, *, units=2, phase="prefill", passes=2, config=True):
+    """A minimal device trace: `units` units of PERIOD (Recipe Start, one X interval) launches."""
+    events, ts = [], 0.0
+    for _unit in range(units):
+        for k in range(PERIOD):
+            rid = 10 + k
+            events.append(
+                {
+                    "ph": "V",
+                    "pid": 2028,
+                    "tid": 31,
+                    "ts": ts,
+                    "dur": 1000.0,
+                    "name": "launch",
+                    "cat": "Recipe Start",
+                    "args": {"recipe_id": rid},
+                }
+            )
+            events.append(
+                {
+                    "ph": "X",
+                    "pid": 2028,
+                    "tid": 31,
+                    "ts": ts + 1.0,
+                    "dur": 1000.0,
+                    "name": "n1_rg_swiglu_f32",
+                    "cat": "kernel",
+                    "args": {"recipe_id": rid},
+                }
+            )
+            ts += 1000.0
+    path.write_text(json.dumps({"traceEvents": events}))
+    if config:
+        # one unit is PERIOD launches of 1000 us: the window of a full 2-unit trace is 4000 us
+        beside = path.with_name(path.name.replace(".json", "-config.json"))
+        beside.write_text(
+            json.dumps(
+                {
+                    "phase": phase,
+                    "passes": passes,
+                    "unit": "prefill cohorts" if phase == "prefill" else "decode completions",
+                    "trace_buffer_size": "0x8000000",
+                }
+            )
+        )
+    return path
+
+
+def run(capsys, path, *argv):
+    status = main([str(path), *argv])
+    return status, capsys.readouterr().out
+
+
+def test_a_complete_trace_is_quoted(tmp_path, capsys):
+    """Two passes of one cohort, each unit spanning the harness's prefill_seconds: quotable.
+
+    This is the case the whole-trace gate made impossible (ratio ~2.0), so it is the check that the
+    per-unit window is the right quantity.
+    """
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json")
+    status, out = run(capsys, trace, "--expect-seconds", "0.002")
+    assert status == 0
+    assert "REFUSED" not in out
+    assert "## the step, three numbers" in out
+    assert "mean per-unit device window = 0.002 s over 2 units" in out
+
+
+def test_a_two_pass_trace_whose_units_are_fragments_is_refused(tmp_path, capsys):
+    """Two passes each covering HALF a cohort: the mean unit window is half, so it is refused.
+
+    A complete trace cannot be laundered into quotability by adding passes.
+    """
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json")
+    status, out = run(capsys, trace, "--expect-seconds", "0.004")
+    assert status == 1
+    assert "the units are not whole cohorts" in out
+    assert "## the step, three numbers" not in out
+
+
+def test_a_truncated_trace_is_refused(tmp_path, capsys):
+    """One unit where the config recorded two: the old code printed FAIL and the numbers anyway."""
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json", units=1, passes=2)
+    status, out = run(capsys, trace, "--expect-seconds", "0.004")
+    assert status == 1
+    assert "REFUSED - this trace cannot be quoted" in out
+    assert "truncated or mis-split" in out
+    assert "## the step, three numbers" not in out  # no number may be quoted
+    assert "merged union over every device interval" not in out
+
+
+def test_one_pass_cannot_be_checked_and_is_refused(tmp_path, capsys):
+    """The B4 regression: with one recorded pass the unit check passes by construction."""
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json", units=1, passes=1)
+    status, out = run(capsys, trace, "--expect-seconds", "0.002")
+    assert status == 1
+    # The message no longer says "prefill": the vacuous-unit argument holds in either phase.
+    assert "records 1 pass" in out
+    assert "## the step, three numbers" not in out
+
+
+def test_a_window_that_does_not_match_the_cohort_is_refused(tmp_path, capsys):
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json")
+    status, out = run(capsys, trace, "--expect-seconds", "16.38")
+    assert status == 1
+    assert "the trace is a fragment" in out
+    assert "## the step, three numbers" not in out
+
+
+def test_a_prefill_trace_without_the_cohort_claim_is_refused(tmp_path, capsys):
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json")
+    status, out = run(capsys, trace)
+    assert status == 1
+    # The message names both accepted sources, because the trace's own config is one of them.
+    assert "no prefill_seconds" in out
+    assert "## the step, three numbers" not in out
+
+
+def test_a_trace_without_its_config_is_refused(tmp_path, capsys):
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json", config=False)
+    status, out = run(capsys, trace, "--expect-seconds", "0.004")
+    assert status == 1
+    assert "no <case>-config.json" in out
+    assert "## the step, three numbers" not in out
+
+
+def test_the_refusal_is_written_to_out_so_a_stale_report_cannot_be_quoted(tmp_path, capsys):
+    trace = write_trace(tmp_path / "prefill-ctx512000-b1-rank000.json", units=1)
+    report = tmp_path / "report.md"
+    status, out = run(
+        capsys, trace, "--expect-seconds", "0.004", "--out", str(report)
+    )
+    assert status == 1
+    assert report.read_text() == out
+    assert "REFUSED" in report.read_text()
+    assert "three numbers" not in report.read_text()
+
+
+def test_a_decode_config_carrying_prefill_seconds_is_not_compared_against_it(
+    tmp_path, capsys
+):
+    """`prefill_seconds` is a COHORT's wall time, so it only gates a prefill trace.
+
+    A decode unit is a step. A decode config that happened to carry `prefill_seconds` would be
+    compared against the wrong quantity and refused spuriously -- so the config fallback is
+    phase-gated, and a decode trace can only be given a number explicitly. Absurd value on
+    purpose: 100 s against a decode step window must be ignored, not fatal.
+    """
+    trace = write_trace(tmp_path / "decode-ctx512000-b1-rank000.json", phase="decode")
+    beside = trace.with_name(trace.name.replace(".json", "-config.json"))
+    config = json.loads(beside.read_text())
+    config["prefill_seconds"] = 100.0
+    beside.write_text(json.dumps(config))
+
+    status, out = run(capsys, trace)
+    assert status == 0, out
+    assert "## the step, three numbers" in out
+    assert "harness prefill_seconds" not in out, out
+
+
+def test_a_one_unit_decode_trace_is_refused_because_it_cannot_show_a_fragment(
+    tmp_path, capsys
+):
+    """The vacuous-unit argument is not a prefill argument.
+
+    With ONE unit, "units detected == passes recorded" is true by construction in EITHER phase,
+    so a truncated decode trace passes every internal check. A trace that cannot show a missing
+    unit cannot show a fragment, so a single-unit decode trace is refused with that reason.
+    """
+    trace = write_trace(
+        tmp_path / "decode-ctx512000-b1-rank000.json",
+        phase="decode",
+        units=1,
+        passes=1,
+    )
+    status, out = run(capsys, trace)
+    assert status == 1, out
+    assert "records 1 pass" in out
+    assert "cannot see truncation" in out
+    assert "## the step, three numbers" not in out

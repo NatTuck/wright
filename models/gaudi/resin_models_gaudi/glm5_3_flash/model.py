@@ -20,6 +20,7 @@ token; each chunk stores its last hidden in its STATE block, which the next chun
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -54,9 +55,43 @@ from resin_models_gaudi.glm5_3_flash.weights import NS, RankSlices, Safetensors,
 from resin_models_gaudi.qwen3_5.attention import SlotRow, plan_slots
 from resin_models_gaudi.qwen3_5.model import Sampling
 from resin_models_gaudi.qwen3_5.sampling import PARAMS, TOP_MAX
-from resin_models_gaudi.synapse.graph import Recipe, RecipeCache
+from resin_models_gaudi.synapse.graph import (
+    _PROFILE_STEP,
+    LAST_CALLS,
+    LAUNCH_BY_RECIPE,
+    LAUNCH_STATS,
+    Recipe,
+    RecipeCache,
+)
 from resin_models_gaudi.synapse.progress import info, weight_file_bytes
 from resin_models_gaudi.synapse.runtime import Device
+
+_LAUNCH_MODE = os.environ.get("RESIN_GAUDI_PROFILE_LAUNCH_MODE", "full")
+# Bind once and launch per step: _Op.args is built at construction and the addresses are mutated
+# only in the GLM MTP path and LaunchPlan.patch, so a DeepSeek decode step re-binds 109 identical
+# slot/address arrays every token (~36 us each, ~3.9 ms/step). Default OFF until the token gate
+# proves it bit-identical: RESIN_GAUDI_LAZY_BIND=1 to try it.
+# NEVER enable it for the GLM MTP path: six sites mutate _Op addresses (glm5_3_flash/model.py
+# 805-835, graph.py:331) and lazy bind would leave them stale - silent corruption, not a crash.
+_LAZY_BIND = os.environ.get("RESIN_GAUDI_LAZY_BIND") == "1"
+_SYNC_EVERY = int(os.environ.get("RESIN_GAUDI_PROFILE_SYNC_EVERY", "0") or 0)
+# Sync at every recipe boundary and time the recipe: with the queue drained by the previous sync,
+# (t1 - t0) is host bind+launch plus that recipe's device execution. Recipes are serial, so the sum
+# over recipes is the step's device occupancy - attribution only, never a performance run.
+_RECIPE_DEVICE = os.environ.get("RESIN_GAUDI_PROFILE_RECIPE_DEVICE") == "1"
+_SYNC_COUNT = [0]
+_SYNC_PENDING = [False]
+# the sum of the diagnostic syncs is the serialised device time for the window
+_SYNC_TOTAL = [0.0]
+_SYNC_TIMES: list[float] = []
+# The control for the bracket: a SECOND sync issued immediately after the first, on a queue the
+# first already drained, measures what one sync call costs by itself. Every (t1 - t0) in this mode
+# carries that constant, so it is accumulated here per step (and per recipe) and subtracted in the
+# corrected column. If it were negligible the second sync would read ~0 and the raw column would
+# stand; it is not, so it does not.
+_SYNC_OVERHEAD_TOTAL = [0.0]
+_SYNC_OVERHEAD_COUNT = [0]
+SECOND_SYNC_BY_RECIPE: dict[str, list] = {}
 
 DECODE_BUCKETS = (1, 2, 4, 8, 16)
 MAX_T = DECODE_BUCKETS[-1]
@@ -1311,10 +1346,35 @@ class Staged:
             self.result()
 
 
+
+def _do_bind(lib, args):
+    """rg_bind_slots with a counter: the step profile reports binds per step, so a flag that is set
+    but never consulted on the running path is visible before any token comparison."""
+    LAUNCH_STATS["binds"] = LAUNCH_STATS.get("binds", 0) + 1
+    return lib.rg_bind_slots(*args)
+
+
+def _do_launch(lib, handle):
+    LAUNCH_STATS["launches"] = LAUNCH_STATS.get("launches", 0) + 1
+    return lib.rg_launch(handle)
+
+
+
+def diagnostics() -> str:
+    """The resolved diagnostics, read from the constants the code branches on (not os.environ), so a
+    boot log cannot disagree with the behaviour."""
+    from resin_models_gaudi.synapse.graph import _PROFILE_STEP
+
+    return (
+        f"diagnostics: lazy_bind={_LAZY_BIND} launch_mode={_LAUNCH_MODE} "
+        f"sync_every={_SYNC_EVERY} step_profile={_PROFILE_STEP}"
+    )
+
+
 class _Op:
     """One launch: a recipe and its bindings as prepared slot / address arrays."""
 
-    __slots__ = ("recipe", "slots", "addresses", "args")
+    __slots__ = ("recipe", "slots", "addresses", "args", "_bound")
 
     def __init__(self, recipe: Recipe, names: dict[str, int]) -> None:
         self.recipe = recipe
@@ -1332,7 +1392,86 @@ class _Op:
         return int(np.flatnonzero(self.slots == self.recipe.slot(name))[0])
 
     def run(self, lib) -> None:
-        if lib.rg_bind_slots(*self.args) < 0 or lib.rg_launch(self.args[0]) < 0:
+        if _PROFILE_STEP:
+            # the launch path every Gaudi model uses: one bind plus one launch per op.
+            # RESIN_GAUDI_PROFILE_LAUNCH_MODE separates the cost: "full" (normal), "bind" (bind only,
+            # no launch), "none" (neither). "bind" and "none" produce garbage tokens and exist only to
+            # time the host floor - never leave them on for a correctness run.
+            started = time.perf_counter()
+            second = 0.0
+            if _LAUNCH_MODE == "none":
+                ok = True
+            elif _LAUNCH_MODE == "bind":
+                ok = _do_bind(lib, self.args) >= 0
+            elif _RECIPE_DEVICE:
+                ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
+                # inside the timed region on purpose: this mode measures the recipe, not the call
+                self.recipe.device.sync()
+                # The control the bracket needs: the queue is drained now, so this second sync has
+                # nothing to wait for and its cost is the sync call itself - the constant that
+                # every (t1 - t0) above carries. It stays IN the bracket and is accumulated here
+                # per step and per recipe, to be subtracted once, in the corrected column:
+                #     raw = sum(t1 - t0);  corrected = raw - host - sync_overhead
+                # (measurements/profile/SUMMARY-recipe-device.txt). Taking it out of elapsed as
+                # well subtracted the control twice and put the corrected column ~3.5% low.
+                t_second = time.perf_counter()
+                self.recipe.device.sync()
+                second = time.perf_counter() - t_second
+                _SYNC_OVERHEAD_TOTAL[0] += second
+                _SYNC_OVERHEAD_COUNT[0] += 1
+                entry2 = SECOND_SYNC_BY_RECIPE.get(self.recipe.name)
+                if entry2 is None:
+                    entry2 = SECOND_SYNC_BY_RECIPE[self.recipe.name] = [0, 0.0]
+                entry2[0] += 1
+                entry2[1] += second
+            elif _LAZY_BIND:
+                # the profiling branch has to honour lazy bind too, or a gate run measures the
+                # unmodified path while reporting the flag as on (found the hard way)
+                if not getattr(self, "_bound", False):
+                    ok = _do_bind(lib, self.args) >= 0
+                    self._bound = ok
+                else:
+                    ok = True
+                if ok and _do_launch(lib, self.args[0]) < 0:
+                    ok = False
+            elif _SYNC_EVERY:
+                # the clean host/device separator: never let the queue build, so the per-call time
+                # collapses to the pure host call cost if blocking was what we were measuring
+                ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
+                _SYNC_COUNT[0] += 1
+                # the sync is deliberately OUTSIDE the timed interval: inside it, one call in N
+                # carried a full device wait and the median rose instead of collapsing (15j)
+                _SYNC_PENDING[0] = _SYNC_COUNT[0] % _SYNC_EVERY == 0
+            else:
+                ok = _do_bind(lib, self.args) >= 0 and _do_launch(lib, self.args[0]) >= 0
+            elapsed = time.perf_counter() - started
+            if _SYNC_PENDING[0]:
+                _SYNC_PENDING[0] = False
+                _sync_started = time.perf_counter()
+                self.recipe.device.sync()
+                _SYNC_TOTAL[0] += time.perf_counter() - _sync_started
+                _SYNC_TIMES.append(time.perf_counter() - _sync_started)
+            if not ok:
+                self.recipe.device.check(-1, f"launch {self.recipe.name}")
+            LAUNCH_STATS["calls"] += 1
+            LAUNCH_STATS["seconds"] += elapsed
+            LAST_CALLS.append(elapsed)
+            entry = LAUNCH_BY_RECIPE.get(self.recipe.name)
+            if entry is None:
+                # workspace is a benign per-recipe query: cached once, never launched
+                entry = LAUNCH_BY_RECIPE[self.recipe.name] = [0, 0.0, self.recipe.workspace]
+            entry[0] += 1
+            entry[1] += elapsed
+            return
+        if _LAZY_BIND:
+            if not getattr(self, "_bound", False):
+                if _do_bind(lib, self.args) < 0:
+                    self.recipe.device.check(-1, f"bind {self.recipe.name}")
+                self._bound = True
+            if _do_launch(lib, self.args[0]) < 0:
+                self.recipe.device.check(-1, f"launch {self.recipe.name}")
+            return
+        if _do_bind(lib, self.args) < 0 or _do_launch(lib, self.args[0]) < 0:
             self.recipe.device.check(-1, f"launch {self.recipe.name}")
 
 
