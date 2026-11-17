@@ -52,6 +52,23 @@ def module_list(text: str) -> str:
     return text
 
 
+class FeaturesAction(argparse.Action):
+    """``-f NAME[,NAME...]``, once or more: the union of the names. ``-f help`` shows the features and exits."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        from resin_models_gaudi import features
+
+        if "help" in (name.strip().lower() for name in str(values).split(",")):
+            print(features.describe())
+            parser.exit()
+        try:
+            names = features.parse([str(values)])
+        except ValueError as error:
+            parser.error(f"{option_string}: {error}")
+        given = getattr(namespace, self.dest, None) or ()
+        setattr(namespace, self.dest, tuple(sorted({*given, *names})))
+
+
 def add_gaudi_arguments(parser: argparse.ArgumentParser) -> None:
     gaudi = parser.add_argument_group("Gaudi")
     gaudi.add_argument(
@@ -90,6 +107,16 @@ def add_gaudi_arguments(parser: argparse.ArgumentParser) -> None:
         "Sets RESIN_GAUDI_SPIN_WAIT. (default: 0.2)",
     )
     gaudi.add_argument(
+        "-f",
+        "--features",
+        action=FeaturesAction,
+        metavar="NAME[,NAME...]",
+        help="optional features, each off unless you name it: oldqwen (Qwen3.5/3.8 steps in the Python "
+        "executor, on one card only) and skipvalidation (no check of each launch's tensor bindings). Give names separated by "
+        "commas, or -f more than once. -f help shows the features. Sets RESIN_GAUDI_FEATURES. "
+        "(default: RESIN_GAUDI_FEATURES, then none)",
+    )
+    gaudi.add_argument(
         "--cc", help="C compiler for native code. Sets CC. (default: gcc)"
     )
     gaudi.add_argument(
@@ -111,18 +138,45 @@ _VARIABLES = {
 
 def apply_gaudi_arguments(args: argparse.Namespace) -> None:
     """Set the variables for this process and its ranks."""
+    from resin_models_gaudi import features
+
     for name, variable in _VARIABLES.items():
         value = getattr(args, name, None)
         if value is not None:
             os.environ[variable] = str(value)
+    if getattr(args, "features", None) is not None:
+        features.set_features(args.features)
+    if features.enabled("skipvalidation"):
+        preload_skip_validation()
+
+
+def feature_enabled(args: argparse.Namespace, name: str) -> bool:
+    """Whether ``args`` (or RESIN_GAUDI_FEATURES, without -f) turn feature ``name`` on."""
+    from resin_models_gaudi import features
+
+    given = getattr(args, "features", None)
+    return name in (features.enabled_features() if given is None else given)
+
+
+def preload_skip_validation() -> None:
+    """Build the launch-validation library and add it to LD_PRELOAD, for ranks spawned after this (the dynamic
+    loader reads LD_PRELOAD only when a process starts)."""
+    from resin_models_gaudi.synapse.build import build_skip_validation
+
+    library = str(build_skip_validation())
+    preload = [p for p in os.environ.get("LD_PRELOAD", "").split(":") if p]
+    if library not in preload:
+        os.environ["LD_PRELOAD"] = ":".join([*preload, library])
 
 
 def describe_settings() -> str:
     """The settings in effect, for the startup log."""
+    from resin_models_gaudi.features import VARIABLE
+
     values = {
         variable: os.environ[variable]
-        for variable in _VARIABLES.values()
-        if variable in os.environ
+        for variable in (*_VARIABLES.values(), VARIABLE)
+        if os.environ.get(variable)
     }
     return " ".join(f"{name}={value}" for name, value in values.items()) or "defaults"
 

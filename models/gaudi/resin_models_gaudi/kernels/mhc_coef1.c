@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // mhc_coef for one token (T = 1) from mhc_mixp's chunk partials, the 4 x 4 comb matrix in 16 lanes: row and
 // column sums by lane shuffles, every exp, sigmoid and reciprocal once per vector (see mhc_coef.c for the
 // coefficients). mix_j = sum over chunks of mixp[j, c]; r = rsqrt(sum ssp / K + rms_eps).

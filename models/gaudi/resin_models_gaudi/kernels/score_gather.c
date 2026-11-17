@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Prompt scoring: raw logprobs of chosen (row, token) pairs, logits[token, row] - lse[row], with
 // lse from samp_select (sel_f lane 1). Pairs with row < 0 are padding (0).
 // tensors: 0 logits (V, R) f32  1 sel_f (16, R) f32  2 pairs (2, N) i32 [row, token]

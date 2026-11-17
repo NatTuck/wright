@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // mla_gather_list for DeepSeek-V4.1 (D = 512, no separate rotary key; see mla_gather_list.c): each column's
 // listed compressed latents into a dense bf16 slab, the dequantized FP8 latent of key k of slot s being position
 // list[k, s] of column s's sequence (block row blocks[p >> 7, s] plus the latent offset, row p & 127). Keys at or

@@ -3,10 +3,11 @@ name = "resin-core"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 description = "Pure Rust scheduling and resource ownership for Resin"
 
 [dependencies]
+log.workspace = true
 rkyv.workspace = true
 serde.workspace = true
 

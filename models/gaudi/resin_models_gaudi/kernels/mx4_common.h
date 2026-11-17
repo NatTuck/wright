@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Constants and tables of the MXFP4 -> FP8 (E4M3 bias 7, +-240) dequant kernels.
 //   S       E8M0 scale byte, one per 32-element block; block k of a vector is in lane group k (32 lanes)
 //   T0, T1  magnitude tables for E2M1 mantissa 0 and 1, indexed by e' (5 bits): value (1 + f/2) * 2^(e' - 14),

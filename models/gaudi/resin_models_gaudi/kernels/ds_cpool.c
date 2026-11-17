@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 compressor, ratio 2: each completed group of two consecutive tokens pools their KV with a softmax of
 // their gate scores per channel:
 //   latent[:, g] = kv_a w_a + kv_b w_b,  (w_a, w_b) = softmax(score_a, score_b)

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Slot attention: reset the accumulators of attn_slot_acc before a chunk's first slot launch
 // (output 0, max NINF, sum 0).
 // tensors: 0 acc_o (256, W, G) f32  1 acc_m (W, G) f32  2 acc_l (W, G) f32 | 3 sink (64, 1) i32

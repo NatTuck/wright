@@ -26,12 +26,9 @@ from resin.models.mistral_large4.config import MistralLarge4Config
 from resin_models_gaudi.gguf import pack
 from resin_models_gaudi.gguf.planar import LAYOUT
 from resin_models_gaudi.gguf.reader import GgufModel
-from resin_models_gaudi.qwen3_5.checkpoint import bf16_rne
+from resin_models_gaudi.loading.convert import bf16_rne, disable_hugepage_madvise
 
-try:
-    np._core.multiarray._set_madvise_hugepage(False)  # type: ignore[attr-defined]
-except AttributeError:  # numpy < 2
-    np.core.multiarray._set_madvise_hugepage(False)  # type: ignore[attr-defined]
+disable_hugepage_madvise()
 
 
 @dataclass(frozen=True, slots=True)

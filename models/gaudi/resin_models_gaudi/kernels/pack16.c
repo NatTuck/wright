@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // f32 -> bf16 in sigma order per 128-row block.
 // tensors: 0 x (C, T) f32 | 1 y (C, T) bf16. index space: [C/128, T]
 #include "common.h"

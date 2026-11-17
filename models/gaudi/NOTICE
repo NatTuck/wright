@@ -1,0 +1,36 @@
+resin-models-gaudi
+
+This package is part of Wright, https://github.com/abotsis/wright. Wright uses a modified version of Resin,
+https://github.com/ekzhang/resin, for its scheduler and front-end.
+
+Wright's own code, including the TPC-C kernels in resin_models_gaudi/kernels/, is licensed under the GNU
+Affero General Public License v3.0 only (AGPL-3.0-only), in LICENSE, or under a separate commercial
+license from the author. The Wright repository's COMMERCIAL.md tells how to get a commercial license.
+
+The adapted third-party parts that this file lists keep their own licenses. The NOTICE file of the Wright
+repository lists all third-party parts of Wright.
+
+Copyright Aaron Botsis
+
+The GGUF block formats in resin_models_gaudi/gguf/ and resin_models_gaudi/synapse/native/pack.c follow
+the format of ggml-quants.c in llama.cpp:
+
+  Copyright The ggml authors
+  https://github.com/ggml-org/llama.cpp
+
+llama.cpp is licensed under the MIT License.
+
+The DSpark drafter in resin_models_gaudi/mistral_large4/dspark.py follows llama.cpp and SGLang:
+
+  https://github.com/ggml-org/llama.cpp
+  https://github.com/sgl-project/sglang
+
+SGLang is licensed under the Apache License, Version 2.0.
+
+The DeepSeek-V4.1 Engram device hash in resin_models_gaudi/kernels/eg_hash.c follows inference/engram.py
+of DeepSeek-V4.1-Flash-1017, revision 1bae0e1088993b9b82de08f59de5be5a34e42170:
+
+  Copyright (c) 2023 DeepSeek
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+
+DeepSeek-V4.1 is licensed under the MIT License. LICENSES/MIT-DeepSeek.txt keeps the MIT notice.

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked gated delta rule, chunk-to-chunk state step (one node per chunk, after the product
 // X = KW_c S_c):   S_{c+1} = gamma_C S_c - X + B_c,   gamma_C = exp(G_63) of chunk c (per head).
 // tensors: 0 S (128,128,nv,1) f32  1 X  2 B  3 GB (64,2,nv,1) | 4 Snew (128,128,nv,1)

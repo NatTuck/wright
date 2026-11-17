@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA slot attention output (Mistral-Large-4), for steps whose attention is one slot launch in
 // which every query column is in at most one slot (decode: one dense slot per row of at most
 // SLOT_KEYS keys, or one sparse slot per column): out = O / l per column, as an output tensor.
@@ -13,6 +13,8 @@
 // index space: [ceil(W / 64), G]; PER_COLUMN builds (ds_slot_ml1.c): one member per column, [W, G]
 // DIRECT (ds_slot_mld.c): slot s covers columns M s .. M s + M - 1 (a sparse slot per column of M heads), so a
 // column finds its slot without a scan of the slots.
+// CPM (ds_slot_ml8.c, with DIRECT): CPM columns per member, index space [ceil(W / CPM), G]; each member stores
+// only its own lanes of mcol / lcol.
 #include "common.h"
 
 // lane k of v broadcast to all lanes
@@ -40,6 +42,8 @@ void main(tensor O, tensor mx, tensor l, tensor slots, tensor out)
         for (int cb = off[0]; cb < end[0]; cb++) {
 #ifdef PER_COLUMN
             const int c0 = cb, c1 = cb + 1;               // one column per member
+#elif defined(CPM)
+            const int c0 = cb * CPM, c1 = c0 + CPM < W ? c0 + CPM : W;
 #else
             const int c0 = cb * 64, c1 = c0 + 64 < W ? c0 + 64 : W;
 #endif
@@ -113,6 +117,9 @@ void main(tensor O, tensor mx, tensor l, tensor slots, tensor out)
 #ifdef PER_COLUMN
             v_f32_st_tnsr_partial(mc, mcol, mv, 0, 0);
             v_f32_st_tnsr_partial(mc, lcol, lv, 0, 0);
+#elif defined(CPM)
+            v_f32_st_tnsr_partial(mc, mcol, mv, CPM - 1, 0);   // lanes 0 .. CPM - 1: this member's columns
+            v_f32_st_tnsr_partial(mc, lcol, lv, CPM - 1, 0);
 #else
             v_f32_st_tnsr(mc, mcol, mv);
             v_f32_st_tnsr(mc, lcol, lv);

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Argmax stage 1: each member scans a contiguous range of the logits and writes
 // [max value, first index of max] (as f32) into lanes 0/1 of its partial row.
 // tensors: 0 logits (V, B) f32 | 1 part (64, NB, B) f32.  index space: [NB, B] (column b of

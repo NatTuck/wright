@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import shutil
 import signal
 import socket
 import sys
@@ -106,6 +108,66 @@ def test_no_flag_keeps_the_variable(monkeypatch) -> None:
     assert os.environ[VISIBLE_MODULES] == "7"
 
 
+@pytest.mark.skipif(
+    shutil.which(os.environ.get("CC", "gcc")) is None, reason="no C compiler"
+)
+def test_the_skipvalidation_feature_preloads_its_library(monkeypatch, tmp_path) -> None:
+    import ctypes
+
+    parser = argparse.ArgumentParser()
+    add_gaudi_arguments(parser)
+    monkeypatch.setenv("RESIN_GAUDI_CACHE", str(tmp_path))
+    monkeypatch.delenv("RESIN_GAUDI_FEATURES", raising=False)
+    monkeypatch.setenv("LD_PRELOAD", "/elsewhere/libx.so")
+    apply_gaudi_arguments(parser.parse_args([]))
+    assert os.environ["LD_PRELOAD"] == "/elsewhere/libx.so"  # off by default
+    apply_gaudi_arguments(parser.parse_args(["-f", "skipvalidation"]))
+    assert os.environ["RESIN_GAUDI_FEATURES"] == "skipvalidation"
+    first, library = os.environ["LD_PRELOAD"].split(":")
+    assert first == "/elsewhere/libx.so" and library.startswith(str(tmp_path))
+    apply_gaudi_arguments(parser.parse_args(["--features", "skipvalidation"]))
+    assert os.environ["LD_PRELOAD"].count(library) == 1  # added once
+    # the library's check reports success and counts the launches
+    stub = ctypes.CDLL(library)
+    check = getattr(stub, "_ZN14RecipeLauncher20validateSectionsInfoERK10LaunchInfo")
+    check.restype = ctypes.c_int
+    count = stub.resin_gaudi_skipped_validations
+    count.restype = ctypes.c_long
+    assert (check(None, None), check(None, None), count()) == (0, 0, 2)
+
+
+def test_features_are_a_list_of_known_names(monkeypatch, capsys) -> None:
+    """-f takes names separated by commas, or -f more than once; an unknown name is an error; -f help lists
+    them; the features reach RESIN_GAUDI_FEATURES, and without -f the variable stays."""
+    from resin_models_gaudi import features
+
+    parser = argparse.ArgumentParser()
+    add_gaudi_arguments(parser)
+    monkeypatch.setenv("RESIN_GAUDI_FEATURES", "")
+    assert parser.parse_args([]).features is None
+    args = parser.parse_args(["-f", "OldQwen", "-f", "oldqwen,"])
+    assert args.features == ("oldqwen",)
+    apply_gaudi_arguments(args)
+    assert os.environ["RESIN_GAUDI_FEATURES"] == "oldqwen"
+    assert features.enabled("oldqwen") and not features.enabled("skipvalidation")
+    apply_gaudi_arguments(parser.parse_args([]))
+    assert os.environ["RESIN_GAUDI_FEATURES"] == "oldqwen"
+    with pytest.raises(SystemExit) as stopped:
+        parser.parse_args(["-f", "oldqwen,warp"])
+    assert stopped.value.code == 2
+    assert "unknown feature 'warp'" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as stopped:
+        parser.parse_args(["-f", "help"])
+    assert stopped.value.code == 0
+    shown = capsys.readouterr().out
+    assert all(name in shown for name in features.FEATURES)
+    monkeypatch.setenv("RESIN_GAUDI_FEATURES", "old-qwen")
+    with pytest.raises(ValueError, match="unknown feature"):
+        features.enabled("oldqwen")
+    with pytest.raises(KeyError):
+        features.enabled("warp")
+
+
 @pytest.mark.parametrize("text", ["0", "-1"])
 def test_positive_int_rejects(text: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
@@ -130,7 +192,7 @@ def test_listen_address_checks() -> None:
 @pytest.mark.parametrize(
     "model, options, match",
     [
-        ("qwen3_5-gaudi2", {"max_batch_size": 64}, "max-batch-size of 32"),
+        ("qwen3_5-gaudi2", {"max_batch_size": 65}, "max-batch-size of 64"),
         ("qwen3_5-gaudi2", {"draft_tokens": 9}, "draft-tokens"),
         (
             "qwen3_5-gaudi2",
@@ -156,7 +218,13 @@ def test_gaudi_options_rejected_before_the_card_opens(model, options, match) -> 
         "draft_tokens": spec.draft_tokens,
     }
     with pytest.raises(ValueError, match=match):
-        validate_gaudi_options(spec, **{**settings, **options})
+        merged = {**settings, **options}
+        validate_gaudi_options(
+            spec,
+            max_batch_size=merged["max_batch_size"],
+            prefill_chunk_size=merged["prefill_chunk_size"],
+            draft_tokens=merged["draft_tokens"],
+        )
 
 
 @pytest.mark.parametrize(
@@ -176,6 +244,45 @@ def test_smaller_prefill_chunks_are_accepted(model, chunk) -> None:
         prefill_chunk_size=chunk,
         draft_tokens=spec.draft_tokens,
     )
+
+
+@pytest.fixture
+def dflash_drafter(tmp_path):
+    """A DFlash 2 drafter directory as deploy reads it: its block size."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"architectures": ["DFlash2DraftModel"], "dflash_config": {"block_size": 8}}
+        )
+    )
+    return tmp_path
+
+
+def test_qwen_drafter_fixes_the_draft_count(dflash_drafter) -> None:
+    from deploy.models import check_gaudi_drafts, default_draft_tokens
+
+    spec = get_model("qwen3_5-gaudi2")
+    assert default_draft_tokens(spec) == spec.draft_tokens == 2
+    assert default_draft_tokens(spec, dflash_drafter) == 7
+    for drafts in (0, 3, 7):
+        validate_gaudi_options(
+            spec,
+            max_batch_size=spec.max_batch_size,
+            prefill_chunk_size=spec.prefill_chunk_size,
+            draft_tokens=drafts,
+            assistant=dflash_drafter,
+        )
+    with pytest.raises(ValueError, match="--draft-tokens 0, 1, 2, 3, 4, 5, 6, 7"):
+        validate_gaudi_options(
+            spec,
+            max_batch_size=spec.max_batch_size,
+            prefill_chunk_size=spec.prefill_chunk_size,
+            draft_tokens=8,
+            assistant=dflash_drafter,
+        )
+    # the drafter needs no MTP weights in the checkpoint
+    check_gaudi_drafts(spec, dflash_drafter, 7, dflash_drafter)
+    with pytest.raises(ValueError, match="no MTP weights"):
+        check_gaudi_drafts(spec, dflash_drafter, 7)
 
 
 @pytest.mark.parametrize(

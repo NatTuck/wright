@@ -31,6 +31,7 @@ from resin.backend.distributed import (
     DistributedExecutionError,
     DistributedWorker,
 )
+from resin.backend.step_transport import GlooStepTransport
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 
 
@@ -176,9 +177,9 @@ class CollectiveRunner:
         )
 
 
-def _run_case(groups, case):
+def _run_case(groups, case, transport=None):
     runner = CollectiveRunner(groups, case)
-    worker = DistributedWorker(runner, groups)
+    worker = DistributedWorker(runner, groups, transport=transport)
     request_results, failed, local_poisoned = [], False, False
     if not groups.is_driver:
         try:
@@ -310,7 +311,7 @@ def _shared_experts_case(groups):
     return runner.calls
 
 
-def _tensor_only_case(groups):
+def _tensor_only_case(groups, transport=None):
     class ForwardOnly:
         calls = 0
 
@@ -325,7 +326,7 @@ def _tensor_only_case(groups):
             return forward_output((values % 127).tolist())
 
     runner = ForwardOnly()
-    worker = DistributedWorker(runner, groups)
+    worker = DistributedWorker(runner, groups, transport=transport)
     if groups.is_driver:
         engine = DistributedEngine(worker)
         request = engine.submit(
@@ -641,7 +642,7 @@ def test_single_rank_replica_keeps_preparation_local_and_skips_serialization(
     engine.close()
 
 
-def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
+def test_control_failure_after_model_work_keeps_the_accepted_batch():
     groups = _single_rank_groups()
     releases = []
     calls = []
@@ -653,20 +654,15 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
         forward=lambda plan: calls.append(plan) or forward_output([3]),
         release=lambda ids: releases.extend(ids),
     )
-    worker = DistributedWorker(runner, groups)
+
+    class FailingCompletion(GlooStepTransport):
+        def finished(self, step_id, error):
+            # The completion gate after model.forward returned.
+            raise RuntimeError("injected transport completion failure")
+
+    worker = DistributedWorker(runner, groups, transport=FailingCompletion(groups))
     engine = DistributedEngine(worker)
     request = engine.submit([1, 2], sampling_params=SamplingParams(max_output_tokens=2))
-    consensus_calls = 0
-    original = worker._consensus
-
-    def consensus(group, error):
-        nonlocal consensus_calls
-        consensus_calls += 1
-        if consensus_calls == 2:  # The completion vote after model.forward returned.
-            raise RuntimeError("injected transport completion failure")
-        return original(group, error)
-
-    monkeypatch.setattr(worker, "_consensus", consensus)
     with pytest.raises(DistributedExecutionError, match="transport completion"):
         engine.step()
     assert len(calls) == 1
@@ -677,3 +673,31 @@ def test_control_failure_after_model_work_keeps_the_accepted_batch(monkeypatch):
     assert releases == []
     with pytest.raises(DistributedExecutionError):
         engine.close()
+
+
+def test_ctrl_c_in_a_step_fails_the_step_on_every_rank_and_stops_as_ctrl_c():
+    groups = _single_rank_groups()
+    seen = []
+
+    class Recording(GlooStepTransport):
+        def finished(self, step_id, error):
+            seen.append(error)
+            return super().finished(step_id, error)
+
+    def interrupted(plan):
+        raise KeyboardInterrupt
+
+    runner = LocalRunner(
+        runner_config=RunnerConfig(),
+        bind_resources=lambda binding: None,
+        forward=interrupted,
+        release=lambda ids: None,
+    )
+    worker = DistributedWorker(runner, groups, transport=Recording(groups))
+    engine = DistributedEngine(worker)
+    engine.submit([1, 2], sampling_params=SamplingParams(max_output_tokens=2))
+    with pytest.raises(KeyboardInterrupt):
+        engine.step()
+    # The completion gate carried the failure to the other ranks.
+    assert seen == ["interrupted"]
+    assert worker.failure == "interrupted"

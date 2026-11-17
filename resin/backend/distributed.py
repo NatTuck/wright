@@ -12,14 +12,13 @@ from time import perf_counter
 from types import SimpleNamespace
 from typing import Protocol
 
-import torch
-
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
 from resin._resin import _HistogramAccumulator
-from resin.backend.command_transport import CommandTransport
-from resin.backend.control_plane import ControlOperation, ControlPlane
+from resin.backend.control_plane import ControlPlane
 from resin.backend.metrics import RunnerMetrics
 from resin.backend.plan_transport import PlanTransport
+from resin.backend.step_transport import GlooStepTransport, StepTransport
+from resin.backend.step_transport import first_error as _first_error
 from resin.backend.topology import ParallelGroups, RankGroup
 
 
@@ -31,17 +30,6 @@ class DistributedExecutionError(RuntimeError):
 
 def _message(error: BaseException | None) -> str | None:
     return None if error is None else f"{type(error).__name__}: {error}"
-
-
-def _first_error(group: RankGroup, errors) -> str | None:
-    return next(
-        (
-            f"rank {rank}: {error}"
-            for rank, error in zip(group.ranks, errors, strict=True)
-            if error
-        ),
-        None,
-    )
 
 
 def _runner_signature(config: RunnerConfig):
@@ -121,9 +109,16 @@ class DistributedWorker:
     scheduling and cache leases while it overlaps the next submission.
     Bind/release may communicate within a replica;
     collectives across replicas belong only in the forward callback.
+    Replica commands and step gates use ``transport``, Gloo by default.
     """
 
-    def __init__(self, runner: Runner | DistributedRunner, groups: ParallelGroups):
+    def __init__(
+        self,
+        runner: Runner | DistributedRunner,
+        groups: ParallelGroups,
+        *,
+        transport: StepTransport | None = None,
+    ):
         self.runner, self.groups = runner, groups
         self.closed = False
         self.failure = None
@@ -134,9 +129,7 @@ class DistributedWorker:
         self._metrics: _HistogramAccumulator | None = None
         self._control = ControlPlane(groups.distributed)
         self._plans = PlanTransport()
-        self._wire = CommandTransport(
-            groups.distributed, groups.replica.handle, source=groups.replica.source
-        )
+        self._transport = GlooStepTransport(groups) if transport is None else transport
         lookahead = None
         error = None
         try:
@@ -254,23 +247,14 @@ class DistributedWorker:
         if group.size == 1:
             gathered = [value]
         else:
-            # Snapshot transport is intentionally separate from step packets:
-            # bounded, infrequent UTF-8 records without Python object pickling.
-            with torch.inference_mode(False):
-                size = torch.tensor([len(payload)], dtype=torch.int64)
-                sizes = [torch.empty_like(size) for _ in group.ranks]
-                self.groups.distributed.all_gather(sizes, size, group=group.handle)
-                capacity = max(int(item.item()) for item in sizes)
-                source = torch.zeros(capacity, dtype=torch.uint8)
-                source[: len(payload)] = torch.frombuffer(
-                    bytearray(payload), dtype=torch.uint8
-                )
-                records = [torch.empty_like(source) for _ in group.ranks]
-                self.groups.distributed.all_gather(records, source, group=group.handle)
-            gathered = [
-                json.loads(record[: int(size.item())].numpy().tobytes())
-                for record, size in zip(records, sizes, strict=True)
-            ]
+            # Bounded UTF-8 records, without Python object pickling.
+            records = self._transport.gather_bytes(payload)
+            if records is None:
+                # This rank sent its record and does not receive the others.
+                if error:
+                    raise DistributedExecutionError(f"rank {self.groups.rank}: {error}")
+                return ()
+            gathered = [json.loads(record) for record in records]
         failure = _first_error(self.groups.replica, [item[1] for item in gathered])
         if failure:
             raise DistributedExecutionError(failure)
@@ -280,9 +264,25 @@ class DistributedWorker:
             snapshots.append((rank, RunnerMetrics(**value)))
         return tuple(snapshots)
 
-    def _consensus(self, group: RankGroup, error: str | None):
-        _, errors = self._vote(group, ControlOperation.VALIDATE, error=error)
-        failure = _first_error(group, errors)
+    def _gate(self, gate, *args, domain=True):
+        """Run one step gate; raise if any rank failed or the transport failed."""
+
+        metrics = self._metrics
+        # Like _vote: only the domain-wide gates of attention DP are timed.
+        timed = metrics is not None and domain and self.groups.topology.attn_dp > 1
+        started = perf_counter() if timed else 0.0
+        try:
+            failure = gate(*args)
+        except KeyboardInterrupt:
+            self.failure = self.failure or "interrupted"
+            raise
+        except BaseException as exc:
+            self.failure = _message(exc)
+            raise DistributedExecutionError(self.failure) from exc
+        finally:
+            if timed:
+                assert metrics is not None
+                metrics.observe(perf_counter() - started)
         if failure:
             raise DistributedExecutionError(failure)
 
@@ -347,13 +347,23 @@ class DistributedWorker:
         return self._vote(self._driver_group, operation, values, error=error)
 
     def _send(self, command):
+        self._transmit(self._transport.send, command)
+
+    def _finish_step(self, failure: str | None):
+        self._transmit(self._transport.finish, failure)
+
+    def _transmit(self, send, value):
         if self.closed:
             raise DistributedExecutionError("workers are closed")
         if self.groups.replica.size > 1:
             try:
-                self._wire.send(command)
+                send(value)
+            except KeyboardInterrupt:
+                self.failure = self.failure or "interrupted"
+                raise
             except BaseException as exc:
-                self.failure = _message(exc)
+                # Keep the first failure: a send after a failed step names its consequence.
+                self.failure = self.failure or _message(exc)
                 raise DistributedExecutionError(self.failure) from exc
 
     def _local_command(self, command):
@@ -390,7 +400,7 @@ class DistributedWorker:
                 raise ValueError(f"unknown worker operation: {operation}")
         except BaseException as exc:
             error = _message(exc)
-        self._consensus(self.groups.replica, error)
+        self._gate(self._transport.acknowledge, error, domain=False)
 
     def bind_resources(self, binding):
         command = {"operation": "bind", "cache_pool_id": binding.cache_pool_id}
@@ -409,6 +419,10 @@ class DistributedWorker:
             return self._coordinate(plan)
         except DistributedExecutionError:
             raise
+        except KeyboardInterrupt:
+            # Ctrl-C stops the process as it does elsewhere; the ranks cannot step again.
+            self.failure = self.failure or "interrupted"
+            raise
         except BaseException as exc:
             # A transport exception can occur after kernels have changed state.
             # All exits from this callback must carry the acceptance marker.
@@ -419,6 +433,9 @@ class DistributedWorker:
         try:
             return self._coordinate(plan, enqueue=True, feedback=feedback is not None)
         except DistributedExecutionError:
+            raise
+        except KeyboardInterrupt:
+            self.failure = self.failure or "interrupted"
             raise
         except BaseException as exc:
             self.failure = _message(exc)
@@ -476,7 +493,7 @@ class DistributedWorker:
         return self._execute(command, plan)
 
     def _execute(self, command, plan=None):
-        error, context, prepared = None, None, None
+        error, context, prepared, interrupt = None, None, None, None
         try:
             if plan is None and command["payload"] is not None:
                 plan = self._plans.restore(command["payload"])
@@ -492,9 +509,11 @@ class DistributedWorker:
             )
             if self._validate is not None:
                 prepared = self._validate(plan, context)
+        except KeyboardInterrupt as exc:
+            error, interrupt = "interrupted", exc
         except BaseException as exc:
             error = _message(exc)
-        self._consensus(self.groups.domain, error)
+        self._step_gate(self._transport.prepared, command["step_id"], error, interrupt)
         result, error = None, None
         previous = self._completion
         try:
@@ -536,23 +555,39 @@ class DistributedWorker:
                 )
             elif plan is not None:
                 result = getattr(self.runner, "forward")(plan)
+        except KeyboardInterrupt as exc:
+            error, interrupt = "interrupted", exc
         except BaseException as exc:
             error = _message(exc)
-        self._consensus(self.groups.domain, error)
+        self._step_gate(self._transport.finished, command["step_id"], error, interrupt)
         return result
+
+    def _step_gate(self, gate, step_id, error, interrupt):
+        """A gate of a step. After Ctrl-C in this rank's step, the other ranks still learn at
+        the gate that the step failed, and then Ctrl-C stops this process."""
+        if interrupt is None:
+            self._gate(gate, step_id, error)
+            return
+        try:
+            self._gate(gate, step_id, error)
+        except DistributedExecutionError:
+            pass
+        self.failure = self.failure or "interrupted"
+        raise interrupt
 
     def serve(self):
         """Follower loop; failures remain contained until the driver closes it."""
         if self.groups.is_driver:
             raise ValueError("replica drivers construct DistributedEngine instead")
         while True:
-            command = self._wire.receive()
+            command = self._transport.receive()
             operation = command["operation"]
             if operation == "close":
                 if self._completion is not None and not command["error"]:
                     self._completion.result()
                     self._completion = None
                 self.closed = True
+                self._transport.close()
                 if command["error"]:
                     raise DistributedExecutionError(command["error"])
                 self._plans.clear()
@@ -593,6 +628,7 @@ class DistributedEngine:
             self._record_failure(failure)
             worker._send({"operation": "close", "error": failure})
             worker.closed = self.closed = True
+            worker._transport.close()
             raise DistributedExecutionError(failure)
 
     @property
@@ -627,7 +663,7 @@ class DistributedEngine:
 
     def _finish(self, failure):
         self._record_failure(failure)
-        self.worker._send({"operation": "finish", "error": failure})
+        self.worker._finish_step(failure)
         if failure:
             raise DistributedExecutionError(failure)
 
@@ -700,11 +736,13 @@ class DistributedEngine:
             BatchPhase.PREFILL if phase == "prefill" else BatchPhase.DECODE
         )
         self.worker._entered = False
-        events, error = [], None
+        events, error, interrupt = [], None, None
         try:
             events = self.local.step(
                 phase=self.worker._phase, allow_overlap=allow_overlap
             )
+        except KeyboardInterrupt as exc:
+            error, interrupt = "interrupted", exc
         except BaseException as exc:
             error = _message(exc)
         if not self.worker._entered:
@@ -714,10 +752,20 @@ class DistributedEngine:
                 # Their zero-row completion belongs to the worker, with no local
                 # scheduler/cache continuation and no token feedback to consume.
                 self.worker._coordinate(None, error, enqueue=allow_overlap)
+            except KeyboardInterrupt as exc:
+                error, interrupt = error or "interrupted", interrupt or exc
             except BaseException as exc:
                 error = error or _message(exc)
         errors = self.worker._drivers("commit", error)
-        self._finish(_first_error(self.worker._driver_group, errors))
+        failure = _first_error(self.worker._driver_group, errors)
+        if interrupt is not None:
+            # The other drivers voted on the failed step; Ctrl-C then stops this process.
+            try:
+                self._finish(failure or "interrupted")
+            except DistributedExecutionError:
+                pass
+            raise interrupt
+        self._finish(failure)
         return events
 
     def close(self):
@@ -738,6 +786,7 @@ class DistributedEngine:
         self._record_failure(failure)
         self.worker._send({"operation": "close", "error": failure})
         self.worker.closed = self.closed = True
+        self.worker._transport.close()
         if failure:
             raise DistributedExecutionError(failure)
         self.worker._plans.clear()

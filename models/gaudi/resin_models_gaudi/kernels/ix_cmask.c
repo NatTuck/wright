@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 candidate blocks, level two: a column's scores with every visible entry outside its candidate
 // blocks set to -3e38. Entry i is in a candidate block when mkey(bmax of block i / 8) >= cthr[c] (ix_bmax's
 // block order; cthr from ix_thr over the blocks). Vectors past the visible entries are not written.

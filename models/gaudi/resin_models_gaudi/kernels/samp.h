@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Shared definitions of the sampling kernels (samp_*.c).
 // Order keys order logits as signed i32: bits for x >= 0, bits ^ 0x7FFFFFFF for x < 0; -0.0 keys
 // as +0.0, NaN as KEY_MAX (torch.argmax counts NaN as the maximum); absent tokens are KEY_MIN.

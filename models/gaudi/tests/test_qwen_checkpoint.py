@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from resin_models_gaudi.qwen3_5.checkpoint import HALVE, halve
+from resin_models_gaudi.loading.convert import HALVE, halve
 
 
 def test_halve_matches_the_table_for_every_byte():

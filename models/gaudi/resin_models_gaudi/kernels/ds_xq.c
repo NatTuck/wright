@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Per-token FP8 quantization of the routed experts' input, pair order (pack_nat128), one copy per route slot
 // (slot = t * R + k).
 //   s_t = max|x_t| / 240;  q = fp8(x_t / s_t).

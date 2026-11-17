@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DSA indexer scores of one slot launch (Mistral-Large-4), into the step's score scratch: for
 // slot s (a query block's tokens against one 2048-key chunk), token t of the block (column
 // qtok0 + t) and key key0 + i,

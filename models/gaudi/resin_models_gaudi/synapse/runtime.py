@@ -1,6 +1,9 @@
 """The process's Synapse device: memory, copies, events and launches over ctypes.
 
-This module keeps a single ``Device``. Multi-card execution runs one process per card.
+This module keeps a single ``Device``. Multi-card execution runs one process per card. Work issues on the calling
+thread's current context (``DeviceContext``): a stream on its own hardware queue slot, with its own workspace and
+staging buffers. A thread starts on the device's default context; a process that serves several models gives the
+others contexts of their own.
 """
 
 from __future__ import annotations
@@ -19,6 +22,8 @@ from typing import Any
 
 import numpy as np
 
+from resin_models_gaudi import features
+from resin_models_gaudi.loading.progress import progress
 from resin_models_gaudi.synapse.build import (
     TESTED_SYNAPSE,
     NativeLibraries,
@@ -27,7 +32,6 @@ from resin_models_gaudi.synapse.build import (
     synapse_build,
 )
 from resin_models_gaudi.synapse.cards import Card, visible_cards
-from resin_models_gaudi.synapse.progress import LoadProgress, info
 
 logger = logging.getLogger("wright")
 
@@ -57,6 +61,11 @@ _SIGNATURES: dict[str, tuple[object, list[object]]] = {
     "rg_module_id": (C.c_int, []),
     "rg_driver_version": (C.c_int, [C.c_char_p, C.c_int]),
     "rg_sync": (C.c_int, []),
+    "rg_sync_all": (C.c_int, []),
+    "rg_context_create": (C.c_int, [C.c_uint64]),
+    "rg_context_use": (C.c_int, [C.c_int]),
+    "rg_context_current": (C.c_int, []),
+    "rg_context_affinity": (C.c_uint64, [C.c_int]),
     "rg_shutdown": (C.c_int, []),
     "rg_malloc": (C.c_uint64, [C.c_uint64]),
     "rg_free": (C.c_int, [C.c_uint64]),
@@ -74,6 +83,10 @@ _SIGNATURES: dict[str, tuple[object, list[object]]] = {
     "rg_event_record": (C.c_int, [C.c_int]),
     "rg_event_wait": (C.c_int, [C.c_int]),
     "rg_event_query": (C.c_int, [C.c_int]),
+    "rg_event_spin": (C.c_int, [C.c_int, C.c_int64]),
+    "rg_event_stream_wait": (C.c_int, [C.c_int]),
+    "rg_event_timed": (C.c_int, [C.c_int]),
+    "rg_event_elapsed": (C.c_int64, [C.c_int, C.c_int]),
     "rg_graph_new": (C.c_int, []),
     "rg_tensor": (C.c_int, [C.c_int, C.c_char_p, C.c_int, C.c_int, _U64P, C.c_int]),
     "rg_tensor_in_section": (
@@ -103,13 +116,16 @@ _SIGNATURES: dict[str, tuple[object, list[object]]] = {
     "rg_ccl_init": (C.c_int, [C.c_void_p, C.c_int, C.c_int]),
     "rg_ccl_allreduce": (C.c_int, [C.c_uint64, C.c_uint64, C.c_uint64, C.c_int]),
     "rg_ccl_allgather": (C.c_int, [C.c_uint64, C.c_uint64, C.c_uint64, C.c_int]),
-    "rg_launch_segs": (C.c_int, [C.c_int, _I32P, _U64P, _U64P]),
     "rg_ccl_destroy": (C.c_int, []),
 }
 
 
 class SynapseError(RuntimeError):
-    pass
+    """A failed call of the Synapse runtime. Raised from a step, it may have left device state changed (an
+    earlier call of the step may already be on the stream), so the Engine treats it as fatal after accept: it
+    stops instead of retrying the step on the same device state."""
+
+    _resin_post_accept = True
 
 
 def _load(path: Path) -> C.CDLL:
@@ -134,7 +150,27 @@ class Device:
         self.libraries = libraries
         self.module_id = lib.rg_module_id()
         self.closed = False
-        self._load: LoadProgress | None = None
+        self._loading = False
+        self._events = 0
+        self._glue: Any = None
+        self._compiles: dict[int, int] = {}
+        self._compiles_lock = threading.Lock()
+
+    @property
+    def glue(self) -> Any:
+        """The glue that native step programs (``resin._resin.GaudiProgram``) run through on this device, or
+        None: resin built without the ``gaudi`` feature, or ``RESIN_GAUDI_PROGRAM=0`` (the Python launch loops)."""
+        if self._glue is None:
+            if os.environ.get("RESIN_GAUDI_PROGRAM", "1") == "0":
+                self._glue = False
+            else:
+                try:
+                    from resin._resin import GaudiGlue
+                except ImportError:
+                    self._glue = False
+                else:
+                    self._glue = GaudiGlue(str(self.libraries.runtime))
+        return self._glue or None
 
     def check(self, rc: int, what: str) -> int:
         if rc < 0:
@@ -149,11 +185,41 @@ class Device:
 
     @property
     def compile_count(self) -> int:
-        """Graph compilations in this process; deserialized recipes do not count."""
-        return int(self.lib.rg_compile_count())
+        """Graph compilations on the calling thread's current context, so that each model of a process counts
+        its own; deserialized recipes do not count."""
+        return self._compiles.get(int(self.lib.rg_context_current()), 0)
+
+    def count_compile(self) -> None:
+        """One more graph compiled on the current context (``RecipeCache``)."""
+        with self._compiles_lock:
+            context = int(self.lib.rg_context_current())
+            self._compiles[context] = self._compiles.get(context, 0) + 1
 
     def sync(self) -> None:
+        """Wait for the work of the current context."""
         self.check(self.lib.rg_sync(), "sync")
+
+    def sync_all(self) -> None:
+        """Wait for the work of every context."""
+        self.check(self.lib.rg_sync_all(), "sync_all")
+
+    # ---- contexts
+    def context(self, affinity: int = 0) -> DeviceContext:
+        """A new context: a stream on hardware queue slot ``affinity`` (a mask; 0: the lowest slot that no
+        context uses) with its own workspace and staging buffers. Work issues on it inside
+        :meth:`DeviceContext.use`. A recipe's workspace comes from the context that loads it."""
+        return DeviceContext(
+            self, self.check(self.lib.rg_context_create(int(affinity)), "context")
+        )
+
+    @property
+    def default_context(self) -> DeviceContext:
+        """The context that every thread starts on."""
+        return DeviceContext(self, 0)
+
+    def current_context(self) -> DeviceContext:
+        """The calling thread's current context."""
+        return DeviceContext(self, int(self.lib.rg_context_current()))
 
     # ---- memory
     def malloc(self, nbytes: int) -> int:
@@ -182,21 +248,23 @@ class Device:
         return np.frombuffer(raw, dtype=dtype, count=count).reshape(shape)
 
     # ---- copies
-    def begin_load(self, total_bytes: int, *, log=info) -> None:
-        """Report host-to-device bytes as weight loading progress until :meth:`end_load`."""
-        self._load = LoadProgress(total_bytes, log=log)
+    def begin_load(self, total_bytes: int) -> None:
+        """Report blocking uploads as the weights phase of startup progress until
+        :meth:`end_load`; ``total_bytes`` is an estimate."""
+        self._loading = True
+        progress.phase("weights", total=total_bytes)
 
     def end_load(self) -> None:
-        if self._load is not None:
-            self._load.finish()
-            self._load = None
+        if self._loading:
+            self._loading = False
+            progress.finish_weights()
 
     def h2d(self, address: int, array: np.ndarray) -> None:
         """Blocking upload."""
         array = np.ascontiguousarray(array)
         self.check(self.lib.rg_h2d(address, array.ctypes.data, array.nbytes), "h2d")
-        if self._load is not None:
-            self._load.add(array.nbytes)
+        if self._loading:
+            progress.advance(array.nbytes)
 
     def h2d_nb(self, address: int, array: np.ndarray) -> None:
         """Non-blocking upload of at most 64 KiB."""
@@ -247,6 +315,19 @@ class Device:
         self.check(self.lib.rg_memset32(address, value, count), "memset32")
 
     # ---- events
+    EVENT_SLOTS = 64
+    """The runtime's event slots (``kEvents`` in runtime.cpp), all handed out by ``event_slots``."""
+
+    def event_slots(self, count: int) -> int:
+        """The first of ``count`` event slots that no other model of this process uses."""
+        first = self._events
+        if first + count > self.EVENT_SLOTS:
+            raise SynapseError(
+                f"event slots: {count} more do not fit in {self.EVENT_SLOTS}"
+            )
+        self._events += count
+        return first
+
     def record(self, slot: int) -> None:
         self.check(self.lib.rg_event_record(slot), "event_record")
 
@@ -261,6 +342,23 @@ class Device:
     def done(self, slot: int) -> bool:
         return bool(self.check(self.lib.rg_event_query(slot), "event_query"))
 
+    def timed_event(self, slot: int) -> None:
+        """Event ``slot`` collects device time for :meth:`elapsed`; call it before the slot's first record."""
+        self.check(self.lib.rg_event_timed(slot), "event_timed")
+
+    def elapsed(self, start: int, end: int) -> float | None:
+        """Device seconds from what timed slot ``start`` recorded to what timed slot ``end`` recorded, or None
+        while either is pending (or its time is gone)."""
+        ns = int(self.lib.rg_event_elapsed(start, end))
+        if ns == -2:
+            return None
+        return self.check(ns, "event_elapsed") / 1e9
+
+    def stream_wait(self, slot: int) -> None:
+        """The current context's later work waits on the device, not on the host, for what event ``slot``
+        recorded (on any context)."""
+        self.check(self.lib.rg_event_stream_wait(slot), "stream_wait")
+
     def now_ns(self) -> int:
         return int(self.lib.rg_now_ns())
 
@@ -269,7 +367,7 @@ class Device:
         self.check(self.lib.rg_prof_start(), "prof_start")
 
     def prof_stop(self, tsv_path: str | Path) -> int:
-        """Stop after the stream drains; write the events as TSV and return their count."""
+        """Stop after every context drains; write the events as TSV and return their count."""
         return self.check(self.lib.rg_prof_stop(str(tsv_path).encode()), "prof_stop")
 
     # ---- collectives (HCCL): one communicator per process
@@ -283,6 +381,7 @@ class Device:
         buf = C.create_string_buffer(unique_id, len(unique_id))
         self.check(self.lib.rg_ccl_init(buf, nranks, rank), "ccl_init")
 
+    # Collectives issue on the current context.
     def allreduce(self, address: int, count: int, *, bf16: bool = False) -> None:
         """In-place sum over the ranks of ``count`` f32 (or bf16) values."""
         self.check(
@@ -305,6 +404,28 @@ class Device:
         atexit.unregister(self.close)
         if _DEVICE is self:
             _DEVICE = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceContext:
+    """A context of the device: where the calling thread's work issues inside :meth:`use`."""
+
+    device: Device
+    id: int
+
+    @property
+    def affinity(self) -> int:
+        """The hardware queue slot of the context's stream, as a mask."""
+        return int(self.device.lib.rg_context_affinity(self.id))
+
+    @contextmanager
+    def use(self):
+        """Issue the calling thread's work on this context for the body, then on the context before it."""
+        previous = self.device.check(self.device.lib.rg_context_use(self.id), "context")
+        try:
+            yield self
+        finally:
+            self.device.lib.rg_context_use(previous)
 
 
 _DEVICE: Device | None = None
@@ -344,6 +465,8 @@ def open_device(
             )
         return _DEVICE
     os.environ["HABANA_LOGS"] = _log_directory(default_cache_root())
+    if progress.current() is None:
+        progress.phase("kernels")
     libraries = libraries or build_native()
     if not synapse_build().startswith(("synapse-", f"habanalabs-graph-{TESTED_SYNAPSE}")):
         logger.warning(f"{synapse_build()} is not the tested Synapse {TESTED_SYNAPSE}")
@@ -376,7 +499,23 @@ def open_device(
             time.sleep(1.0)
     _DEVICE = Device(lib, chosen, libraries)
     atexit.register(_DEVICE.close)
+    if features.enabled("skipvalidation") and skipped_launch_validations() is None:
+        logger.warning(
+            "the skipvalidation feature is on but its library is not preloaded (give -f skipvalidation on the "
+            "command line, which preloads it into the ranks): Synapse still checks every launch"
+        )
     return _DEVICE
+
+
+def skipped_launch_validations() -> int | None:
+    """Launches whose binding check the ``skipvalidation`` feature skipped in this process, or None when its library
+    is not preloaded."""
+    try:
+        count = C.CDLL(None).resin_gaudi_skipped_validations
+    except AttributeError:
+        return None
+    count.restype = C.c_long
+    return int(count())
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,17 +526,21 @@ class Claim:
 
 
 @contextmanager
-def claim_card(rank: int = 0, *, wait: float = 60.0, numa: str = "auto"):
+def claim_card(
+    rank: int = 0, *, wait: float = 60.0, numa: str = "auto", module: int | None = None
+):
     """Open a visible card for this rank, and stay on its NUMA node for the body.
 
-    The rank starts at its own position in the list and skips busy cards. Each candidate is tried
-    under its own binding. Yields a :class:`Claim`, or None when no card came free within ``wait``
-    seconds.
+    The rank starts at its own position in the list and skips busy cards; with ``module``, it
+    takes only the card of that module. Each candidate is tried under its own binding. Yields a
+    :class:`Claim`, or None when no card came free within ``wait`` seconds.
     """
     from resin import numa as numa_module
 
     cards = visible_cards()
     order = cards[rank % len(cards) :] + cards[: rank % len(cards)] if cards else []
+    if module is not None:
+        order = [card for card in cards if card.module == module]
     deadline = time.monotonic() + wait
     while True:
         for card in order:

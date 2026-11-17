@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Q4_K planar -> bf16 for the paged MoE batch_gemm (the paged interface of syn_qdq.c -DPAGED): out[r, k, p] =
 // W_{pe[p]}[r, k] as bf16 [M, K, P]; pages with pe[p] < 0 are left as they are. The dequant chain is
 // the Q4_K one of syn_qdq.c (see there); here the items are the (page, row block, superblock) of the member's

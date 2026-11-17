@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Fused Qwen3.5 gated-delta-net block for one value head per member:
 //   causal conv1d(k=4)+SiLU on the head's q/k/v channels, l2-norm(q,k), q*=1/sqrt(128),
 //   gates beta = sigmoid(b), eg = exp(ssm_a * softplus(a + dt_bias)),

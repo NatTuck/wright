@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // SwiGLU: out = bf16( silu(g) * u ), sigma order.   gu = [g (F) | u (F)]
 // tensors: 0 gu (2F,T) f32 | 1 out (F,T) bf16.  index space: [F/128, T]
 // FP8 build (-DFP8): gu is an FP8-GEMM output with per-token scale gs (1,T); the output is f32

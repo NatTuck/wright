@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MoE router, sigmoid scoring (GLM-5.3-Flash, noaux_tc with one group): s = sigmoid(logit); the K
 // largest of s + bias are chosen (ties: lowest index), their weights are s normalized over the K and
 // scaled: w_k = scale * s_k / (sum s + 1e-20). Padding tokens (t >= meta[1]) get ids -1, weights 0.

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // mHC site projection of one token in K chunks, for mhc_coef1: partial dots mixp[j, c] = fn_j . X over chunk c
 // of the K = 4H positions, four rows per member (each X vector loaded once for the four), and the chunk's sum of
 // squares of X, ssp[c] (row group 0).

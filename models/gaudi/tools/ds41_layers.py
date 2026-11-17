@@ -160,7 +160,7 @@ def run(rank: int, nranks: int, args) -> None:
     device = open_device()
     say(f"rank {rank}: accel{device.card}", flush=True)
     if nranks > 1:
-        from resin_models_gaudi.mistral_large4.parallel import (
+        from resin_models_gaudi.ranks import (
             hccl_rendezvous,
             init_gloo,
         )
@@ -203,7 +203,7 @@ def run(rank: int, nranks: int, args) -> None:
             resident[layer] = names
             say(f"layer {layer} resident", flush=True)
         if layers[-1] == cfg.num_hidden_layers - 1:
-            from resin_models_gaudi.qwen3_5.checkpoint import kperm
+            from resin_models_gaudi.loading.convert import kperm
 
             bound.put("head", kperm(src.read("head.weight", sl.vocab)))
             bound.put(
@@ -431,7 +431,7 @@ def run(rank: int, nranks: int, args) -> None:
                     bound.drop(name)
         if layers[-1] == cfg.num_hidden_layers - 1:
             if not timing:
-                from resin_models_gaudi.qwen3_5.checkpoint import kperm
+                from resin_models_gaudi.loading.convert import kperm
 
                 bound.put("head", kperm(src.read("head.weight", sl.vocab)))
                 bound.put(

@@ -15,12 +15,29 @@ use pyo3::types::{PyDict, PyTuple};
 
 mod arrays;
 mod cache;
+#[cfg(feature = "gaudi")]
+mod gaudi;
+#[cfg(all(feature = "gaudi", target_os = "linux"))]
+mod gaudi_ds41;
+#[cfg(all(feature = "gaudi", target_os = "linux"))]
+mod gaudi_exec;
+#[cfg(feature = "gaudi")]
+mod gaudi_gate;
+#[cfg(all(feature = "gaudi", target_os = "linux"))]
+mod gaudi_glm;
+#[cfg(all(feature = "gaudi", target_os = "linux"))]
+mod gaudi_qwen;
+#[cfg(all(feature = "gaudi", target_os = "linux"))]
+mod gaudi_ranks;
 mod http;
 mod http_distributed;
 mod http_logprobs;
 mod http_output;
+#[cfg(target_os = "linux")]
+mod http_replicas;
 mod http_session;
 mod http_stop;
+mod logging;
 mod media_payload;
 mod media_preprocess;
 mod metrics;
@@ -33,8 +50,16 @@ mod recipe_events;
 mod recipe_media;
 mod recipe_types;
 mod runner;
+#[cfg(unix)]
+mod slab_table;
+#[cfg(target_os = "linux")]
+mod step_channel;
+#[cfg(all(feature = "gaudi", target_os = "linux"))]
+mod step_trace;
 
-use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
+use cache::{
+    CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CachePool, CacheRetention,
+};
 use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
 use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
@@ -1263,6 +1288,15 @@ struct PendingExecution {
 }
 
 impl Engine {
+    /// Keep a report of every committed step for the HTTP session's log lines.
+    pub(crate) fn enable_step_reports(&mut self) {
+        self.core.set_step_reports(true);
+    }
+
+    pub(crate) fn take_step_reports(&mut self) -> Vec<core::StepReport> {
+        self.core.take_step_reports()
+    }
+
     fn step_once(
         &mut self,
         py: Python<'_>,
@@ -1533,7 +1567,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, enable_overlap = true, enable_metrics = true, cache_pool = None, cache_floor = 0))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1547,7 +1581,12 @@ impl Engine {
         prefix_cache: bool,
         enable_overlap: bool,
         enable_metrics: bool,
+        cache_pool: Option<Py<CachePool>>,
+        cache_floor: u32,
     ) -> PyResult<Self> {
+        if cache_pool.is_none() && cache_floor != 0 {
+            return Err(PyValueError::new_err("cache_floor requires cache_pool"));
+        }
         let runner_enqueue = optional_runner_callable(py, runner.bind(py), "enqueue")?;
         let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let resolved = resolve_runner_config(py, runner.bind(py))?;
@@ -1556,7 +1595,7 @@ impl Engine {
             .as_ref()
             .map(|config| *config.borrow(py))
             .unwrap_or_default();
-        let mut core = core::EngineCore::new(
+        let mut core = core::EngineCore::in_pool(
             core::RunnerConfig {
                 max_batch_tokens: config.max_batch_tokens,
                 prefill_chunk_size: config.prefill_chunk_size,
@@ -1566,6 +1605,9 @@ impl Engine {
                     .cache_layout
                     .as_ref()
                     .map(|layout| layout.get().inner_native().clone()),
+                max_speculative_rows: config.max_speculative_rows,
+                continuation_extension: config.continuation_extension,
+                draft_tokens: config.draft_tokens,
             },
             max_running_requests,
             context_length,
@@ -1576,6 +1618,9 @@ impl Engine {
                 decode_share: scheduler.decode_share,
             },
             prefix_cache,
+            cache_pool
+                .as_ref()
+                .map(|pool| (&pool.get().inner, cache_floor)),
         )
         .map_err(core_error)?;
         if enable_metrics {
@@ -1587,12 +1632,13 @@ impl Engine {
             kwargs.set_item("enabled", enable_metrics)?;
             configure.bind(py).call((), Some(&kwargs))?;
         }
+        let runner_config = bind_runner_resources(py, resolved, core.cache_pool_id())?;
+        // after the binding: a runner can attach a native `metrics_snapshot` there (its executor's)
         let runner_metrics = if enable_metrics {
             optional_runner_callable(py, runner.bind(py), "metrics_snapshot")?
         } else {
             None
         };
-        let runner_config = bind_runner_resources(py, resolved, core.cache_pool_id())?;
         Ok(Self {
             core,
             runner_forward,
@@ -1906,6 +1952,20 @@ impl Engine {
         self.core.context_length()
     }
 
+    /// Decode steps with more rows than this lease no write lookahead and
+    /// verify no drafts (the runner config's `max_speculative_rows`; None: any
+    /// step may). Set it between steps for a runner that turns its drafts off
+    /// (0) or on again; it fails while a step is in flight.
+    #[getter]
+    fn max_speculative_rows(&self) -> Option<u32> {
+        self.core.max_speculative_rows()
+    }
+
+    #[setter]
+    fn set_max_speculative_rows(&mut self, rows: Option<u32>) -> PyResult<()> {
+        self.core.set_max_speculative_rows(rows).map_err(core_error)
+    }
+
     #[getter]
     fn cache_layout(&self, py: Python<'_>) -> Option<Py<CacheLayout>> {
         self.runner_config
@@ -2050,8 +2110,8 @@ mod _resin {
     #[pymodule_export]
     use super::{
         BatchPhase, BatchPlan, CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout,
-        CacheRetention, Engine, ForwardOutput, Parallelism, RequestLease, ResourceBinding,
-        RunnerConfig, SamplingParams, SchedulerConfig, TokenEvent, TokenLogprobs,
+        CachePool, CacheRetention, Engine, ForwardOutput, Parallelism, RequestLease,
+        ResourceBinding, RunnerConfig, SamplingParams, SchedulerConfig, TokenEvent, TokenLogprobs,
     };
 
     #[pymodule_export]
@@ -2059,8 +2119,47 @@ mod _resin {
         _runner_metrics_prometheus_protobuf, EngineMetrics, HistogramAccumulator, RunnerMetrics,
     };
 
+    #[cfg(feature = "gaudi")]
+    #[pymodule_export]
+    use crate::gaudi::{
+        Ds41Context, Ds41Fill, FnextFill, GaudiGlue, GaudiProgram, GlmDraftPolicy, GlmFill,
+        QwenDraftTables, QwenFill, qwen_philox_uniform,
+    };
+
+    #[cfg(feature = "gaudi")]
+    #[pymodule_export]
+    use crate::gaudi_gate::{CardGate, GateCounts};
+
+    #[cfg(all(feature = "gaudi", target_os = "linux"))]
+    #[pymodule_export]
+    use crate::gaudi_ds41::{Ds41Completion, Ds41Executor, Ds41Feedback, Ds41Verification};
+
+    #[cfg(all(feature = "gaudi", target_os = "linux"))]
+    #[pymodule_export]
+    use crate::gaudi_glm::{GlmCompletion, GlmExecutor, GlmFeedback, GlmVerification};
+
+    #[cfg(all(feature = "gaudi", target_os = "linux"))]
+    #[pymodule_export]
+    use crate::gaudi_qwen::{QwenCompletion, QwenDraftPolicy, QwenExecutor, QwenFeedback};
+
+    #[cfg(all(feature = "gaudi", target_os = "linux"))]
+    #[pymodule_export]
+    use crate::gaudi_ranks::GaudiRanks;
+
     #[pymodule_export]
     use crate::http::NativeHttpServer;
+
+    #[cfg(target_os = "linux")]
+    #[pymodule_export]
+    use crate::step_channel::{StepChannelDriver, StepChannelFollower};
+
+    #[cfg(unix)]
+    #[pymodule_export]
+    use crate::slab_table::{SlabSide, SlabTable};
+
+    #[cfg(target_os = "linux")]
+    #[pymodule_export]
+    use crate::http_replicas::{ReplicaRouter, ReplicaServer};
 
     #[pymodule_export]
     use crate::http_distributed::{HttpEvents, HttpIngress};
@@ -2068,6 +2167,8 @@ mod _resin {
     #[pymodule_export]
     use crate::http_session::NativeHttpSession;
 
+    #[pymodule_export]
+    use crate::logging::{set_log_level, set_log_sink};
     #[pymodule_export]
     use crate::numa::{_numa_get_policy, _numa_set_policy};
 
@@ -2100,6 +2201,12 @@ mod _resin {
     #[pymodule_export]
     #[allow(non_upper_case_globals)]
     const __version__: &str = env!("CARGO_PKG_VERSION");
+
+    #[pymodule_init]
+    fn init(_module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+        crate::logging::install();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2151,7 +2258,7 @@ mod tests {
         });
     }
 
-    fn wire_plan(group_index: u32) -> BatchPlan {
+    pub(crate) fn wire_plan(group_index: u32) -> BatchPlan {
         let group = CacheGroupPlan::from_parts(
             group_index,
             vec![0, 1],

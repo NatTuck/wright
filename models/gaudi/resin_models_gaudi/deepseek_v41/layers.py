@@ -28,6 +28,7 @@ ROPE = 64
 WINDOW = 128
 PAGE = 128  # tokens per latent page: 128 FP8 rows and one row of their scales
 QUERY_BLOCK_DENSE = 128  # prefill columns per slot of the dense compressed attention
+DECODE_TOKENS = 16  # steps of up to 16 tokens: a slot merge member per token
 ROW_BYTES = 512
 ARENA_BLOCK_ROWS = 1024
 
@@ -87,6 +88,9 @@ class Dims:
 
 class LayerGraph(GlmLayerGraph):
     """GLM's building blocks with DeepSeek-V4.1's power-of-two activation scales."""
+
+    COEF_PER_TOKEN = DECODE_TOKENS
+    MIX_CHUNKS = DECODE_TOKENS
 
     def __init__(self, device: Device, name: str, dims: Dims, tokens: int) -> None:
         self.g = Graph(
@@ -734,6 +738,73 @@ MARKOV_RANK = 256  # DSpark's Markov head width
 INDEX_SCALE = 1.0 / 64  # index_head_dim^-0.5 * index_heads^-0.5
 
 
+def _compress_store(
+    lg: LayerGraph, arena, h32, *, ratio: int, groups: int, state_rows: int
+) -> None:
+    """A KV owner's compressor on the collapsed h32 (H, T): ``groups`` latents, normed, their index keys and the
+    latents (RoPE, FP4) stored with ``cmp_store`` (see attention_pre_graph)."""
+    D, H, T, G = lg.d.head_dim, lg.d.hidden, lg.T, groups
+    kvc = lg.tensor((D, T), F32)
+    lg.node("gemm", [h32, lg.input("cmp_wkv", (H, D), F32)], [kvc], GEMM_NT)
+    if ratio > 1:
+        gate = lg.tensor((D, T), F32)
+        lg.node("gemm", [h32, lg.input("cmp_wgate", (H, D), F32)], [gate], GEMM_NT)
+        lat = lg.tensor((D, G), F32)
+        state = lg.input("cmp_state", (2 * D, state_rows), F32)
+        lg.node(
+            "rg_ds_cpool_f32",
+            [kvc, gate, state, lg.input("cmp_groups", (4, G), I32)],
+            [lat],
+        )
+        lg.node(
+            "rg_ds_cstate_f32",
+            [kvc, gate, lg.input("cmp_rows", (T,), I32), state, lat],
+            [lg.input("cmp_sink", (64, 1), I32)],
+        )
+    else:
+        lat = kvc
+    latn = lg.norm(lat, "cmp_norm")
+    cs_g = lg.input("cs_g", (128, G), F32)
+    k = lg.tensor((INDEX_DIM, G), F32)
+    lg.node(
+        "gemm",
+        [lg.cast16(latn), lg.input("ix_wk", (D, INDEX_DIM), BF16)],
+        [k],
+        GEMM_NT,
+    )
+    ix32 = lg.fq4(lg.ds_rope(k, cs_g, 1, norm="ix_knorm"), 0)
+    lq = lg.fq4(lg.rope(latn, cs_g, 1), 1)
+    lg.node(
+        "rg_mla_store_i8_f32",
+        [arena, lg.input("cmp_store", (8, G), I32), lq, ix32],
+        [lg.input("cmp_stored", (64, 1), I32)],
+    )
+
+
+def owner_store_graph(
+    device: Device,
+    dims: Dims,
+    tokens: int,
+    blocks: int,
+    *,
+    ratio: int,
+    groups: int,
+    state_rows: int = 1,
+) -> Graph:
+    """Bounded replay's cut: a KV owner's first launch reduced to its compressor. The residual (``X_out``), the
+    collapse, and the latents and index keys of every column stored as attention_pre_graph stores them; no
+    queries, window keys or attention. The layers after the owner then run only on the kept columns."""
+    lg = LayerGraph(
+        device, f"owner_store_T{tokens}_r{ratio}_G{groups}_R{state_rows}", dims, tokens
+    )
+    X = lg.residual()
+    _, h32, _, _ = lg.collapse8(X, lg.input("c", (tokens, 24), F32), "attn_norm")
+    _compress_store(
+        lg, lg.arena(blocks), h32, ratio=ratio, groups=groups, state_rows=state_rows
+    )
+    return lg.g
+
+
 def attention_pre_graph(
     device: Device,
     dims: Dims,
@@ -834,10 +905,12 @@ def attention_pre_graph(
     )
     pv = lg.tensor((D, M, S), F32)
     lg.node("batch_gemm", [P, ks], [pv], GEMM_NN)
+    if qb == 1:  # a slot per column
+        ml = _slot_merge(W, T)
+    else:  # few columns: one member each; else a scan of the slots
+        ml = "rg_ds_slot_ml1_f32" if W <= 32 else "rg_ds_slot_ml_f32"
     lg.node(
-        "rg_ds_slot_ml1_f32"
-        if W <= 32
-        else "rg_ds_slot_ml_f32",  # few columns: one member each
+        ml,
         [pv, mx, ls, table],
         [
             lg.input("o1", (D, W, 1), F32),
@@ -846,41 +919,7 @@ def attention_pre_graph(
         ],
     )
     if owner:
-        kvc = lg.tensor((D, T), F32)
-        lg.node("gemm", [h32, lg.input("cmp_wkv", (H, D), F32)], [kvc], GEMM_NT)
-        if ratio > 1:
-            gate = lg.tensor((D, T), F32)
-            lg.node("gemm", [h32, lg.input("cmp_wgate", (H, D), F32)], [gate], GEMM_NT)
-            lat = lg.tensor((D, G), F32)
-            state = lg.input("cmp_state", (2 * D, state_rows), F32)
-            lg.node(
-                "rg_ds_cpool_f32",
-                [kvc, gate, state, lg.input("cmp_groups", (4, G), I32)],
-                [lat],
-            )
-            lg.node(
-                "rg_ds_cstate_f32",
-                [kvc, gate, lg.input("cmp_rows", (T,), I32), state, lat],
-                [lg.input("cmp_sink", (64, 1), I32)],
-            )
-        else:
-            lat = kvc
-        latn = lg.norm(lat, "cmp_norm")
-        cs_g = lg.input("cs_g", (128, G), F32)
-        k = lg.tensor((INDEX_DIM, G), F32)
-        lg.node(
-            "gemm",
-            [lg.cast16(latn), lg.input("ix_wk", (D, INDEX_DIM), BF16)],
-            [k],
-            GEMM_NT,
-        )
-        ix32 = lg.fq4(lg.ds_rope(k, cs_g, 1, norm="ix_knorm"), 0)
-        lq = lg.fq4(lg.rope(latn, cs_g, 1), 1)
-        lg.node(
-            "rg_mla_store_i8_f32",
-            [arena, lg.input("cmp_store", (8, G), I32), lq, ix32],
-            [lg.input("cmp_stored", (64, 1), I32)],
-        )
+        _compress_store(lg, arena, h32, ratio=ratio, groups=G, state_rows=state_rows)
     if source:
         qi = lg.gemm8(qr8, "ix_wq_b", INDEX_HEADS * INDEX_DIM)
         qi = lg.ds_rope(
@@ -1221,11 +1260,18 @@ def attention_out_graph(
         lg.tensor((W, 1), F32),
         lg.tensor((W, 1), F32),
     )
-    # few columns: one member each; else each column's slot is the column (no scan of the slots)
-    ml = "rg_ds_slot_ml1_f32" if W <= 32 else "rg_ds_slot_mld_f32"
-    lg.node(ml, [pv, mx, ls, lslots], [o2, m2, l2])
+    lg.node(_slot_merge(W, T), [pv, mx, ls, lslots], [o2, m2, l2])
     _attention_comb(lg, o2, m2, l2)
     return lg.g
+
+
+def _slot_merge(W: int, T: int) -> str:
+    """The slot merge build for W columns of T tokens when column c's slot is c // heads (one slot per column, in
+    column order): one member per column for few columns, one per 8 columns (a token's heads) for the other decode
+    steps, else 64 columns per member. Only ds_slot_ml1 scans the slots."""
+    if W <= 32:
+        return "rg_ds_slot_ml1_f32"
+    return "rg_ds_slot_ml8_f32" if T <= DECODE_TOKENS else "rg_ds_slot_mld_f32"
 
 
 def _attention_comb(lg: LayerGraph, o2: Tensor, m2: Tensor, l2: Tensor) -> None:

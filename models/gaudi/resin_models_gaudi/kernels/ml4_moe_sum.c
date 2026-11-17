@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Mistral-Large-4 MoE output + residual: out[:, t] = x[:, t] + sh[:, t] + sum_k wts[t, k] * y[:, t K + k]
 // tensors: 0 y (H, K T) f32 (the routed down GEMV's slots)  1 wts (64, T) f32  2 x (H, T) f32  3 sh (H, T) f32
 //          | 4 out (H, T) f32

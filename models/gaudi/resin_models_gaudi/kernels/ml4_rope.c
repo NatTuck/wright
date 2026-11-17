@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Mistral-Large-4: RoPE (adjacent pairs (2i, 2i+1), as apply_rotary_pos_emb_interleave) on rows r0 .. r0 + 63 of each
 // column (r0 < 0: none), then the SSMax query scale s[h] * lp[t] + b[h] on the whole column (s = 0, b = 1: none).
 // Columns c = t * hpt + h of x (the GEMV output: token-major heads); y is written head-major, y[:, t, h] (hm = 1), or

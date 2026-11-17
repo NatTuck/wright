@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DSA index keys of one slot (DeepSeek-V4.1, FP8 index pages; see mla_store_i8.c): the slot's C keys from its
 // index pages into a dense FP8 slab, and each key's scale. An index page holds 128 keys of 128 FP8 bytes, four
 // per row from its first row, then a row of their f32 scales. Keys at or past the slot's klen (slots[4, s], from

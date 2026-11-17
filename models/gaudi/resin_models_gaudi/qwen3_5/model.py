@@ -21,61 +21,230 @@ accepts d_1 .. d_m while d_t = y_(t-1), emits y_0 .. y_m, commits the first m + 
 through the MTP layer. A prefill runs the MTP layer over its chunk (filling its KV) and drafts
 after the sampled token. Output equals non-speculative decoding: every token is the target's
 sample at its position.
+
+DFlash 2 (``drafter`` = a ``Qwen3.8-27B-DFlash2`` directory, ``dflash.py``): the same verify step
+with K drafts (``mtp`` = 1 .. 7, default 7: the block makes 7, a step may verify fewer), and the
+drafts come from the separate block-diffusion drafter instead of the MTP layer: every target pass feeds its tap layers' residuals to the drafter's cache, and after the
+accepted tokens are known one block step makes the next 7 drafts. MTP and the drafter are
+alternatives. A ``Qwen3.8-27B-DSpine-b16`` directory selects the DSpine drafter in the same place:
+its block makes 15 drafts (``mtp`` = 1 .. 15, default 15).
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import struct
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import numpy as np
 
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.speculative import SpeculativeStats
-from resin_models_gaudi.qwen3_5.attention import SlotRow, kv_rows, plan_slots
-from resin_models_gaudi.qwen3_5.cache import ROW_BYTES, STATE_TOKENS, CacheGeometry
-from resin_models_gaudi.qwen3_5.checkpoint import Qwen35Checkpoint, rope_table
-from resin_models_gaudi.qwen3_5.layers import (
+from resin_models_gaudi.arena import ARENA_PAD_BLOCKS, SharedArena
+from resin_models_gaudi.common.attention import SlotRow, kv_rows, plan_slots
+from resin_models_gaudi.common.dflash import (
+    Drafter,
+    DrafterConfig,
+    DraftRow,
+    drafter_is_fp8,
+    slots_per_launch,
+)
+from resin_models_gaudi.common.dflash import prepare_weights as prepare_drafter
+from resin_models_gaudi.common.dflash import tap_graph as dflash_tap_graph
+from resin_models_gaudi.common.layers import (
     ARENA_BLOCK_ROWS,
+    FUSED_QUERY_BLOCK,
     QUERY_BLOCK,
-    SCORE_PAIRS,
-    SCORE_ROWS,
     SLOT_KEYS,
     Dims,
+    attn_slots_graph,
+)
+from resin_models_gaudi.common.sampling import (
+    PARAMS,
+    TOP_MAX,
+    Sampling,
+    row_params,
+)
+from resin_models_gaudi.common.scoring import ScoreRequest, Scores
+from resin_models_gaudi.common.weights import weight_items
+from resin_models_gaudi.loading.convert import rope_table
+from resin_models_gaudi.loading.progress import progress, weight_file_bytes
+from resin_models_gaudi.loading.shard import DenseShard
+from resin_models_gaudi.loading.upload import WeightLoader
+from resin_models_gaudi.qwen3_5.cache import (
+    ROW_BYTES,
+    STATE_TOKENS,
+    CacheGeometry,
+    kv8_bits,
+)
+from resin_models_gaudi.qwen3_5.checkpoint import Qwen35Checkpoint
+from resin_models_gaudi.qwen3_5.layers import (
+    SCORE_PAIRS,
+    SCORE_ROWS,
     attn_post_graph,
     attn_pre_graph,
     attn_proj,
-    attn_slots_graph,
     commit_graph,
     embed_graph,
     gdn_layer_graph,
     head_graph,
     hidden_store_graph,
+    mlp_graph,
     mtp_in_graph,
     score_graph,
 )
-from resin_models_gaudi.qwen3_5.sampling import (
-    PARAMS,
-    TOP_MAX,
-    philox_uniform,
-    row_params,
-)
-from resin_models_gaudi.qwen3_5.weights import DeviceWeights
-from resin_models_gaudi.synapse.graph import LaunchPlan, Recipe, RecipeCache
-from resin_models_gaudi.synapse.progress import weight_file_bytes
-from resin_models_gaudi.synapse.runtime import Device
+from resin_models_gaudi.synapse.graph import Graph, LaunchPlan, Recipe, RecipeCache
+from resin_models_gaudi.synapse.runtime import I32, Device
 
 PREFILL_BUCKETS = (128, 256, 512, 1024, 2048, 4096)
-DECODE_BUCKETS = (1, 2, 4, 8, 16, 32)
+DECODE_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
+# the widest decode bucket of a speculative step (rows): wider decode steps run without drafts. Verify
+# modes, the drafter's block steps and the speculative buffers are sized from this, not DECODE_BUCKETS[-1]
+SPEC_ROWS = 32
+# verify widths (columns per row) a DSpine drafter's steps choose among, besides all 16
+DSPINE_WIDTHS = (4, 8)
+# P(a step accepts at least j of its drafts | the row's last step), j = 0 .. 15, by class of the
+# last step: accepted 0, 1, 2, 3, 4-5, 6-8, 9-14, 15, then at least 3 (all, at width 4) and at
+# least 7 (all, at width 8). Measured with the DSpine drafter verifying all 15 drafts (scripts/
+# bench.py, greedy code and English, 8K context, 1 and 8 rows, 2026-11-09).
+# fmt: off
+SURVIVAL = np.array(
+    (
+        (1.000, 0.695, 0.480, 0.329, 0.222, 0.151, 0.103, 0.065, 0.048, 0.036, 0.032, 0.028, 0.022, 0.017, 0.012, 0.012),
+        (1.000, 0.710, 0.487, 0.339, 0.216, 0.144, 0.090, 0.063, 0.041, 0.031, 0.023, 0.018, 0.012, 0.007, 0.006, 0.003),
+        (0.999, 0.747, 0.535, 0.346, 0.219, 0.151, 0.093, 0.069, 0.048, 0.035, 0.025, 0.015, 0.015, 0.010, 0.009, 0.008),
+        (0.999, 0.735, 0.511, 0.373, 0.262, 0.197, 0.130, 0.105, 0.082, 0.064, 0.049, 0.031, 0.029, 0.024, 0.024, 0.014),
+        (0.999, 0.735, 0.535, 0.387, 0.293, 0.226, 0.157, 0.114, 0.090, 0.060, 0.042, 0.023, 0.018, 0.013, 0.013, 0.013),
+        (0.999, 0.802, 0.618, 0.490, 0.344, 0.242, 0.173, 0.132, 0.121, 0.109, 0.104, 0.083, 0.070, 0.055, 0.052, 0.050),
+        (0.998, 0.852, 0.731, 0.593, 0.520, 0.439, 0.407, 0.346, 0.302, 0.277, 0.253, 0.229, 0.217, 0.168, 0.144, 0.128),
+        (0.998, 0.983, 0.938, 0.879, 0.865, 0.820, 0.736, 0.682, 0.667, 0.653, 0.643, 0.628, 0.589, 0.549, 0.534, 0.515),
+        (1.000, 0.785, 0.604, 0.472, 0.373, 0.301, 0.235, 0.195, 0.172, 0.150, 0.135, 0.116, 0.107, 0.092, 0.087, 0.080),
+        (0.999, 0.876, 0.756, 0.643, 0.571, 0.497, 0.440, 0.388, 0.363, 0.347, 0.334, 0.315, 0.297, 0.257, 0.241, 0.227),
+    )
+)
+# fmt: on
+SURVIVAL_CLASS = (0, 1, 2, 3, 4, 4, 5, 5, 5, 6, 6, 6, 6, 6, 6, 7)
+
+
+def spec_fix_graph(
+    device: Device,
+    bucket: int,
+    width: int,
+    layers: int,
+    patches: int,
+    block_tokens: int,
+    table_words: int,
+) -> Graph:
+    """A verify step's acceptance and the tables after it on the device (``spec_fix``): the
+    samples ``tok_out`` against the step's input tokens ``fix_tin`` -> ``fix_acc``, the commit's
+    ``commit_bases`` / ``commit_counts`` / ``hidden_table`` and the next block step's tokens,
+    positions, anchors and slot records (the drafter's ``btok`` / ``bpos`` / ``banc`` /
+    ``dtables``)."""
+    g = Graph(device, f"qwen35_spec_fix_B{bucket}_Q{width}_L{layers}_P{patches}")
+    BL = bucket * layers
+    g.node(
+        "rg_spec_fix_f32",
+        [
+            g.input("tok_out", (width, bucket), I32),
+            g.input("fix_tin", (width, bucket), I32),
+            g.input("fix_rows", (8, bucket), I32),
+            g.input("fix_cb0", (4, BL), I32),
+            g.input("fix_cb1", (4, BL), I32),
+            g.input("fix_patch", (4, patches), I32),
+            g.input("fix_meta", (4,), I32),
+        ],
+        [
+            g.input("fix_acc", (bucket,), I32),
+            g.input("commit_bases", (4, BL), I32),
+            g.input("commit_counts", (BL,), I32),
+            g.input("hidden_table", (2, bucket), I32),
+            g.input("btok", (block_tokens,), I32),
+            g.input("bpos", (block_tokens,), I32),
+            g.input("banc", (bucket,), I32),
+            g.input("dtables", (table_words,), I32),
+        ],
+        struct.pack("i", layers),
+    )
+    return g
+
+
+def verify_mode(bucket: int, width: int, full: int) -> str:
+    """The verify mode of bucket rows of width columns (v{B} takes every draft)."""
+    return f"v{bucket}" if width == full else f"v{bucket}w{width}"
+
+
+def step_ms(width: int, bucket: int) -> float:
+    """A speculative step's time (ms) with the DSpine drafter, bucket rows of width
+    columns: a fit of one card's steps at 4K context."""
+    per_column = max(0.4, 0.71 - 0.026 * (bucket - 1))
+    return 22.3 + 1.44 * (bucket - 1) + per_column * bucket * width
+
+
+def plain_ms(bucket: int) -> float:
+    """A plain decode step's time (ms), bucket rows: a fit of one card's steps at 8K context."""
+    return 16.0 + 1.07 * bucket
+
+
+def mtp_step_ms(width: int, bucket: int) -> float:
+    """A speculative step's time (ms) with the MTP layer, bucket rows of width columns: a fit of
+    one card's MTP-2 steps at 8K context."""
+    return 18.0 + 0.92 * bucket * width
+
+
+def choose_width(
+    widths: Sequence[int], accepted: np.ndarray, width: int, bucket: int = 1
+) -> int:
+    """The next verify step's columns per row: the width of the most expected tokens per ms
+    (step_ms), each row's tokens expected from its accepted drafts this step (of width -
+    1 verified) through SURVIVAL."""
+    if len(widths) == 1:
+        return widths[0]
+    classes = []
+    for a in np.asarray(accepted).tolist():
+        if a >= width - 1 and width < 16:  # all accepted: at least a
+            classes.append(8 if width <= 4 else 9)
+        else:
+            classes.append(SURVIVAL_CLASS[min(int(a), 15)])
+    sums = np.cumsum(
+        SURVIVAL, axis=1
+    )  # sums[c, j]: expected drafts accepted of the first j
+    best, choice = -1.0, widths[-1]
+    for w in widths:
+        tokens = sum(1.0 + sums[c, min(w - 1, 15)] - SURVIVAL[c, 0] for c in classes)
+        rate = tokens / step_ms(w, bucket)
+        if rate > best:
+            best, choice = rate, w
+    return choice
+
+
 SMALL = 256  # bytes of each small device buffer
-WORKSPACE_RESERVE = (
-    2 << 30
-)  # bytes held back for recipe workspaces
+WORKSPACE_RESERVE = 2 << 30  # bytes held back for recipe workspaces
 CAPACITY_QUANTUM = 8
 SCORE_TOPS = (0, 64, 1024)  # top-logprob list lengths of the scoring recipes
 OFFSET_STRIDE = 32  # Philox offsets per position (resin.backend.sampling)
-DYNAMIC = ("slots", "k_pages", "v_pages", "mtp_prev", "mtp_tok")  # bound per launch
+# A split model on several cards all-gathers its partials in decode and verify steps whose columns times ranks are at
+# most GATHER_LIMIT, and each graph sums them in rank order (rsum). Wider steps all-reduce them.
+# RESIN_QWEN_TP_GATHER=0: always all-reduce.
+GATHER_LIMIT = int(os.environ.get("RESIN_QWEN_TP_GATHER", "64"))
+# The native executor puts the first slots of a decode or verify step in launches of WIDE_SLOTS slots, and only the
+# rest in the mode's narrow launches: a long context has far fewer attention launches. RESIN_QWEN_WIDE_SLOTS=0:
+# narrow launches only.
+WIDE_SLOTS = int(os.environ.get("RESIN_QWEN_WIDE_SLOTS", "64"))
+# A native prefill chunk launches the slots whose every key each query of the block sees first, without a mask
+# (the same results), and the others after them with one.
+# RESIN_QWEN_UNMASKED=0: every slot launch has a mask.
+UNMASKED = os.environ.get("RESIN_QWEN_UNMASKED", "1") != "0"
+DYNAMIC = (
+    "slots",
+    "k_pages",
+    "v_pages",
+    "mtp_prev",
+    "mtp_tok",
+    "fix_tin",
+)  # bound per launch
 
 
 def prefill_chunks(
@@ -114,71 +283,19 @@ class RowCache:
     mtp_blocks: np.ndarray | None = None
     state_first: int = 0
     state_rows: tuple[int, ...] = ()
+    draft_blocks: np.ndarray | None = None  # the DFlash drafter's DRAFT blocks (window)
+    draft_first: int = 0  # the logical block of draft_blocks[0]
 
     def state_at(self, position: int) -> int:
         if not self.state_rows:
             return self.state_dst
         return self.state_rows[position // STATE_TOKENS - self.state_first]
 
-
-@dataclass(frozen=True, slots=True)
-class Sampling:
-    """Sampler inputs of the rows (``sampling.row_params``), with each row's seed and the Philox
-    offset of its first sampled position, so later positions (verify columns, drafts) get their
-    own uniforms."""
-
-    params: np.ndarray
-    seeds: np.ndarray | None = None
-    offsets: np.ndarray | None = None
-
-    def at(self, rows: Sequence[int], steps: Sequence[int]) -> np.ndarray:
-        """Params of ``rows`` [i] at ``steps`` [i] positions past their first sampled one."""
-        rows = np.asarray(rows, np.int64)
-        return self._uniforms(
-            self.params[rows].copy(), rows, np.asarray(steps, np.int64)
-        )
-
-    def grid(self, rows: int, steps: Sequence[int]) -> np.ndarray:
-        """(rows, len(steps), PARAMS): the first ``rows`` rows at each of ``steps``, in one
-        Philox evaluation."""
-        steps = np.asarray(steps, np.int64)
-        index = np.repeat(np.arange(rows), len(steps))
-        out = self._uniforms(self.params[index].copy(), index, np.tile(steps, rows))
-        return out.reshape(rows, len(steps), -1)
-
-    def _uniforms(
-        self, out: np.ndarray, rows: np.ndarray, steps: np.ndarray
-    ) -> np.ndarray:
-        """Each sampled row's uniform at its step (greedy rows never read theirs)."""
-        if self.seeds is None or not len(out):
-            return out
-        sampled = out[:, 4] > 0.5
-        if sampled.any():
-            offsets = self.offsets[rows[sampled]] + steps[sampled] * OFFSET_STRIDE
-            out[sampled, 3] = philox_uniform(
-                self.seeds[rows[sampled]], offsets.astype(np.uint64)
-            ).astype(np.float32)
-        return out
-
-
-@dataclass(frozen=True, slots=True)
-class ScoreRequest:
-    """Prompt positions of a prefill to score: ``positions`` (indices into its tokens, whose
-    next-token distributions are scored), per position the token ids whose raw logprobs are
-    wanted (``targets``) and the number of top logprobs (``tops``, at most SCORE_TOPS[-1])."""
-
-    positions: np.ndarray
-    targets: Sequence[np.ndarray]
-    tops: np.ndarray
-
-
-@dataclass(frozen=True, slots=True)
-class Scores:
-    """Per scored position: the targets' logprobs, and the top ids and logprobs."""
-
-    targets: list[np.ndarray]
-    top_ids: list[np.ndarray]
-    top_logprobs: list[np.ndarray]
+    def draft_row(self, position: int) -> DraftRow:
+        """The drafter's view of this row with its block at ``position``."""
+        if self.draft_blocks is None:
+            raise ValueError("the row has no DRAFT blocks")
+        return DraftRow(position, self.draft_blocks, self.draft_first)
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +316,8 @@ class Verified:
     accepted: np.ndarray
     drafts: np.ndarray
     columns: list[np.ndarray] = field(default_factory=list)
+    width: int = 0
+    """columns per row of the step (its drafts + 1)"""
 
 
 class Staging:
@@ -215,6 +334,19 @@ class Staging:
         self.top_idx = device.host_buffer((columns, TOP_MAX), np.int32)
         self.top_lp = device.host_buffer((columns, TOP_MAX), np.float32)
         self.drafts = device.host_buffer((max(drafts, 1), rows), np.int32)
+        # a DFlash block step's [anchor, drafts] per row, ``next_width`` per row
+        self.next = device.host_buffer((rows, drafts + 1), np.int32)
+        self.next_width = drafts + 1
+        self.accepted = device.host_buffer(rows, np.int32)  # spec_fix's counts
+
+    def next_drafts(self, rows: int, drafts: int) -> np.ndarray:
+        """(rows, drafts) i64: the staged block step's drafts per row, zeros past its width."""
+        w = self.next_width
+        out = np.zeros((rows, drafts), np.int64)
+        flat = self.next.reshape(-1)[: rows * w].reshape(rows, w)
+        n = min(drafts, w - 1)
+        out[:, :n] = flat[:, 1 : n + 1]
+        return out
 
     def record(self, event: int = 0) -> None:
         self.device.record(self.slot + 2 * event)
@@ -232,6 +364,10 @@ class _Mode:
     per_row: int
     query_block: int
     slots: int
+    wide: int = 0
+    """slots of the mode's wide launches (0: none; the native executor's decode and verify steps)"""
+    full: bool = False
+    """the wide launches take the slots that need no mask (a fused prefill's), not the step's first slots"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,12 +379,30 @@ class Launched:
     sampling: Sampling | None
     stage: Staging | None
     mode: _Mode
+    device_accept: bool = False
+    """``spec_fix`` accepted on the device and the commit and block step are already queued"""
+    next_width: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class _Binds:
     slots: np.ndarray
     addresses: np.ndarray
+
+
+class _SpecHost:
+    """The model as its drafter's ``DrafterHost``: block steps take the speculative row buckets
+    (``spec_buckets``), not every decode bucket."""
+
+    def __init__(self, m) -> None:
+        self._m = m
+
+    @property
+    def decode_buckets(self) -> Sequence[int]:
+        return self._m.spec_buckets
+
+    def __getattr__(self, name: str):
+        return getattr(self._m, name)
 
 
 class Qwen35Gaudi:
@@ -270,65 +424,199 @@ class Qwen35Gaudi:
         decode_slots: int | None = None,
         mtp: int = 0,
         layers: int | None = None,
+        drafter: str | None = None,
+        defer_cache: bool = False,
+        verify_widths: Sequence[int] | None = None,
+        tensor_parallel: tuple[int, int] | None = None,
+        split: bool | None = None,
+        reduce_capacity: Callable[[int], int] | None = None,
+        native: bool = False,
+        cache_types: tuple[str, str] = ("bf16", "bf16"),
     ) -> None:
+        """``tensor_parallel``: (rank, ranks) of a tensor-parallel model, whose part of the model this rank
+        holds (``loading.shard``); the caller has made the device's communicator.
+        ``split``: split layers (``layers.split_entry``), which tensor parallelism takes and
+        ``RESIN_QWEN_TP_SPLIT=1`` forces on one card; only the native executor runs them.
+        ``reduce_capacity``: the cache capacity every rank agrees on (the smallest).
+        ``native``: the native executor makes the steps, so the modes also get its launches (wide slot launches,
+        a prefill chunk's slots without a mask); the Python executor takes neither, nor split layers.
+        ``cache_types``: the types of the K and V pages of the full-attention layers and the MTP layer
+        (``cache.KV_TYPES``: bf16 or fp8)."""
+        self.reduce_capacity = reduce_capacity
         self.device = device
         ckpt = Qwen35Checkpoint(checkpoint)
         self.config = config = ckpt.config
+        shard: DenseShard | None = None
+        if tensor_parallel is not None and tensor_parallel[1] > 1:
+            shard = ckpt.shard(*tensor_parallel)
+        self.shard = shard
+        self.nranks = 1 if shard is None else shard.nranks
+        if split is None:
+            split = self.nranks > 1 or os.environ.get("RESIN_QWEN_TP_SPLIT") == "1"
+        if self.nranks > 1 and not split:
+            raise ValueError("tensor parallelism takes split layers")
+        if split and not native:
+            raise ValueError("split layers run on the native executor only (not with the oldqwen feature)")
+        self.split = split
         self.dims = Dims.from_config(config)
-        self.mtp = mtp
+        # the MTP layer stays whole on every rank (``Qwen35Checkpoint.weights``): it keeps the model's dimensions
+        self.mtp_dims = self.dims
+        if shard is not None:
+            self.dims = self.dims.shard(shard)
+        # the MTP layer's drafts (0: none), or the DFlash 2 drafter's block
+        self.dfl_cfg = None if drafter is None else DrafterConfig.load(drafter, config)
+        if self.dfl_cfg is None:
+            self.mtp = self.K = mtp
+        else:  # the drafter's block makes dfl_cfg.drafts; a step verifies the first K of them
+            if not 0 <= mtp <= self.dfl_cfg.drafts:
+                raise ValueError(
+                    f"the drafter makes up to {self.dfl_cfg.drafts} drafts a step, not {mtp}"
+                )
+            self.mtp, self.K = 0, mtp or self.dfl_cfg.drafts
+        self.drafter: Drafter | None = None
+        # the columns per row a verify step may take (the largest: every draft); a DSpine
+        # drafter's step takes the one ``choose_width`` picks from the last step's acceptance
+        full = self.K + 1
+        if verify_widths is None:
+            dspine = self.dfl_cfg is not None and self.dfl_cfg.kind == "dspine"
+            verify_widths = DSPINE_WIDTHS if dspine else ()
+        self.verify_widths = (
+            tuple(
+                sorted({int(w) for w in verify_widths if 2 <= int(w) < full} | {full})
+            )
+            if self.K
+            else ()
+        )
+        self.next_width = full
+        # a test's verify width for every step after a prompt (None: ``choose_width``'s, from the acceptance)
+        self.force_width: int | None = None
+        # device acceptance for drafter steps (spec_fix), and the last step's counts that pick
+        # the next width
+        self.device_accept = True
+        self._last_accepted: np.ndarray = np.zeros(0, np.int64)
+        self._last_width = full
+        self._fix_launches = 0
         # verify acceptance counters (and the benchmark's fixed-acceptance mode)
-        self.speculation = SpeculativeStats(mtp)
-        self.geometry = CacheGeometry.from_config(config, mtp=mtp > 0)
+        self.speculation = SpeculativeStats(self.K)
+        self.geometry = CacheGeometry.from_config(
+            config,
+            mtp=self.mtp > 0,
+            draft_layers=0 if self.dfl_cfg is None else self.dfl_cfg.layers,
+            draft_layer_rows=0 if self.dfl_cfg is None else self.dfl_cfg.layer_rows,
+            draft_window=0 if self.dfl_cfg is None else self.dfl_cfg.window,
+            draft_write=max(buckets),
+            shard=shard,
+            mtp_kv_groups=self.mtp_dims.kv_groups,
+            # on one card the MTP layer takes the target's attention recipes and their shorter arena view (a split
+            # model's MTP layer has recipes of its own over the whole arena)
+            mtp_short_view=self.mtp > 0 and not self.split,
+            kv8=kv8_bits(cache_types),
+        )
         self.n_layers = layers or config.num_hidden_layers
         self.mtp_layer = config.num_hidden_layers  # the MTP layer's weight index
         self.full = [i for i in range(self.n_layers) if i in set(config.full_layer_ids)]
         self.gdn = [i for i in range(self.n_layers) if i not in set(self.full)]
         self.buckets = tuple(buckets)
         self.decode_buckets = tuple(decode_buckets)
+        self.spec_buckets = tuple(b for b in self.decode_buckets if b <= SPEC_ROWS)
         self.max_positions = max_positions
         self.modes: dict[str, _Mode] = {}
         for T in self.buckets:
+            qb = min(T, QUERY_BLOCK)
+            full = native and UNMASKED and bool(FUSED_QUERY_BLOCK) and qb >= FUSED_QUERY_BLOCK
             self.modes[f"p{T}"] = _Mode(
-                f"p{T}", T, T, min(T, QUERY_BLOCK), prefill_slots
+                f"p{T}", T, T, qb, prefill_slots, prefill_slots if full else 0, full
             )
         for B in self.decode_buckets:
             # by default one 2048-key chunk of every sequence and KV group per launch
             S = decode_slots or max(16, self.dims.kv_groups * B)
-            self.modes[f"d{B}"] = _Mode(f"d{B}", B, 1, 1, S)
-            if mtp:
-                Tq = mtp + 1
-                self.modes[f"v{B}"] = _Mode(f"v{B}", B * Tq, Tq, Tq, S)
+            wide = WIDE_SLOTS if native and WIDE_SLOTS > S and WIDE_SLOTS % S == 0 else 0
+            self.modes[f"d{B}"] = _Mode(f"d{B}", B, 1, 1, S, wide)
+            for Tq in self.verify_widths if B in self.spec_buckets else ():
+                name = verify_mode(B, Tq, self.K + 1)
+                self.modes[name] = _Mode(name, B * Tq, Tq, Tq, S, wide)
         self.columns = max(m.columns for m in self.modes.values())
         self.recipes = RecipeCache(device)
-        weight_layers = set(range(self.n_layers)) | ({self.mtp_layer} if mtp else set())
-        device.begin_load(weight_file_bytes(ckpt.path, "*.safetensors"))
-        self.weights = DeviceWeights(
-            device, self.recipes, ckpt, mtp=mtp > 0, layers=weight_layers
+        weight_layers = set(range(self.n_layers)) | (
+            {self.mtp_layer} if self.mtp else set()
         )
+        total = weight_file_bytes(ckpt.path, "*.safetensors")
+        if drafter is not None:
+            total += weight_file_bytes(Path(drafter), "*.safetensors")
+        device.begin_load(total)
+        # exact allocation sizes: free memory after the load sizes the cache arena
+        self.loader = WeightLoader(device, self.recipes, min_alloc=0)
+        self.loader.load(
+            weight_items(
+                ckpt.weights(mtp=self.mtp > 0, layers=weight_layers, shard=shard)
+            )
+        )
+        if self.dfl_cfg is not None:
+            logging.getLogger("wright").info(
+                f"drafter {self.dfl_cfg.kind} from {drafter} "
+                f"({'fp8_inc' if drafter_is_fp8(drafter) else 'bf16'})"
+            )
+            self.loader.load(
+                weight_items(prepare_drafter(drafter, self.dfl_cfg, head=ckpt.head))
+            )
         device.end_load()
+        self.weights = self.loader.w
         self._buffers()
-        if parent_capacity is None:
-            free, total = device.memory_info()
-            planned = plan_cache_capacity(
-                total,
-                free,
-                memory_utilization,
-                self.geometry.slab_bytes,
-                overhead_bytes=workspace_reserve,
-            ).parent_capacity
-            parent_capacity = max(1, planned // CAPACITY_QUANTUM * CAPACITY_QUANTUM)
-        self.parent_capacity = parent_capacity
-        self.blocks = self.geometry.arena_blocks(parent_capacity)
-        nbytes = self.blocks * ARENA_BLOCK_ROWS * ROW_BYTES
-        self.arena_bytes = nbytes
-        self.arena = device.malloc(nbytes)
-        device.memset32(self.arena, 0, nbytes // 4)
+        self.memory_utilization = memory_utilization
+        self.workspace_reserve = workspace_reserve
+        if not defer_cache:
+            self.attach(parent_capacity=parent_capacity)
+
+    def attach(
+        self, *, parent_capacity: int | None = None, arena: SharedArena | None = None
+    ) -> None:
+        """The cache arena, the recipes and their bindings. Without ``arena``, this model's
+        own arena from the card memory that is free (or ``parent_capacity`` slabs); with it,
+        the arena that this model shares with the other models of the card."""
+        device = self.device
+        if arena is not None:
+            if self.dfl_cfg is not None:
+                raise NotImplementedError("a DFlash drafter in a shared cache arena")
+            self.geometry = replace(self.geometry, shared_slab_rows=arena.slab_rows)
+            self.parent_capacity = arena.parent_capacity
+            self.blocks = arena.blocks
+            self.arena_bytes = arena.nbytes
+            self.arena = arena.address
+        else:
+            if parent_capacity is None:
+                free, total = device.memory_info()
+                planned = plan_cache_capacity(
+                    total,
+                    free,
+                    self.memory_utilization,
+                    self.geometry.slab_bytes,
+                    overhead_bytes=self.workspace_reserve,
+                ).parent_capacity
+                parent_capacity = max(
+                    1, planned // CAPACITY_QUANTUM * CAPACITY_QUANTUM
+                )
+                if self.reduce_capacity is not None:
+                    parent_capacity = self.reduce_capacity(parent_capacity)
+            self.parent_capacity = parent_capacity
+            self.blocks = self.geometry.arena_blocks(parent_capacity)
+            scratch_rows = self.blocks * ARENA_BLOCK_ROWS
+            if self.dfl_cfg is not None:  # the block steps' scratch pages follow the cache
+                extra = Drafter.scratch_rows(self.dfl_cfg, self.spec_buckets[-1])
+                self.blocks += -(-extra // ARENA_BLOCK_ROWS)
+                self.drafter = Drafter(
+                    _SpecHost(self), self.dfl_cfg, scratch_rows
+                )  # its buffers first
+            self.blocks += ARENA_PAD_BLOCKS  # the last attention layer's view ends past the slabs
+            nbytes = self.blocks * ARENA_BLOCK_ROWS * ROW_BYTES
+            self.arena_bytes = nbytes
+            self.arena = device.malloc(nbytes)
+            device.memset32(self.arena, 0, nbytes // 4)
         logging.getLogger("wright").info("preparing recipes")
         self._compile()
         workspace = max(r.workspace for r in self.recipe.values())
-        if workspace > workspace_reserve:
+        if workspace > self.workspace_reserve:
             raise MemoryError(
-                f"recipe workspace {workspace} exceeds the reserve {workspace_reserve}"
+                f"recipe workspace {workspace} exceeds the reserve {self.workspace_reserve}"
             )
         self._bind_all()
 
@@ -339,6 +627,9 @@ class Qwen35Gaudi:
         T = self.columns
         B = self.decode_buckets[-1]
         W = d.hpg * T
+        # the attention's buffers hold a whole MTP layer's (a tensor-parallel rank's layers have fewer KV groups)
+        dm = self.mtp_dims if self.mtp else d
+        G = max(G, dm.kv_groups)
 
         def buf(nbytes: int) -> int:
             return dev.malloc(_round(nbytes))
@@ -352,8 +643,26 @@ class Qwen35Gaudi:
             }
 
         self.carry = [carry(), carry()]
+        if self.split:  # the split layers' partials: the mixer's, then the MLP's (layers.split_entry)
+            # RESIN_QWEN_TP_PARTS (a debug aid, default 2): the number of partial buffers, used in turn
+            n_parts = int(os.environ.get("RESIN_QWEN_TP_PARTS", "2"))
+            self.parts = [buf(H * T * 4) for _ in range(n_parts)]
+            # steps of up to GATHER_LIMIT / ranks columns all-gather each partial into its gathered buffer (H, T, ranks)
+            gather_t = min(GATHER_LIMIT // self.nranks, T) if self.nranks > 1 else 0
+            self.gathered_parts = (
+                [buf(self.nranks * H * gather_t * 4) for _ in self.parts]
+                if gather_t
+                else []
+            )
+            self.ones_t = buf(T * 4)
+            dev.h2d(self.ones_t, np.ones(T, np.float32))
+            # RESIN_QWEN_DUMP (a debug aid): decode steps of up to 8 columns copy, for each layer, the mixer's carry
+            # out, its partial before and after the all-reduce, then the MLP's (6 slots of H x 8 f32 a layer)
+            self.dump = (
+                buf(6 * self.n_layers * H * 8 * 4) if os.environ.get("RESIN_QWEN_DUMP") else None
+            )
         self.buf = {
-            "p_out": buf(attn_proj(d) * T * 4),
+            "p_out": buf(max(attn_proj(d), attn_proj(dm)) * T * 4),
             "q_all": buf(256 * W * G * 2),
             "acc_o": buf(256 * W * G * 4),
             "acc_m": buf(max(W, 64) * G * 4),
@@ -416,9 +725,44 @@ class Qwen35Gaudi:
         score = row_params(SCORE_ROWS, d.vocab, logprobs=np.ones(SCORE_ROWS))
         dev.h2d(self.buf["score_params"], score)
         # two in-flight steps' output copies (the Engine keeps one step ahead)
-        self.staging = [Staging(dev, T, self.mtp, B, slot) for slot in (0, 1)]
+        # two staging sets, each with two events (slot + 2 event): four event slots of this model
+        events = dev.event_slots(4)
+        self.staging = [
+            Staging(dev, T, self.K, B, events + slot) for slot in (0, 1)
+        ]
+        self.spec_buf: dict[str, int] = {}
+        if self.K:
+            Tq, L = self.K + 1, len(self.gdn)
+            B = self.spec_buckets[-1]  # rows of a speculative step
+            self.spec_buf = {
+                "commit_bases": buf(4 * B * L * 4),
+                "commit_counts": buf(B * L * 4),
+                # an enqueued MTP step's continuation tokens [anchor, d_1 .. d_K] per row: the
+                # anchor and d_1 from the host, d_2 .. d_K copied from the draft chain
+                "next_tok": buf(B * Tq * 4),
+            }
+            if self.dfl_cfg is not None:  # device acceptance (spec_fix)
+                c = self.dfl_cfg
+                self.fix_patch = (
+                    c.layers
+                    * (c.window // SLOT_KEYS + 2)
+                    * slots_per_launch(B, c.pairs)
+                )
+                self.spec_buf.update(
+                    {
+                        "fix_acc": buf(B * 4),
+                        "fix_rows": buf(8 * B * 4),
+                        "fix_cb0": buf(4 * B * L * 4),
+                        "fix_cb1": buf(4 * B * L * 4),
+                        "fix_patch": buf(4 * self.fix_patch * 4),
+                        "fix_meta": buf(4 * 4),
+                    }
+                )
+            self.pend_layer = 128 * 3 * d.nv * Tq * 4  # bytes per sequence and layer
+            self.pconv_layer = d.conv_dim * Tq * 4
+            self.pend = buf(self.pend_layer * B * L)
+            self.pconv = buf(self.pconv_layer * B * L)
         if self.mtp:
-            Tq, L = self.mtp + 1, len(self.gdn)
             self.mtp_carry = [carry(), carry()]
             self.mtp_buf = {
                 "mtp_cols": buf(T * 4),
@@ -430,19 +774,11 @@ class Qwen35Gaudi:
                 "mtp_top_lp": buf(TOP_MAX * T * 4),
                 "mtp_logits": buf(V * T * 4),
                 "mtp_params": buf(PARAMS * T * 4),
-                "commit_bases": buf(4 * B * L * 4),
-                "commit_counts": buf(B * L * 4),
-                # an enqueued step's continuation tokens [anchor, d_1 .. d_K] per row: the
-                # anchor and d_1 from the host, d_2 .. d_K copied from the draft chain
-                "next_tok": buf(B * Tq * 4),
             }
             dev.memset32(self.mtp_buf["mtp_zero"], 0, H)
-            self.pend_layer = 128 * 3 * d.nv * Tq * 4  # bytes per sequence and layer
-            self.pconv_layer = d.conv_dim * Tq * 4
-            self.pend = buf(self.pend_layer * B * L)
-            self.pconv = buf(self.pconv_layer * B * L)
 
     def _compile(self) -> None:
+        progress.building_graphs()
         dev, d, P = self.device, self.dims, self.max_positions
         nb = self.blocks
         na = self.geometry.attention_blocks(self.parent_capacity)
@@ -451,28 +787,94 @@ class Qwen35Gaudi:
             T = m.columns
             verify = m.per_row if m.name[0] == "v" else 0
             graphs[("embed", m.name)] = embed_graph(dev, d, T)
+            split = self.split
+            R = self.gathered(m.name)
             graphs[("gdn", m.name)] = gdn_layer_graph(
-                dev, d, T, nb, decode=m.name[0] != "p", verify=verify
+                dev,
+                d,
+                T,
+                nb,
+                decode=m.name[0] != "p",
+                verify=verify,
+                split=split,
+                ranks=R,
             )
-            graphs[("pre", m.name)] = attn_pre_graph(dev, d, T, na, P)
+            if split:
+                graphs[("gdn0", m.name)] = gdn_layer_graph(
+                    dev,
+                    d,
+                    T,
+                    nb,
+                    decode=m.name[0] != "p",
+                    verify=verify,
+                    split=True,
+                    first=True,
+                )
+                graphs[("mlp", m.name)] = mlp_graph(dev, d, T, R)
+            kv8 = self.geometry.kv8
+            graphs[("pre", m.name)] = attn_pre_graph(
+                dev, d, T, na, P, split=split, ranks=R, kv8=kv8
+            )
             graphs[("slots", m.name)] = attn_slots_graph(
-                dev, d, T, m.slots, na, m.query_block
+                dev, d, T, m.slots, na, m.query_block, per_column=True, kv8=kv8
             )
-            graphs[("post", m.name)] = attn_post_graph(dev, d, T)
+            if m.wide:
+                graphs[("wslots", m.name)] = attn_slots_graph(
+                    dev,
+                    d,
+                    T,
+                    m.wide,
+                    na,
+                    m.query_block,
+                    per_column=True,
+                    mask=not m.full,
+                    kv8=kv8,
+                )
+            graphs[("post", m.name)] = attn_post_graph(dev, d, T, split=split)
             graphs[("head", m.name)] = head_graph(
-                dev, d, T, 1 if m.name[0] == "p" else T
+                dev, d, T, 1 if m.name[0] == "p" else T, split=split, ranks=R
             )
             if self.mtp:
                 graphs[("mtp_in", m.name)] = mtp_in_graph(dev, d, T, self.columns)
+            if self.mtp and split:  # the whole MTP layer on every rank: its attention and head unsplit
+                dm = self.mtp_dims
+                graphs[("mtp_pre", m.name)] = attn_pre_graph(
+                    dev, dm, T, nb, P, kv8=kv8
+                )
+                if m.name[0] != "p":  # prefill chunks store its keys only
+                    graphs[("mtp_slots", m.name)] = attn_slots_graph(
+                        dev,
+                        dm,
+                        T,
+                        m.slots,
+                        nb,
+                        m.query_block,
+                        per_column=True,
+                        kv8=kv8,
+                    )
+                    graphs[("mtp_post", m.name)] = attn_post_graph(dev, dm, T)
+                    graphs[("mtp_head", m.name)] = head_graph(dev, dm, T, T)
             if verify:
                 B = T // verify
                 graphs[("commit", m.name)] = commit_graph(
                     dev, d, B, verify, len(self.gdn), nb
                 )
+                if self.drafter is not None:
+                    graphs[("spec_fix", m.name)] = spec_fix_graph(
+                        dev,
+                        B,
+                        verify,
+                        len(self.gdn),
+                        self.fix_patch,
+                        self.drafter.TD,
+                        self.drafter.tables_words,
+                    )
         for K in SCORE_TOPS:
             graphs[("score", f"k{K}")] = score_graph(dev, d, self.columns, K)
         if self.mtp:
             graphs[("hidden", "x")] = hidden_store_graph(dev, d, self.columns, nb)
+        if self.drafter is not None:
+            graphs.update(self.drafter.graphs(nb))
         recipes = self.recipes.compile_many(list(graphs.values()))
         self.recipe: dict[tuple[str, str], Recipe] = dict(zip(graphs, recipes))
 
@@ -481,15 +883,26 @@ class Qwen35Gaudi:
         # launch plans of whole passes, by (pass, mode, slot launches per layer, ...)
         self._plans: dict[tuple, LaunchPlan] = {}
         M = self.mtp_layer
-        for (kind, mode), recipe in self.recipe.items():
+        for key, recipe in self.recipe.items():
+            if key[0].startswith("dfl_"):
+                continue  # the drafter binds its own recipes
+            kind, mode = key
             if kind == "gdn":
-                targets = [(i, "") for i in self.gdn]
-            elif kind in ("pre", "slots", "post"):
+                targets = [(i, "") for i in self.gdn if not (self.split and i == 0)]
+            elif kind == "gdn0":  # a split model's first layer
+                targets = [(0, "")]
+            elif kind == "mlp":  # a split layer's MLP
+                targets = [(i, "") for i in range(self.n_layers)]
+            elif kind in ("pre", "slots", "wslots", "post"):
                 targets = [(i, "") for i in self.full]
-                if self.mtp:
+                if self.mtp and not self.split and kind != "wslots":  # (MTP passes: narrow only)
                     targets.append((M, "mtp"))
+            elif kind in ("mtp_pre", "mtp_slots", "mtp_post"):
+                targets = [(M, "mtp")]
+            elif kind == "mtp_head":
+                targets = [(-1, "mtp")]
             elif kind == "head":
-                targets = [(-1, "")] + ([(-1, "mtp")] if self.mtp else [])
+                targets = [(-1, "")] + ([(-1, "mtp")] if self.mtp and not self.split else [])
             elif kind == "mtp_in":
                 targets = [(M, "mtp"), (M, "mtpc")]
             else:
@@ -508,16 +921,20 @@ class Qwen35Gaudi:
         w, g = self.weights, self.geometry
         final = self.carry[self.n_layers % 2]
         names = dict(self.buf)
+        names.update(self.spec_buf)
+        if self.drafter is not None:
+            dr = self.drafter
+            names.update(btok=dr.tok, bpos=dr.pos, banc=dr.anchors, dtables=dr.tables)
         if self.mtp:
             names.update(self.mtp_buf)
         if variant:
             src, dst = self.mtp_carry
             if kind == "mtp_in":
-                x = final["x"] if variant == "mtp" else self.mtp_carry[1]["x"]
+                x = self.final_x if variant == "mtp" else self.mtp_carry[1]["x"]
                 norm = "out_norm" if variant == "mtp" else "mtp.norm"
                 names.update({f"{k}_out": v for k, v in src.items()})
-                names.update(x=x, mtp_xnorm=w[norm].address)
-            elif kind == "head":
+                names.update(x=x, mtp_xnorm=w[norm])
+            elif kind in ("head", "mtp_head"):
                 names["h16"] = dst["h16"]
                 for k in ("tok_out", "lp_out", "top_idx", "top_lp", "logits"):
                     names[k] = self.mtp_buf[f"mtp_{k}"]
@@ -526,7 +943,7 @@ class Qwen35Gaudi:
                 names.update(src)
                 names.update({f"{k}_out": v for k, v in dst.items()})
                 names["arena"] = self.arena
-                names["next_norm"] = w["mtp.norm"].address
+                names["next_norm"] = w["mtp.norm"]
         else:
             src = 0 if layer < 0 else layer % 2
             names.update(self.carry[src])
@@ -538,8 +955,8 @@ class Qwen35Gaudi:
                 names.update({f"{k}_out": v for k, v in self.carry[0].items()})
                 names["h16"] = final["h16"]
                 names["x"] = final["x"]
-                names["next_norm"] = w["l0.attn_norm"].address
-                if self.mtp:
+                names["next_norm"] = w["l0.attn_norm"]
+                if self.K:
                     names["gdn_pend"], names["gdn_pconv"] = self.pend, self.pconv
             else:
                 nxt = (
@@ -547,7 +964,9 @@ class Qwen35Gaudi:
                     if layer + 1 < self.n_layers
                     else "out_norm"
                 )
-                names["next_norm"] = w[nxt].address
+                names["next_norm"] = w[nxt]
+            if self.split and kind != "embed":
+                names.update(self._split_names(kind, layer, mode))
             if layer in self.full:
                 a = self.full.index(layer)
                 names["arena"] = self.arena + a * g.kv_layer_rows * ROW_BYTES
@@ -562,18 +981,23 @@ class Qwen35Gaudi:
                     base = self.dec_bases + j * self.dec_stride
                     names["gdn_bases"] = base
                     names["conv_dst"] = base + _round(4 * self.decode_buckets[-1] * 4)
-                if mode[0] == "v":
-                    B = self.modes[mode].columns // self.modes[mode].per_row
-                    names["gdn_pend"] = self.pend + j * B * self.pend_layer
-                    names["gdn_pconv"] = self.pconv + j * B * self.pconv_layer
+                if (
+                    mode[0] == "v"
+                ):  # back to back per layer at this width (commit_graph)
+                    m = self.modes[mode]
+                    B, Tq = m.columns // m.per_row, m.per_row
+                    pend = self.pend_layer // (self.K + 1) * Tq
+                    pconv = self.pconv_layer // (self.K + 1) * Tq
+                    names["gdn_pend"] = self.pend + j * B * pend
+                    names["gdn_pconv"] = self.pconv + j * B * pconv
         pairs = []
         for name in recipe.persistent:
             if name in DYNAMIC:
                 continue
             if layer >= 0 and f"l{layer}.{name}" in w:
-                address = w[f"l{layer}.{name}"].address
+                address = w[f"l{layer}.{name}"]
             elif name in w:
-                address = w[name].address
+                address = w[name]
             else:
                 address = names[name]
             pairs.append((recipe.slot(name), address))
@@ -581,6 +1005,67 @@ class Qwen35Gaudi:
             np.array([p[0] for p in pairs], np.int32),
             np.array([p[1] for p in pairs], np.uint64),
         )
+
+    @property
+    def final_x(self) -> int:
+        """The target's final residual: the last layer's carry out, or a split model's head's (which adds the last
+        partial)."""
+        if self.split:
+            return self.carry[1]["x"]
+        return self.carry[self.n_layers % 2]["x"]
+
+    def mtp_kind(self, kind: str) -> str:
+        """The recipe kind of the MTP layer's ``pre``, ``slots``, ``post`` or ``head`` launch: a split model's MTP
+        layer stays whole (``mtp_pre`` ...), one card's takes the target's recipes."""
+        return f"mtp_{kind}" if self.split else kind
+
+    def part(self, layer: int, mlp: bool) -> int:
+        """The partial that layer ``layer``'s mixer (or MLP) writes; the next graph reads it (the head: layer -1
+        reads the last MLP's)."""
+        if layer < 0:
+            return self.parts[(2 * self.n_layers) % len(self.parts)]
+        return self.parts[(2 * layer + 1 + int(mlp)) % len(self.parts)]
+
+    def gathered(self, mode: str) -> int:
+        """The ranks whose partials a step of ``mode`` all-gathers (decode and verify steps whose columns times ranks
+        are at most ``GATHER_LIMIT``), else 1: it all-reduces them."""
+        m = self.modes.get(mode)  # (scoring and drafter recipes have no step mode)
+        if (
+            m is not None
+            and self.split
+            and self.nranks > 1
+            and mode[0] != "p"
+            and m.columns * self.nranks <= GATHER_LIMIT
+        ):
+            return self.nranks
+        return 1
+
+    def gathered_part(self, part: int) -> int:
+        """The buffer that partial ``part`` (a buffer of ``self.parts``) is all-gathered into."""
+        return self.gathered_parts[self.parts.index(part)]
+
+    def _split_names(self, kind: str, layer: int, mode: str) -> dict[str, int]:
+        """A split layer's carries and partials (``layers.split_entry``): the mixer (``gdn``, ``gdn0``,
+        ``pre``; ``post`` ends it) reads carry 0 and the last MLP's partial and writes carry 1 and its partial, the
+        MLP reads carry 1 and the mixer's partial and writes carry 0 and its partial, and the head reads carry 0
+        and the last MLP's partial (``part``: two partials in turn by default)."""
+        c0, c1 = self.carry
+        names = {"ones_t": self.ones_t}
+        mixer_out = self.part(layer, False) if layer >= 0 else self.part(-1, False)
+        mlp_in = self.parts[(2 * layer) % len(self.parts)] if layer >= 0 else self.part(-1, False)
+        if kind in ("gdn", "gdn0", "pre", "head"):
+            src, dst, pin, pout = c0, c1, mlp_in, mixer_out
+        else:  # post, mlp (and slots, which take neither)
+            src, dst = c1, c0
+            pin, pout = mixer_out, self.part(layer, True)
+        if kind == "post":
+            pout = mixer_out
+        names.update(src)
+        names.update({f"{k}_out": v for k, v in dst.items()})
+        if self.gathered(mode) > 1:
+            pin = self.gathered_part(pin)
+        names.update(part_in=pin, part_out=pout)
+        return names
 
     # ---- launching
     def _upload(self, address: int, array: np.ndarray) -> None:
@@ -590,6 +1075,29 @@ class Qwen35Gaudi:
             self.device.h2d_nb(address, array)
         else:
             self.device.h2d(address, array)
+
+    # ---- the drafter's host (``dflash.DrafterHost``)
+    def weight(self, name: str) -> int:
+        return self.weights[name]
+
+    def buffer(self, name: str) -> int:
+        return self.buf[name]
+
+    def recipe_of(self, key: tuple) -> Recipe:
+        return self.recipe[key]
+
+    def upload(self, address: int, array: np.ndarray) -> None:
+        self._upload(address, array)
+
+    def tap_source(self, layer: int) -> int:
+        """the output carry of target layer ``layer`` (split layers: the next layer's mixer adds the last
+        partial into carry 1, and the tap runs after it)"""
+        if self.split:
+            return self.carry[1]["x"]
+        return self.carry[(layer + 1) % 2]["x"]
+
+    def tap_graph(self, tokens: int) -> Graph:
+        return dflash_tap_graph(self.device, self.dims, tokens)
 
     def _launch(
         self,
@@ -698,6 +1206,8 @@ class Qwen35Gaudi:
         ``token_source`` the device buffer holding them (a previous step's sampled tokens); a
         prefill's ``real`` tokens or ``real`` rows of a decode / verify batch; ``params``
         (columns or 1, PARAMS) sampler inputs."""
+        if self.split:
+            raise NotImplementedError("split layers run on the native executor only")
         dev, prefill = self.device, mode.name[0] == "p"
         T = mode.columns
         dev.h2d_nb(self.buf["samp_params"], params)
@@ -724,7 +1234,7 @@ class Qwen35Gaudi:
             dev.h2d_nb(self.buf["last"], np.array([real - 1], np.int32))
         self._write_state_tables(rows, prefill)
         slot_rows = self._pages(mode, rows, False, starts)
-        self._upload(self.buf["kv_rows"], kv_rows(T, slot_rows))
+        self._upload(self.buf["kv_rows"], kv_rows(T, slot_rows, self.geometry.kv8))
         tables = self._slot_tables(mode, slot_rows)
         if token_source is None:
             tokens = tokens() if callable(tokens) else tokens
@@ -735,11 +1245,14 @@ class Qwen35Gaudi:
         if plan is None:
             extra = None if token_source is None else {"tok": token_source}
             steps = [self._step("embed", mode.name, extra=extra)]
+            taps = self.drafter.tap_steps(mode.name) if self.drafter is not None else {}
             for i in range(self.n_layers):
                 if i in self.gdn:
                     steps.append(self._step("gdn", mode.name, i))
                 else:
                     steps += self._attention_steps(mode, i, "", tables)
+                if i in taps:  # the drafter's context projection of this layer's output
+                    steps.append(taps[i])
             steps.append(self._step("head", mode.name))
             plan = self._plans[key] = LaunchPlan(self.device, steps)
         plan.run()
@@ -790,7 +1303,9 @@ class Qwen35Gaudi:
         """The MTP layer over ``mode``'s columns: column c reads token ``tokens`` [c] (or the
         device buffer ``tokens``), hidden column ``cols`` [c] of [prev | x] and sits at its
         row's position ``starts`` [row] + its index in the row; it writes MTP KV for the first
-        ``real`` columns of each row (prefill: of the chunk). With ``params``, sample drafts."""
+        ``real`` columns of each row (prefill: of the chunk). With ``params``, sample drafts;
+        without, only the MTP KV: the input and the attention's pre launch (which stores K and V),
+        no slot launches and no post."""
         dev, T = self.device, mode.columns
         dev.h2d_nb(self.mtp_buf["mtp_cols"], np.asarray(cols, np.int32))
         extra = {"mtp_prev": prev}
@@ -807,9 +1322,10 @@ class Qwen35Gaudi:
             )
         dev.h2d_nb(self.buf["pos"], np.minimum(pos, self.max_positions - 1))
         slot_rows = self._pages(mode, rows, True, (list(starts), real))
-        self._upload(self.buf["kv_rows"], kv_rows(T, slot_rows))
-        tables = self._slot_tables(mode, slot_rows)
-        key = ("mtp", mode.name, variant, len(tables))
+        self._upload(self.buf["kv_rows"], kv_rows(T, slot_rows, self.geometry.kv8))
+        keys_only = params is None
+        tables = () if keys_only else self._slot_tables(mode, slot_rows)
+        key = ("mtp", mode.name, variant, "keys" if keys_only else len(tables))
         plan = self._plans.get(key)
         if (
             plan is None
@@ -817,7 +1333,13 @@ class Qwen35Gaudi:
             first = self._step(
                 "mtp_in", mode.name, self.mtp_layer, variant, dict.fromkeys(extra, 0)
             )
-            steps = [first, *self._attention_steps(mode, self.mtp_layer, "mtp", tables)]
+            if keys_only:
+                steps = [first, self._step("pre", mode.name, self.mtp_layer, "mtp")]
+            else:
+                steps = [
+                    first,
+                    *self._attention_steps(mode, self.mtp_layer, "mtp", tables),
+                ]
             plan = self._plans[key] = LaunchPlan(self.device, steps)
         n = int(plan.starts[1])
         plan.patch(n - 2, extra["mtp_prev"])
@@ -919,7 +1441,13 @@ class Qwen35Gaudi:
         for n, (real, T) in enumerate(chunks):
             src = row.state_src if i == 0 else row.state_dst
             chunk = RowCache(
-                row.pos0 + i, row.kv_blocks, src, row.state_dst, row.mtp_blocks
+                row.pos0 + i,
+                row.kv_blocks,
+                src,
+                row.state_dst,
+                row.mtp_blocks,
+                draft_blocks=row.draft_blocks,
+                draft_first=row.draft_first,
             )
             last = n == len(chunks) - 1
             mode = self.modes[f"p{T}"]
@@ -939,8 +1467,25 @@ class Qwen35Gaudi:
                 drafts = self._prefill_mtp(
                     chunk, ids, i, real, tokens, last and draft, sampling
                 )
+            elif self.drafter is not None:
+                drafts = self._prefill_draft(chunk, mode, real, token, last and draft)
             i += real
         return Prefilled(token, result, drafts)
+
+    def _prefill_draft(
+        self, chunk: RowCache, mode: _Mode, real: int, token: int, last: bool
+    ) -> np.ndarray | None:
+        """The drafter's cache entries of a prefill chunk and, after the prompt's last chunk,
+        the block after its sampled token (at the position after the prompt)."""
+        drafter = self.drafter
+        assert drafter is not None
+        drafter.inject(mode.name, [(0, chunk.pos0, real, chunk.draft_row(chunk.pos0))])
+        if not last:
+            return None
+        bucket = self.decode_buckets[0]
+        self.next_width = self.K + 1  # the prompt's drafts: all of them
+        drafter.block([chunk.draft_row(chunk.pos0 + real)], [token], bucket)
+        return drafter.read_next(bucket)[0, 1:].astype(np.int64)
 
     def _prefill_mtp(
         self, chunk, ids, i, real, tokens, last, sampling
@@ -1080,6 +1625,28 @@ class Qwen35Gaudi:
             params[:B] = sampling.params[:B]
         source = None if tokens is not None else self.buf["tok_out"]
         self._target(mode, rows, ids, B, params, token_source=source)
+        if self.mtp:
+            # the MTP layer's KV at each row's position: its sampled next token and the target's
+            # hidden; a plain step samples no drafts, so a row that speculates again verifies zeros
+            self._mtp_pass(
+                mode,
+                "mtp",
+                rows,
+                [row.pos0 for row in rows],
+                1,
+                np.arange(bucket) + 1,
+                self.buf["tok_out"],
+                self.mtp_buf["mtp_zero"],
+                None,
+            )
+        if self.drafter is not None:
+            self.drafter.inject(
+                mode.name,
+                [
+                    (b, row.pos0, 1, row.draft_row(row.pos0))
+                    for b, row in enumerate(rows)
+                ],
+            )
         if stage is None:
             return self.device.d2h(self.buf["tok_out"], (B,), np.int32)
         dev = self.device
@@ -1112,6 +1679,7 @@ class Qwen35Gaudi:
         stage: Staging | None = None,
         scores: bool = False,
         chained: bool = False,
+        width: int | None = None,
     ) -> Launched:
         """Launch the verify pass of [anchor, drafts] for each row (anchor at row.pos0): the
         target over K + 1 columns per row, then the MTP layer at every column. ``anchors`` and
@@ -1119,16 +1687,25 @@ class Qwen35Gaudi:
         same rows continue the last staged ``verify_finish``, whose continuation tokens are on
         the device; ``drafts`` is then a callable for their host copy, read at the finish.
         With ``stage``, the samples (and with ``scores`` their logprobs) are copied into it
-        without waiting."""
-        Tq, B = self.mtp + 1, len(rows)
+        without waiting. ``width``: columns per row (one of ``verify_widths``; the first
+        ``width - 1`` drafts are verified); by default the width the last step chose
+        (``next_width``), which a chained step must take: its tokens were drafted for it."""
+        if chained:  # the width the drafter wrote the tokens for
+            Tq = self.K + 1 if self.drafter is None else self.drafter.next_width
+        else:
+            Tq = width or self.force_width or self.next_width
+        if Tq not in self.verify_widths:
+            raise ValueError(f"no verify step of {Tq} columns ({self.verify_widths})")
+        B = len(rows)
         bucket = min(b for b in self.decode_buckets if b >= B)
-        mode = self.modes[f"v{bucket}"]
+        mode = self.modes[verify_mode(bucket, Tq, self.K + 1)]
         resolved: list[np.ndarray] = []
 
         def tokens() -> np.ndarray:
             out = np.zeros((bucket, Tq), np.int64)
             out[:B, 0] = anchors() if callable(anchors) else anchors
-            resolved.append(drafts() if callable(drafts) else np.asarray(drafts))
+            got = drafts() if callable(drafts) else np.asarray(drafts)
+            resolved.append(np.asarray(got)[:, : Tq - 1])
             out[:B, 1:] = resolved[0]
             return out.reshape(-1)
 
@@ -1142,38 +1719,133 @@ class Qwen35Gaudi:
                 None,
                 B,
                 params.reshape(-1, PARAMS),
-                token_source=self.mtp_buf["next_tok"],
+                token_source=self.next_tokens,
             )
             resolved.append(drafts)
         else:
             self._target(mode, rows, tokens, B, params.reshape(-1, PARAMS))
-        # the MTP layer at every verify column: token y_t, the target's hidden at the column
-        cols = np.arange(bucket * Tq) + 1
-        mtp_params = np.zeros((bucket, Tq, PARAMS), np.float32)
-        if sampling is not None:  # column t drafts position pos0 + t + 2
-            mtp_params[:B] = sampling.grid(B, range(1, Tq + 1))
-        self._mtp_pass(
-            mode,
-            "mtp",
-            rows,
-            [row.pos0 for row in rows],
-            Tq,
-            cols,
-            self.buf["tok_out"],
-            self.mtp_buf["mtp_zero"],
-            mtp_params.reshape(-1, PARAMS),
-        )
+        if self.mtp:
+            # the MTP layer at every verify column: token y_t, the target's hidden at the column
+            cols = np.arange(bucket * Tq) + 1
+            mtp_params = np.zeros((bucket, Tq, PARAMS), np.float32)
+            if sampling is not None:  # column t drafts position pos0 + t + 2
+                mtp_params[:B] = sampling.grid(B, range(1, Tq + 1))
+            self._mtp_pass(
+                mode,
+                "mtp",
+                rows,
+                [row.pos0 for row in rows],
+                Tq,
+                cols,
+                self.buf["tok_out"],
+                self.mtp_buf["mtp_zero"],
+                mtp_params.reshape(-1, PARAMS),
+            )
+        else:  # every column into the drafter's cache: the next steps rewrite the rejected ones
+            assert self.drafter is not None
+            self.drafter.inject(
+                mode.name,
+                [
+                    (b * Tq, row.pos0, Tq, row.draft_row(row.pos0))
+                    for b, row in enumerate(rows)
+                ],
+            )
+        device_accept = self.drafter is not None and self.device_accept
+        w = 0
+        if device_accept:  # accept on the device, the commit and block step behind it
+            w = self._fix(mode, rows, chained)
         if stage is not None:
             n = bucket * Tq
             d2h = self.device.d2h_async
             d2h(stage.tokens[:n], self.buf["tok_out"])
-            d2h(stage.mtp_tokens[:n], self.mtp_buf["mtp_tok_out"])
+            if device_accept:
+                d2h(stage.accepted[:bucket], self.spec_buf["fix_acc"])
+            if self.mtp:
+                d2h(stage.mtp_tokens[:n], self.mtp_buf["mtp_tok_out"])
             if scores:
                 d2h(stage.lp[:n], self.buf["lp_out"])
                 d2h(stage.top_idx[:n], self.buf["top_idx"])
                 d2h(stage.top_lp[:n], self.buf["top_lp"])
             stage.record()
-        return Launched(rows, resolved[0], sampling, stage, mode)
+        if device_accept:
+            self._launch("commit", mode.name)
+            assert self.drafter is not None
+            self.drafter.run(bucket, self._fix_launches, w)
+            self.next_width = w
+            if (
+                stage is not None
+            ):  # read at the continuation's finish (stage.next, event 1)
+                stage.next_width = w
+                self.device.d2h_async(
+                    stage.next.reshape(-1)[: bucket * w], self.drafter.next
+                )
+                stage.record(1)
+        return Launched(rows, resolved[0], sampling, stage, mode, device_accept, w)
+
+    def _fix(self, mode: _Mode, rows: Sequence[RowCache], chained: bool) -> int:
+        """Upload ``spec_fix``'s tables for a verify step and launch it: the commit's state
+        fields for the accepted count's two possible STATE blocks, and the next block step's
+        tables over every anchor position the count allows (``Drafter.prepare_device``).
+        Returns the next block step's width (from the rows' last acceptance)."""
+        drafter = self.drafter
+        assert drafter is not None
+        Tq, B = mode.per_row, len(rows)
+        bucket = mode.columns // Tq
+        L = len(self.gdn)
+        last = self._last_accepted if len(self._last_accepted) == B else None
+        w = self.force_width or choose_width(
+            self.verify_widths,
+            last if last is not None else np.full(B, Tq - 1),
+            self._last_width if last is not None else Tq,
+            bucket,
+        )
+        first = [row.state_at(row.pos0) for row in rows]
+        final = [row.state_at(row.pos0 + Tq - 1) for row in rows]
+        srcs = [row.state_src for row in rows]
+        cb = []
+        for dsts in (first, final):
+            fields = np.full((L, bucket, 4), -1, np.int32)
+            fields[:, :B] = self._state_fields(srcs, dsts)
+            cb.append(fields)
+        table = np.zeros((bucket, 8), np.int32)
+        for b, row in enumerate(rows):
+            switch = next(
+                (m for m in range(Tq) if row.state_at(row.pos0 + m) != first[b]), Tq
+            )
+            table[b, :5] = (
+                row.pos0,
+                1,
+                switch,
+                self.geometry.hidden_row(first[b]),
+                self.geometry.hidden_row(final[b]),
+            )
+        self._upload(self.spec_buf["fix_cb0"], cb[0])
+        self._upload(self.spec_buf["fix_cb1"], cb[1])
+        self._upload(self.spec_buf["fix_rows"], table)
+        # padding rows commit nothing
+        self._upload(
+            self.spec_buf["commit_bases"], np.full((L, bucket, 4), -1, np.int32)
+        )
+        self._upload(self.spec_buf["commit_counts"], np.zeros((L, bucket), np.int32))
+        self._upload(self.buf["hidden_table"], np.full((bucket, 2), -1, np.int32))
+        self._fix_launches, patch = drafter.prepare_device(
+            [row.draft_row(row.pos0 + Tq) for row in rows],
+            [row.pos0 + 1 for row in rows],
+            bucket,
+            w,
+        )
+        if len(patch) > self.fix_patch:
+            raise ValueError(f"{len(patch)} slot patches exceed {self.fix_patch}")
+        full = np.zeros((self.fix_patch, 4), np.int32)
+        full[: len(patch)] = patch
+        self._upload(self.spec_buf["fix_patch"], full)
+        meta = np.array(
+            [len(patch), drafter.block_cfg(w).block, drafter.cfg.window, 0], np.int32
+        )
+        self._upload(self.spec_buf["fix_meta"], meta)
+        tin = self.next_tokens if chained else self.buf["tok"]
+        self._launch("spec_fix", mode.name, extra={"fix_tin": tin})
+        return w
 
     def verify_finish(self, launched: Launched) -> Verified:
         """Accept each row's drafts against the verify pass's samples, commit the accepted
@@ -1187,38 +1859,97 @@ class Qwen35Gaudi:
             launched.stage,
             launched.mode,
         )
-        Tq, B = self.mtp + 1, len(rows)
+        Tq, B = mode.per_row, len(rows)
         bucket = mode.columns // Tq
         if callable(drafts):
             drafts = drafts()
+        drafts = np.asarray(drafts)[:, : Tq - 1]
         if stage is None:
             y = self.device.d2h(self.buf["tok_out"], (bucket, Tq), np.int32)[:B]
-            q = self.device.d2h(self.mtp_buf["mtp_tok_out"], (bucket, Tq), np.int32)[:B]
         else:
             stage.wait()
             y = stage.tokens[: bucket * Tq].reshape(bucket, Tq)[:B].copy()
-            q = stage.mtp_tokens[: bucket * Tq].reshape(bucket, Tq)[:B].copy()
         acceptance = self.speculation.accept(drafts.tolist(), y.tolist())
         accepted = np.asarray(acceptance.accepted_counts, np.int64)
         emitted = acceptance.token_rows
+        if launched.device_accept:  # committed and drafted on the device already
+            if stage is None:
+                on_device = self.device.d2h(
+                    self.spec_buf["fix_acc"], (bucket,), np.int32
+                )
+            else:
+                on_device = stage.accepted[:bucket]
+            if not np.array_equal(on_device[:B], accepted):
+                raise RuntimeError(
+                    f"device acceptance {on_device[:B].tolist()} != host {accepted.tolist()}"
+                )
+            self._last_accepted, self._last_width = accepted, Tq
+            w = launched.next_width
+            next_drafts = np.zeros((B, self.K), np.int64)
+            if stage is None:
+                assert self.drafter is not None
+                next_drafts[:, : w - 1] = self.drafter.read_next(bucket, w)[:B, 1:]
+            columns = [b * Tq + np.arange(accepted[b] + 1) for b in range(B)]
+            return Verified(emitted, accepted, next_drafts, columns, Tq)
         self._commit(mode, rows, accepted)
-        first = q[np.arange(B), accepted]
-        first_cols = np.arange(B) * Tq + accepted + 1
         anchor_pos = [rows[b].pos0 + int(accepted[b]) + 1 for b in range(B)]
-        scatter = None
-        if stage is not None:
-            scatter = self.mtp_buf["next_tok"]
-            following = np.zeros((bucket, Tq), np.int32)
-            following[:B, 0] = [row[-1] for row in emitted]
-            following[:B, 1] = first
-            self._upload(scatter, following)
-        next_drafts = self._chain(
-            rows, anchor_pos, first, first_cols, sampling, accepted, stage, scatter
-        )
+        if self.mtp:
+            if stage is None:
+                q = self.device.d2h(
+                    self.mtp_buf["mtp_tok_out"], (bucket, Tq), np.int32
+                )[:B]
+            else:
+                q = stage.mtp_tokens[: bucket * Tq].reshape(bucket, Tq)[:B].copy()
+            first = q[np.arange(B), accepted]
+            first_cols = np.arange(B) * Tq + accepted + 1
+            scatter = None
+            if stage is not None:
+                scatter = self.spec_buf["next_tok"]
+                following = np.zeros((bucket, Tq), np.int32)
+                following[:B, 0] = [row[-1] for row in emitted]
+                following[:B, 1] = first
+                self._upload(scatter, following)
+            next_drafts = self._chain(
+                rows, anchor_pos, first, first_cols, sampling, accepted, stage, scatter
+            )
+        else:  # the block step after each row's new anchor: the next step's tokens
+            drafter = self.drafter
+            assert drafter is not None
+            # the next step's width, which the block step writes its tokens for
+            self.next_width = w = self.force_width or choose_width(
+                self.verify_widths, accepted, Tq, bucket
+            )
+            drafter.block(
+                [rows[b].draft_row(anchor_pos[b]) for b in range(B)],
+                [row[-1] for row in emitted],
+                bucket,
+                width=w,
+            )
+            next_drafts = np.zeros((B, self.K), np.int64)
+            if stage is None:
+                next_drafts[:, : w - 1] = drafter.read_next(bucket, w)[:B, 1:]
+            else:  # read at the continuation's finish (stage.next, event 1)
+                stage.next_width = w
+                self.device.d2h_async(
+                    stage.next.reshape(-1)[: bucket * w], drafter.next
+                )
         if stage is not None:
             stage.record(1)
         columns = [b * Tq + np.arange(accepted[b] + 1) for b in range(B)]
-        return Verified(emitted, accepted, next_drafts, columns)
+        return Verified(emitted, accepted, next_drafts, columns, Tq)
+
+    @property
+    def next_tokens(self) -> int:
+        """The device buffer holding a chained verify step's tokens [anchor, drafts] per row."""
+        if self.drafter is not None:
+            return self.drafter.next
+        return self.spec_buf["next_tok"]
+
+    @property
+    def host_drafts(self) -> int:
+        """How many of a staged verify step's next drafts the host knows at its finish (the
+        rest land in the staging: MTP's chain in ``drafts``, the block step in ``next``)."""
+        return 1 if self.mtp else 0
 
     def _commit(
         self, mode: _Mode, rows: Sequence[RowCache], accepted: np.ndarray
@@ -1237,8 +1968,8 @@ class Qwen35Gaudi:
         bases[:, : len(rows)] = fields
         counts = np.zeros((L, B), np.int32)
         counts[:, : len(rows)] = accepted + 1
-        self._upload(self.mtp_buf["commit_bases"], bases)
-        self._upload(self.mtp_buf["commit_counts"], counts)
+        self._upload(self.spec_buf["commit_bases"], bases)
+        self._upload(self.spec_buf["commit_counts"], counts)
         table = np.full((B, 2), -1, np.int32)
         for b, (m, dst) in enumerate(zip(accepted, dsts, strict=True)):
             table[b] = (b * mode.per_row + int(m), self.geometry.hidden_row(dst))
@@ -1263,7 +1994,7 @@ class Qwen35Gaudi:
         return self.device.d2h(self.buf["logits"], (rows, V), np.float32)
 
     def close(self) -> None:
-        self.weights.close()
+        self.loader.close()
 
 
 class SingleSequence:
@@ -1278,6 +2009,17 @@ class SingleSequence:
         self.slabs = slabs or range(1, model.parent_capacity + 1)
         # with MTP: its KV blocks in a fixed slab below at most three STATE blocks
         self.mtp_slab = self.slabs[-4] if model.mtp else None
+        # with the DFlash drafter: a ring of DRAFT blocks covering its window, in the slabs
+        # below the STATE blocks (and the MTP slab)
+        self.ring: np.ndarray | None = None
+        if model.dfl_cfg is not None:
+            g, cfg = model.geometry, model.dfl_cfg
+            R = cfg.window // 128 + 2
+            per = g.draft_blocks_per_slab
+            top = self.slabs[-4]
+            slabs = np.arange(R) // per
+            self.ring = g.draft_block_row(top - slabs, np.arange(R) % per)
+            self.ring_slabs = int(slabs.max()) + 1
         self.reset()
 
     def reset(self) -> None:
@@ -1308,10 +2050,21 @@ class SingleSequence:
             top = min(top, self.mtp_slab - 1)
             if len(self.state_blocks) > 3:
                 raise MemoryError("sequence exceeds its slabs")
+        draft_rows, draft_first = None, 0
+        if self.ring is not None:
+            R = len(self.ring)
+            draft_first = max(0, int(blocks[-1]) + 1 - R)
+            logical = np.arange(draft_first, int(blocks[-1]) + 1)
+            draft_rows = self.ring[logical % R]
+            top = min(top, self.slabs[-4] - self.ring_slabs)
+            if len(self.state_blocks) > 3:
+                raise MemoryError("sequence exceeds its slabs")
         if kv_slabs.max() > top:
             raise MemoryError("sequence exceeds its slabs")
         rows = g.kv_block_row(kv_slabs, blocks % per_slab)
-        return RowCache(self.pos, rows, src, dst, mtp_rows, first, states)
+        return RowCache(
+            self.pos, rows, src, dst, mtp_rows, first, states, draft_rows, draft_first
+        )
 
     def prefill(self, ids: Sequence[int], sampling=None) -> int:
         done = self.model.prefill(self._row(len(ids)), ids, sampling)
@@ -1326,7 +2079,7 @@ class SingleSequence:
 
     def verify(self, token: int, sampling: Sampling | None = None) -> list[int]:
         """One speculative step from ``token`` (the last emitted): the emitted tokens."""
-        K = self.model.mtp
+        K = self.model.K
         drafts = self.drafts if self.drafts is not None else np.zeros(K, np.int64)
         row = self._row(1, lookahead=2 * K)
         done = self.model.verify([row], [token], drafts[None], sampling)

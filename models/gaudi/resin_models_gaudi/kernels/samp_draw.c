@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Sampling, pass 5 of 5 (draw): one member per row. A sampled row draws the token where the
 // cumulative kept mass, in vocabulary order, first exceeds uniform * total (searchsorted
 // right): the chunk from samp_mass's chunk masses, then the vector and lane inside it. Rounding

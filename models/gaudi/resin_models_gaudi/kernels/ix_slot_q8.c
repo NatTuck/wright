@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DSA index query slots with FP8 queries (DeepSeek-V4.1): copy each slot's M query columns qcol0 .. qcol0 + M - 1
 // (qcol0 = slots[1, s]) of the FP8 queries (128 bytes a column) and their scales. Slots of group -1 are skipped.
 // tensors: 0 q (128, W) fp8  1 qs (W) f32  2 slots (8, S) i32 | 3 out (128, M, S) fp8  4 outs (M, S) f32

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DSA key lists (Mistral-Large-4): per column c, the positions of its kept keys (sparse decode
 // attention): first the keys whose mkey(score) is above the threshold (ix_thr), then the ties
 // (equal), each in ascending position, at most KS in all (a column that sees at most KS keys

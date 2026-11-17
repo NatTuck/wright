@@ -102,7 +102,13 @@ for unsampled continuation or replay rows. A decode runner may
 return multiple tokens for each sequence; this is how speculative decoding
 commits an accepted block. The runner declares its maximum additional cache writes through
 `RunnerConfig.cache_write_lookahead_tokens`, so the Engine reserves those pages
-before execution. DSpark and other speculative algorithms remain model-runner
+before execution. A runner that speculates only for small batches also sets
+`RunnerConfig.max_speculative_rows`. A decode step with more rows than this
+reserves no lookahead and returns one token for each sequence. Its overlapped
+continuation can then run until the last token of a cache block, or across
+blocks with `RunnerConfig.continuation_extension`, which leases each next block
+inside the running batch. Every continuation plan still carries the exact active
+range of each row's next step. DSpark and other speculative algorithms remain model-runner
 details rather than fields in the generic plan. The Engine validates raw output
 rows before applying stop tokens and length limits, so truncation cannot hide
 an oversized verified block.

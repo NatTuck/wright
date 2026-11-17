@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 Engram residual: each stream s of a token takes the shared value, gated by how well the stream
 // matches its key:
 //   r = rsqrt(mean h_s^2 + eps) rsqrt(mean key_s^2 + eps),  dot = sum(h_s w_s key_s) r / sqrt(H)

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Mistral-Large-4: swap the two outer axes, y[:, b, a] = x[:, a, b] (head-major attention outputs -> token-major
 // columns for the o-projection GEMV). tensors: 0 x (D, A, B) f32 | 1 y (D, B, A) f32. index space: [B, A].
 #include "common.h"

@@ -18,7 +18,7 @@ class CheckingRunner:
 
     def forward(self, plan) -> ForwardOutput:
         from resin.backend.sampling import batch_sampling_inputs
-        from resin_models_gaudi.qwen3_5.sampling import philox_uniform, plan_params
+        from resin_models_gaudi.common.sampling import philox_uniform, plan_params
 
         expected = batch_sampling_inputs(plan, VOCAB)
         got = plan_params(plan, VOCAB)

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // GLM DSA, decode: a column's kept pools (ix_list, at most 512) as key positions for the sparse attention gather:
 // pool P -> 4P .. 4P + 3, then the tail 4 vis .. klen - 1 (always kept, including the token's own key: at most
 // 3 + 1 keys past the last complete pool), and the slot record

@@ -12,6 +12,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tests"))  # glm_reference
+import glm_reference  # noqa: E402
+
 pytestmark = pytest.mark.skipif(
     not Path("/usr/include/habanalabs/synapse_api.h").exists()
     or shutil.which("tpc-clang") is None,
@@ -82,7 +85,7 @@ class Run:
 
 
 def e4m3(b: np.ndarray) -> np.ndarray:
-    from resin_models_gaudi.qwen3_5.checkpoint import E4M3
+    from resin_models_gaudi.loading.convert import E4M3
 
     return E4M3[b]
 
@@ -95,7 +98,7 @@ def fp8_inc_bytes(n: int, rng) -> np.ndarray:
 
 # ------------------------------------------------------------------ the FP8 load path
 def test_fp8_inc_matches_host_table(device, recipes):
-    from resin_models_gaudi.qwen3_5.checkpoint import HALVE
+    from resin_models_gaudi.loading.convert import HALVE
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import U8
 
@@ -108,7 +111,7 @@ def test_fp8_inc_matches_host_table(device, recipes):
 
 def test_x8_requant_row_scales(device, recipes):
     """Requantized FP8 with per-row scales equals the input value within FP8's rounding"""
-    from resin_models_gaudi.qwen3_5.checkpoint import HALVE
+    from resin_models_gaudi.loading.convert import HALVE
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import F8, F32
 
@@ -173,10 +176,10 @@ def test_rejected_draft_keeps_the_pool_it_restarts_inside(K):
     blocks = np.array([0, 2000], np.int64)
     for anchor in range(8, 16):  # every alignment, inside one block
         launch = M.Row(0, anchor, K + 1, blocks, -1, 0)
-        _, written = M._store_rows(K + 1, [launch], keep_tails=True)
+        _, written = glm_reference._store_rows(K + 1, [launch], keep_tails=True)
         rejected = {int(t) for t in written[1:, 4] if t >= 0}
         restart = M.Row(0, anchor + 1, K + 1, blocks, -1, 0)
-        _, read = M._store_rows(K + 1, [restart], keep_tails=True)
+        _, read = glm_reference._store_rows(K + 1, [restart], keep_tails=True)
         for sources in read[:, 1:4]:
             for s in sources:
                 if s < 0:  # a stored tail
@@ -189,7 +192,7 @@ def test_store_rows_keep_scales_apart_at_large_rows():
 
     b = (1 << 24) + 5 * M.PAGE_TOKENS
     row = M.Row(0, 5, 1, np.array([b], np.int64), -1, 0)
-    store, _ = M._store_rows(1, [row])
+    store, _ = glm_reference._store_rows(1, [row])
     assert store[0, 0] == b + 5
     assert store[0, 3] == b + M.PAGE_TOKENS
     assert store[0, 4] == 5
@@ -352,7 +355,7 @@ def test_routed_experts_through_slots(device, recipes):
             up = np.clip(x[t] @ ups[e].T, -lim, lim)
             want[t] += wts[t, k] * ((gt / (1 + np.exp(-gt)) * up) @ downs[e].T)
     # the FP8 model in numpy
-    from resin_models_gaudi.qwen3_5.checkpoint import e4m3_encode
+    from resin_models_gaudi.loading.convert import e4m3_encode
 
     def q8(v):
         scale = max(np.abs(v).max() / 240, 1e-30)
@@ -441,7 +444,7 @@ def test_kda_decode_matches_recurrence(device, recipes, nh):
         recipe.launch()
         device.sync()
         outs.append(device.d2h(addr["out"], (B, C), np.uint16).copy())
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_to_f32
+    from resin_models_gaudi.loading.convert import bf16_to_f32
 
     for b in range(B):
         x = qkv[:, b].astype(np.float64)
@@ -514,7 +517,7 @@ def test_mhc_chain_matches_numpy(device, recipes, T):
 
 # ------------------------------------------------------------------ DSA pools
 def _unbf16(u16):
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_to_f32
+    from resin_models_gaudi.loading.convert import bf16_to_f32
 
     return bf16_to_f32(u16)
 
@@ -522,7 +525,9 @@ def _unbf16(u16):
 def test_pool_keys_cross_launches_and_gather(device, recipes):
     """A pool whose first tokens came in an earlier launch reads them from the tail rows; the gather reads
     32 pools per page."""
-    from resin_models_gaudi.glm5_3_flash.model import Row, _store_rows
+    from glm_reference import _store_rows
+
+    from resin_models_gaudi.glm5_3_flash.model import Row
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import BF16, F32, I32, U8
 
@@ -688,3 +693,64 @@ def test_mhc_coef1_matches_mhc_coef(device, recipes):
         got = Run(device, recipes, g)(inputs, ["coef"])["coef"].reshape(-1)
         g.destroy()
         np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("T", [2, 4, 5, 8, 16])
+def test_mhc_coeft_matches_mhc_coef(device, recipes, T):
+    """A few tokens: mhc_coeft (one member per token, the comb matrix in lanes) against mhc_coef on the same mix."""
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F32
+
+    rng = np.random.default_rng(10 + T)
+    K, iters, hc_eps, eps = 4 * 640, 20, 1e-6, 1e-5
+    inputs = {
+        "fn": (rng.standard_normal((32, K)) * 0.05).astype(np.float32),
+        "X": (rng.standard_normal((T, K)) * rng.uniform(0.5, 4, (T, 1))).astype(np.float32),
+        "base": rng.standard_normal(24).astype(np.float32),
+        "scale": rng.uniform(0.1, 2.0, 3).astype(np.float32),
+    }
+    outs = []
+    for guid in ("rg_mhc_coef_f32", "rg_mhc_coeft_f32"):
+        g = Graph(device, f"t_{guid}_{T}")
+        mix, rt = g.tensor((T, 32), F32), g.tensor((64, T), F32)
+        g.node("rg_mhc_mix1_f32" if T <= 2 else "rg_mhc_mix_f32",
+               [g.input("fn", (K, 32), F32), g.input("X", (K, T), F32)], [mix, rt], struct.pack("f", eps))
+        g.node(guid, [mix, rt, g.input("base", (24,), F32), g.input("scale", (3,), F32)],
+               [g.input("coef", (T, 24), F32)], struct.pack("if", iters, hc_eps))
+        outs.append(Run(device, recipes, g)(inputs, ["coef"])["coef"])
+        g.destroy()
+    np.testing.assert_allclose(outs[1], outs[0], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("T", [2, 4, 5, 8, 16])
+def test_mhc_mixc_and_coefp_match_mhc_mix_and_coef(device, recipes, T):
+    """A few tokens: the site's projection in K chunks (mhc_mixc, rows 0..23) and mhc_coefp adding the chunks up,
+    against mhc_mix + mhc_coef."""
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F32
+
+    rng = np.random.default_rng(30 + T)
+    K, iters, hc_eps, eps = 4 * 5120, 20, 1e-6, 1e-6
+    C = 4 if T <= 4 else 2 if T <= 8 else 1
+    inputs = {
+        "fn": (rng.standard_normal((32, K)) * 0.02).astype(np.float32),
+        "X": (rng.standard_normal((T, K)) * rng.uniform(0.5, 4, (T, 1))).astype(np.float32),
+        "base": rng.standard_normal(24).astype(np.float32),
+        "scale": rng.uniform(0.1, 2.0, 3).astype(np.float32),
+    }
+    g = Graph(device, f"t_coef_mix_{T}")
+    mix, rt = g.tensor((T, 32), F32), g.tensor((64, T), F32)
+    fn, X = g.input("fn", (K, 32), F32), g.input("X", (K, T), F32)
+    g.node("rg_mhc_mix1_f32" if T <= 2 else "rg_mhc_mix_f32", [fn, X], [mix, rt], struct.pack("f", eps))
+    g.node("rg_mhc_coef_f32", [mix, rt, g.input("base", (24,), F32), g.input("scale", (3,), F32)],
+           [g.input("coef", (T, 24), F32)], struct.pack("if", iters, hc_eps))
+    want = Run(device, recipes, g)(inputs, ["coef"])["coef"]
+    g.destroy()
+    g = Graph(device, f"t_coefp_{T}")
+    mixp, ssp = g.tensor((T, 24, C), F32), g.tensor((T, C), F32)
+    g.node("rg_mhc_mixc_f32", [g.input("fn", (K, 32), F32), g.input("X", (K, T), F32)], [mixp, ssp])
+    g.node("rg_mhc_coefp_f32", [mixp, ssp, g.input("base", (24,), F32), g.input("scale", (3,), F32)],
+           [g.input("coef", (T, 24), F32)], struct.pack("iffi", iters, hc_eps, eps, K))
+    got = Run(device, recipes, g)(inputs, ["coef"])["coef"]
+    g.destroy()
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)

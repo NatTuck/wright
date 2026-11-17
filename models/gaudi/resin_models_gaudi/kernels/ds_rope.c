@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 RoPE (adjacent pairs (2i, 2i+1)) on the last 64 rows of each column, after
 //   mode & 1: an RMSNorm of the column, v = x * rsqrt(mean x^2 + eps) * nw
 //   mode & 2: a per-token scale, v = x * ts[t]

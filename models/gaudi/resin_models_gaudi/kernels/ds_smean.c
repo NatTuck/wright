@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 DSpark: the mean of the 4 mHC streams of each column, y[i, t] = (X[i] + X[H + i] + X[2H + i]
 // + X[3H + i]) / 4 at t (the main model's hidden state that the drafter reads).
 // tensors: 0 X (4H, T) f32 | 1 y (H, T) f32

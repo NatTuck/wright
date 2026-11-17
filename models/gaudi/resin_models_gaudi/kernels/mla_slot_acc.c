@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA slot attention, accumulate (Mistral-Large-4; attn_slot_acc for any head width D): merge
 // one launch's slot results into the running attention output of each query column. Per column c of group g the accumulator holds
 // the normalized output acc_o, the running max acc_m and the running sum acc_l; slot s (covering

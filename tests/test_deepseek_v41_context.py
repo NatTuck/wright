@@ -1,10 +1,14 @@
 """DeepSeek-V4.1's Engram context on CPU: the tokens before the first position of every row, with the Engine's
-prefix cache (hits after prefill and after decode, the WINDOW ring after a hit, eviction and block reuse)."""
+prefix cache (hits after prefill and after decode, the WINDOW ring after a hit, eviction and block reuse). Each test
+runs the native context (``resin._resin.Ds41Context``) and the numpy one it replaced (``ds41_reference``)."""
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
+from ds41_reference import EngramContext
 from output_helpers import forward_output
 
 from resin import Engine, RunnerConfig, SamplingParams, SchedulerConfig
@@ -13,11 +17,24 @@ from resin_models_gaudi.deepseek_v41.cache import (
     PAGE_TOKENS,
     WINDOW_GROUP,
     CacheGeometry,
-    EngramContext,
 )
 
 N = 3
 FAMILY = 10_000
+CONTEXTS = [EngramContext]
+try:
+    from resin._resin import Ds41Context
+
+    CONTEXTS.append(Ds41Context)
+except ImportError:  # resin built without the gaudi feature
+    pass
+
+
+@pytest.fixture(autouse=True, params=CONTEXTS, ids=lambda c: c.__name__)
+def context_class(request, monkeypatch):
+    """the context the tests construct (as ``EngramContext``)"""
+    monkeypatch.setitem(globals(), "EngramContext", request.param)
+    return request.param
 CHUNK = 256
 # two KV owners of ratio 1 make a HISTORY block 768 rows, so three WINDOW blocks share a slab
 GEOMETRY = CacheGeometry(2, (0, 1), (1, 1), 128, CHUNK)
@@ -32,10 +49,13 @@ class ContextRunner:
     """Uses ``EngramContext`` as the Gaudi runner does (``before`` for each row, then ``seen`` for its tokens) and
     checks each ``before`` against the tokens of the row's family."""
 
-    def __init__(self, capacity: int) -> None:
-        self.cache_layout = GEOMETRY.layout(capacity)
+    def __init__(self, capacity: int, replay: int = 0, chunk: int = CHUNK) -> None:
+        self.cache_layout = replace(GEOMETRY, max_write=chunk).layout(capacity, replay)
+        self.replay = replay
+        # (pos0, prefill end) of each request's first prefill row
+        self.first_positions: list[tuple[int, int]] = []
         self.runner_config = RunnerConfig(
-            prefill_chunk_size=CHUNK,
+            prefill_chunk_size=chunk,
             continuation_prefill=True,
             cache_layout=self.cache_layout,
         )
@@ -54,7 +74,9 @@ class ContextRunner:
             ids = [int(t) for t in batch.token_ids[batch.token_slice(r)]]
             family = ids[0] // FAMILY
             assert ids == tokens(family, pos0, pos0 + len(ids))
-            known = sequence in self.context.last
+            known = self.context.has(sequence)
+            if not known:
+                self.first_positions.append((pos0, int(plan.prefill_lengths[r])))
             ids_win = GEOMETRY.window_block_id(win.block_slabs(r), win.block_slots(r))
             before = self.context.before(
                 sequence, pos0, int(win.block_table_start_indices[r]), ids_win
@@ -80,12 +102,12 @@ def run(engine: Engine, family: int, length: int, out: int = 1):
     return handle
 
 
-def engine(runner: ContextRunner, **options) -> Engine:
+def engine(runner: ContextRunner, chunk: int = CHUNK, **options) -> Engine:
     return Engine(
         runner,
         context_length=4096,
         prefix_cache=True,
-        scheduler_config=SchedulerConfig(prefill_chunk_size=CHUNK),
+        scheduler_config=SchedulerConfig(prefill_chunk_size=chunk),
         **options,
     )
 
@@ -99,6 +121,36 @@ def test_hits_after_prefill_and_after_a_hit():
         )  # then publishes 768 from its own blocks
         assert run(e, 1, 1000).cached_tokens == 768
     assert runner.restored == 2
+
+
+def test_replay_leaves_the_kept_span_to_compute():
+    """Bounded replay: a hit never reaches into the prompt's last ``replay`` positions, whose layers after the
+    cut have no cached windows."""
+    plain, replay = ContextRunner(64), ContextRunner(64, replay=128)
+    with engine(plain) as e:
+        run(e, 1, 700)  # publishes 256 and 512
+        assert run(e, 1, 600).cached_tokens == 512
+    with engine(replay) as e:
+        run(e, 1, 700)
+        # 512 would leave only 88 of the kept 128
+        assert run(e, 1, 600).cached_tokens == 256
+        assert run(e, 1, 700).cached_tokens == 512
+    assert all(pos0 <= end - 128 for pos0, end in replay.first_positions)
+
+
+def test_replay_hits_a_repeated_prompt_in_one_chunk():
+    """Bounded replay with prefill chunks longer than a cache block: a chunk ends at the last block boundary
+    before the kept span, so a repeated prompt finds that prefix. (A chunk that ends at the last block boundary
+    before the prompt end publishes a prefix that a repeat of the prompt may not use.)"""
+    runner = ContextRunner(64, replay=256, chunk=2048)
+    with engine(runner, chunk=2048) as e:
+        assert run(e, 1, 1051).cached_tokens == 0
+        # 1051 - 256 = 795, down to a 256-token boundary
+        assert run(e, 1, 1051).cached_tokens == 768
+        assert run(e, 1, 1300).cached_tokens == 768  # it publishes 1300 - 256 = 1044, down to 1024
+        assert run(e, 1, 1300).cached_tokens == 1024
+    assert runner.restored == 3
+    assert all(pos0 <= end - 256 for pos0, end in runner.first_positions)
 
 
 def test_hit_on_blocks_that_decode_wrote():
@@ -158,7 +210,7 @@ def test_a_hit_needs_a_recorded_block_before_it():
         1, 2 * PAGE_TOKENS - 1, tokens(5, 2 * PAGE_TOKENS - 1, 2 * PAGE_TOKENS)
     )
     context.release([1])
-    assert 1 not in context.last
+    assert not context.has(1)
     before = context.before(7, 2 * PAGE_TOKENS, 0, ids)
     assert before.tolist() == tokens(5, 2 * PAGE_TOKENS - N, 2 * PAGE_TOKENS)
     assert context.before(7, 0, 0, ids).tolist() == []

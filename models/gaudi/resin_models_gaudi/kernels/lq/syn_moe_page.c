@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Routed matrix product by pages (many tokens): token-expert pairs grouped by expert into pages of PS = 2^psh rows, one
 // batch_gemm over the pages (B = the pages' experts dequantized by syn_qdqp_*). pair = t * nu + s; the tokens
 // are split into chunks of tc tokens (chunk m: tokens [m tc, (m + 1) tc)). Ep is E rounded up to 64, and

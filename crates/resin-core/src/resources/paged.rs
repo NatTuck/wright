@@ -91,6 +91,14 @@ impl GroupDemand {
     pub const fn new(group: GroupId, blocks: usize) -> Self {
         Self { group, blocks }
     }
+
+    /// This demand, raised to at least `blocks`.
+    pub fn at_least(self, blocks: usize) -> Self {
+        Self {
+            blocks: self.blocks.max(blocks),
+            ..self
+        }
+    }
 }
 
 /// One ordered physical table for one input demand. Duplicate group demands
@@ -327,11 +335,36 @@ impl WriterAccessLease {
     pub fn is_empty(&self) -> bool {
         self.claims.is_empty()
     }
+
+    /// Claims stay sorted by handle (prepare_writer_access sorts them).
+    fn claim_index(&self, handle: PageHandle) -> Result<usize, usize> {
+        self.claims
+            .binary_search_by_key(&handle, |claim| claim.claim.handle)
+    }
+
+    pub(crate) fn has_write_claim(&self, handle: PageHandle) -> bool {
+        self.claim_index(handle)
+            .is_ok_and(|index| self.claims[index].claim.write)
+    }
+
+    fn insert_claim(&mut self, claim: PreparedWriterClaim) {
+        let index = self
+            .claim_index(claim.claim.handle)
+            .expect_err("an extension claims each page once");
+        self.claims.insert(index, claim);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CachePoolError {
     InvalidParentCapacity,
+    /// Slabs that cross a slab boundary could not be cleared on the device.
+    ScrubFailed,
+    /// An engine's cache layout declares another capacity than the shared pool.
+    PoolCapacityMismatch {
+        pool: u32,
+        layout: u32,
+    },
     EmptyGroupLayout,
     TooManyGroups,
     PoolIdExhausted,
@@ -370,6 +403,9 @@ pub enum CachePoolError {
         expected: u64,
         actual: u64,
     },
+    /// The slabs that an allocation needs are on their way from a pool in another process (`SlabLeases`): try
+    /// again at the next step.
+    LeasePending,
 }
 
 impl fmt::Display for CachePoolError {
@@ -378,6 +414,12 @@ impl fmt::Display for CachePoolError {
             Self::InvalidParentCapacity => {
                 formatter.write_str("cache pool parent capacity must be positive")
             }
+            Self::ScrubFailed => formatter
+                .write_str("slabs that cross the slab boundary could not be cleared on the device"),
+            Self::PoolCapacityMismatch { pool, layout } => write!(
+                formatter,
+                "the cache layout declares {layout} slabs, and the shared cache pool has {pool}"
+            ),
             Self::EmptyGroupLayout => {
                 formatter.write_str("cache pool requires at least one cache group")
             }
@@ -445,6 +487,9 @@ impl fmt::Display for CachePoolError {
                 formatter,
                 "cache page write epoch changed from {expected} to {actual} after access preparation"
             ),
+            Self::LeasePending => {
+                formatter.write_str("cache slabs are on their way from another process's pool")
+            }
         }
     }
 }
@@ -727,6 +772,18 @@ impl PlacementPlan {
     }
 }
 
+/// Which free slab a new block takes first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FreeOrder {
+    /// The slab freed longest ago.
+    #[default]
+    Fifo,
+    /// The lowest slab id.
+    Low,
+    /// The highest slab id.
+    High,
+}
+
 /// One flat pool of fungible, equal-sized physical parents.
 #[derive(Debug)]
 pub struct CachePool {
@@ -734,9 +791,19 @@ pub struct CachePool {
     /// Last writer identity committed to a successful reservation. It is
     /// monotonic for this pool and never rewound by abort or retirement.
     last_writer_id: u64,
-    group_packings: Box<[NonZeroU32]>,
+    /// Blocks per slab of each group. Several engines that share the pool each
+    /// register their groups (`register_groups`), so the list can grow.
+    group_packings: Vec<NonZeroU32>,
+    /// Slabs bound to each group: an engine's share of a shared pool.
+    bound_by_group: Vec<u32>,
+    /// Free slabs that planning must leave untaken (the unmet floors of the
+    /// other engines of a shared pool).
+    free_reserve: usize,
     parents: Vec<Parent>,
     free_parents: VecDeque<u32>,
+    free_order: FreeOrder,
+    /// Slabs leased from other processes' pools and not given back (`with_leased_capacity`), or every slab.
+    leased_parents: usize,
     /// Compact unordered membership. Removal uses `swap_remove`, so placement
     /// promises dense packing but deliberately no stable partial-parent
     /// priority. Capacity is fixed up front for allocation-free teardown.
@@ -753,15 +820,20 @@ impl CachePool {
         parent_capacity: u32,
         group_packings: &[NonZeroU32],
     ) -> Result<Self, CachePoolError> {
-        if parent_capacity == 0 {
-            return Err(CachePoolError::InvalidParentCapacity);
-        }
         if group_packings.is_empty() {
             return Err(CachePoolError::EmptyGroupLayout);
         }
-        if group_packings.len() > u32::MAX as usize {
-            return Err(CachePoolError::TooManyGroups);
+        let mut pool = Self::with_capacity(parent_capacity)?;
+        pool.register_groups(group_packings)?;
+        Ok(pool)
+    }
+
+    /// A pool without groups yet: the engines that share it register theirs.
+    pub fn with_capacity(parent_capacity: u32) -> Result<Self, CachePoolError> {
+        if parent_capacity == 0 {
+            return Err(CachePoolError::InvalidParentCapacity);
         }
+        let group_packings: &[NonZeroU32] = &[];
         let id = NEXT_POOL_ID
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -793,20 +865,143 @@ impl CachePool {
             .try_reserve_exact(parent_capacity)
             .map_err(|_| CachePoolError::MetadataAllocation)?;
 
+        let bound_by_group = vec![0; packings.len()];
         Ok(Self {
             id,
             last_writer_id: 0,
-            group_packings: packings.into_boxed_slice(),
+            group_packings: packings,
+            bound_by_group,
+            free_reserve: 0,
             parents,
+            leased_parents: free_parents.len(),
             free_parents,
+            free_order: FreeOrder::Fifo,
             partial_parents,
             occupied_blocks: 0,
             validation_handles: Mutex::new(Vec::new()),
         })
     }
 
+    /// A pool of `parent_capacity` slab ids, none of them free: the pool places blocks only in slabs that
+    /// `add_free_parents` gives it (slabs leased from a table that pools in other processes share), in `order`.
+    pub fn with_leased_capacity(
+        parent_capacity: u32,
+        order: FreeOrder,
+    ) -> Result<Self, CachePoolError> {
+        let mut pool = Self::with_capacity(parent_capacity)?;
+        pool.free_parents.clear();
+        pool.free_order = order;
+        pool.leased_parents = 0;
+        Ok(pool)
+    }
+
+    /// Slabs this pool may place blocks in: bound to a group, or free.
+    pub fn leased_parent_count(&self) -> usize {
+        self.leased_parents
+    }
+
+    /// Make leased slabs free for placement. Each must be a slab id of this pool that it does not hold.
+    pub fn add_free_parents(&mut self, parents: &[u32]) -> Result<(), CachePoolError> {
+        for &parent in parents {
+            let index = parent.checked_sub(1).map(|index| index as usize);
+            let held = index
+                .and_then(|index| self.parents.get(index))
+                .is_none_or(|slab| slab.binding.is_some() || !slab.slots.is_empty());
+            if held || self.free_parents.contains(&parent) {
+                return Err(CachePoolError::DuplicateHandle);
+            }
+            self.insert_free(parent);
+            self.leased_parents += 1;
+        }
+        Ok(())
+    }
+
+    /// Whether slab `parent` holds a block that a request uses or that is leased (not only cached prefixes):
+    /// evicting its prefixes would not free it.
+    pub fn parent_has_live_blocks(&self, parent: u32) -> bool {
+        let Some(slab) = parent
+            .checked_sub(1)
+            .and_then(|index| self.parents.get(index as usize))
+        else {
+            return false;
+        };
+        slab.slots
+            .iter()
+            .any(|slot| slot.request_refs != 0 || slot.reader_leases != 0 || slot.writer_lease)
+    }
+
+    /// Whether slab `parent` is in this pool's free list.
+    pub fn parent_is_free(&self, parent: u32) -> bool {
+        self.free_parents.contains(&parent)
+    }
+
+    /// Take free slab `parent` out of the pool (to give it to a pool in another process); false when it is not
+    /// free here.
+    pub fn take_free_parent(&mut self, parent: u32) -> bool {
+        let Some(at) = self.free_parents.iter().position(|&free| free == parent) else {
+            return false;
+        };
+        self.free_parents.remove(at);
+        self.leased_parents -= 1;
+        true
+    }
+
+    fn insert_free(&mut self, parent: u32) {
+        let at = match self.free_order {
+            FreeOrder::Fifo => self.free_parents.len(),
+            FreeOrder::Low => self.free_parents.partition_point(|&other| other < parent),
+            FreeOrder::High => self.free_parents.partition_point(|&other| other > parent),
+        };
+        self.free_parents.insert(at, parent);
+    }
+
     pub const fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn parent_capacity(&self) -> u32 {
+        self.parents.len() as u32
+    }
+
+    /// Add groups for another engine of a shared pool; returns the first new
+    /// group's index. Slabs stay fungible across every registered group.
+    pub fn register_groups(
+        &mut self,
+        group_packings: &[NonZeroU32],
+    ) -> Result<u32, CachePoolError> {
+        if group_packings.is_empty() {
+            return Err(CachePoolError::EmptyGroupLayout);
+        }
+        let first = self.group_packings.len();
+        if first + group_packings.len() > u32::MAX as usize {
+            return Err(CachePoolError::TooManyGroups);
+        }
+        self.group_packings
+            .try_reserve(group_packings.len())
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        self.bound_by_group
+            .try_reserve(group_packings.len())
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        self.group_packings.extend_from_slice(group_packings);
+        self.bound_by_group.resize(self.group_packings.len(), 0);
+        Ok(first as u32)
+    }
+
+    pub fn group_count(&self) -> u32 {
+        self.group_packings.len() as u32
+    }
+
+    /// Slabs bound to the groups `groups` (live, leased or cached blocks).
+    pub fn bound_slab_count(&self, groups: std::ops::Range<u32>) -> u64 {
+        self.bound_by_group[groups.start as usize..groups.end as usize]
+            .iter()
+            .map(|&slabs| u64::from(slabs))
+            .sum()
+    }
+
+    /// Leave `slabs` free slabs untaken by later reservations (0: none).
+    pub fn set_free_reserve(&mut self, slabs: usize) {
+        self.free_reserve = slabs;
     }
 
     pub fn blocks_per_slab(&self, group: GroupId) -> Result<NonZeroU32, CachePoolError> {
@@ -1323,6 +1518,190 @@ impl CachePool {
         Ok(())
     }
 
+    /// Grow a request, write-claim spare pages it already holds, and copy-on-write shared pages, while its batch's
+    /// writer lease is active: a decode continuation whose next step crosses a cache block. Every new or claimed
+    /// page joins `lease`, which releases it like any other claim. Placement is all-or-nothing; on failure the
+    /// request and the lease are unchanged.
+    ///
+    /// `demands` gives each group's total page count (at least what the request holds). `claims` and
+    /// `replacements` give ascending page indices per group: writable pages the lease does not hold yet, and shared
+    /// pages to replace with fresh ones (no data is copied: the caller only replaces pages it will overwrite).
+    pub fn extend_leased_request(
+        &mut self,
+        request: &mut RequestPages,
+        lease: &mut WriterAccessLease,
+        demands: &[GroupDemand],
+        claims: &[Vec<usize>],
+        replacements: &[Vec<usize>],
+    ) -> Result<(), CachePoolError> {
+        if lease.pool_id != self.id {
+            return Err(CachePoolError::ForeignAccess);
+        }
+        self.validate_request_leased(request, lease)?;
+        let groups = request.groups.len();
+        if demands.len() != groups
+            || claims.len() != groups
+            || replacements.len() != groups
+            || demands
+                .iter()
+                .zip(&request.groups)
+                .any(|(demand, group)| demand.group != group.group)
+        {
+            return Err(CachePoolError::StaleHandle);
+        }
+        let mut growth = Vec::new();
+        growth
+            .try_reserve_exact(groups)
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let (mut new_pages, mut claimed, mut request_blocks) = (0usize, 0usize, 0usize);
+        for (((demand, group), claim), replace) in demands
+            .iter()
+            .zip(&request.groups)
+            .zip(claims)
+            .zip(replacements)
+        {
+            let add = demand
+                .blocks
+                .checked_sub(group.pages.len())
+                .ok_or(CachePoolError::StaleHandle)?;
+            for indices in [claim, replace] {
+                if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err(CachePoolError::DuplicateHandle);
+                }
+            }
+            if claim
+                .iter()
+                .any(|index| replace.binary_search(index).is_ok())
+            {
+                return Err(CachePoolError::DuplicateHandle);
+            }
+            for &index in claim {
+                let page = group.pages.get(index).ok_or(CachePoolError::StaleHandle)?;
+                if !page.writable {
+                    return Err(CachePoolError::PageNotWritable);
+                }
+                let access = request.access_claim(page);
+                self.validate_writer_claim(access)?;
+                self.validate_writer_available(access)?;
+            }
+            for &index in replace {
+                let page = group.pages.get(index).ok_or(CachePoolError::StaleHandle)?;
+                if page.writable
+                    || self.validate_live_handle(page.handle)?.mode != Some(PageMode::Shared)
+                {
+                    return Err(CachePoolError::StaleHandle);
+                }
+            }
+            growth.push(add);
+            new_pages = add
+                .checked_add(replace.len())
+                .and_then(|pages| new_pages.checked_add(pages))
+                .ok_or(CachePoolError::DemandOverflow)?;
+            claimed += claim.len();
+            request_blocks = request_blocks
+                .checked_add(demand.blocks)
+                .ok_or(CachePoolError::DemandOverflow)?;
+        }
+        if new_pages == 0 && claimed == 0 {
+            return Ok(());
+        }
+        self.prepare_validation_capacity(request_blocks)?;
+        lease
+            .claims
+            .try_reserve(new_pages + claimed)
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut additions = Vec::new();
+        additions
+            .try_reserve_exact(groups)
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        for ((group, &add), replace) in request.groups.iter_mut().zip(&growth).zip(replacements) {
+            group
+                .pages
+                .try_reserve_exact(add)
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
+            let mut pages = Vec::new();
+            pages
+                .try_reserve_exact(add + replace.len())
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
+            additions.push(pages);
+        }
+        if new_pages != 0 {
+            self.occupied_blocks
+                .checked_add(new_pages)
+                .ok_or(CachePoolError::DemandOverflow)?;
+            let mut plan =
+                PlacementPlan::new(self.group_packings.len(), new_pages, self.parents.len())?;
+            for (((group, &add), replace), pages) in request
+                .groups
+                .iter()
+                .zip(&growth)
+                .zip(replacements)
+                .zip(&mut additions)
+            {
+                let count = add + replace.len();
+                if count != 0 {
+                    self.plan_partition(
+                        &mut plan,
+                        request.writer,
+                        GroupDemand::new(group.group, count),
+                        pages,
+                    )?;
+                }
+            }
+            debug_assert_eq!(plan.block_count, new_pages);
+            self.commit_plan(plan);
+        }
+
+        // Nothing below can fail.
+        for page in additions.iter().flatten() {
+            let slot = self.slot_mut(page.handle);
+            debug_assert_eq!(
+                slot.mode,
+                Some(PageMode::Reserved {
+                    writer: request.writer
+                })
+            );
+            slot.mode = Some(PageMode::Mutable {
+                writer: request.writer,
+            });
+            slot.request_refs = 1;
+            slot.writer_lease = true;
+            let expected_write_epoch = slot.write_epoch;
+            lease.insert_claim(PreparedWriterClaim {
+                claim: request.access_claim(page),
+                expected_write_epoch,
+            });
+        }
+        for (group, claim) in request.groups.iter().zip(claims) {
+            for &index in claim {
+                let page = &group.pages[index];
+                let slot = self.slot_mut(page.handle);
+                slot.writer_lease = true;
+                let expected_write_epoch = slot.write_epoch;
+                lease.insert_claim(PreparedWriterClaim {
+                    claim: request.access_claim(page),
+                    expected_write_epoch,
+                });
+            }
+        }
+        for ((group, replace), pages) in request.groups.iter_mut().zip(replacements).zip(additions)
+        {
+            let mut fresh = pages.into_iter();
+            if !replace.is_empty() {
+                group.snapshot = Weak::new();
+            }
+            for &index in replace {
+                let replacement = fresh.next().expect("one fresh page per replacement");
+                let old = std::mem::replace(&mut group.pages[index], replacement);
+                debug_assert!(!old.writable);
+                self.slot_mut(old.handle).request_refs -= 1;
+                self.retire_slot_if_unused(old.handle);
+            }
+            group.pages.extend(fresh);
+        }
+        Ok(())
+    }
+
     /// Release every page while retaining the request's sequence and writer.
     pub fn clear_request(&mut self, request: &mut RequestPages) -> Result<(), CachePoolError> {
         self.validate_request_idle(request)?;
@@ -1529,7 +1908,13 @@ impl CachePool {
                 continue;
             }
 
-            let Some(parent_id) = self.free_parents.get(new_parent_ids.len()).copied() else {
+            let unreserved = self.free_parents.len().saturating_sub(self.free_reserve);
+            let Some(parent_id) = self
+                .free_parents
+                .get(new_parent_ids.len())
+                .copied()
+                .filter(|_| new_parent_ids.len() < unreserved)
+            else {
                 return Err(CachePoolError::InsufficientCapacity {
                     group: demand.group,
                     requested: demand.blocks,
@@ -1599,6 +1984,7 @@ impl CachePool {
                         debug_assert!(parent.partial_index.is_none());
                         parent.binding = Some(group);
                         parent.slots = slots;
+                        self.bound_by_group[group.index() as usize] += 1;
                         parent.occupied_slots = occupied_after;
                         parent.next_generation = next_generation;
                         occupied_after as usize != parent.slots.len()
@@ -1662,6 +2048,23 @@ impl CachePool {
 
     fn validate_request_idle(&self, request: &RequestPages) -> Result<(), CachePoolError> {
         self.validate_request_access(request, true)
+    }
+
+    /// Like idle validation, except that `lease` may hold this request's pages: every page under a writer lease
+    /// must be one of its write claims. Read pins on shared pages are allowed (they are never written).
+    fn validate_request_leased(
+        &self,
+        request: &RequestPages,
+        lease: &WriterAccessLease,
+    ) -> Result<(), CachePoolError> {
+        self.validate_request_access(request, false)?;
+        for page in request.groups.iter().flat_map(|group| &group.pages) {
+            let slot = self.validate_live_handle(page.handle)?;
+            if slot.writer_lease && !lease.has_write_claim(page.handle) {
+                return Err(CachePoolError::AccessConflict);
+            }
+        }
+        Ok(())
     }
 
     fn prepare_validation_capacity(&mut self, count: usize) -> Result<(), CachePoolError> {
@@ -1850,9 +2253,11 @@ impl CachePool {
                 self.remove_partial(handle.parent);
             }
             let parent = &mut self.parents[parent_index];
-            parent.binding = None;
+            if let Some(group) = parent.binding.take() {
+                self.bound_by_group[group.index() as usize] -= 1;
+            }
             parent.slots.clear();
-            self.free_parents.push_back(handle.parent);
+            self.insert_free(handle.parent);
         } else if became_partial {
             debug_assert!(!was_partial);
             self.insert_partial(handle.parent);

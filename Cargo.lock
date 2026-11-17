@@ -1570,9 +1570,17 @@ dependencies = [
 name = "resin-core"
 version = "0.1.0"
 dependencies = [
+ "log",
  "prometheus-client",
  "rkyv",
  "serde",
+]
+
+[[package]]
+name = "resin-gaudi"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -1583,6 +1591,7 @@ dependencies = [
  "axum",
  "futures-core",
  "http-body-util",
+ "log",
  "prometheus-client",
  "prost",
  "resin-core",
@@ -1598,10 +1607,12 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "libc",
+ "log",
  "numpy",
  "pyo3",
  "pythonize",
  "resin-core",
+ "resin-gaudi",
  "resin-http",
  "resin-recipe",
  "rkyv",

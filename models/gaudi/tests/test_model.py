@@ -1,5 +1,6 @@
-"""The full single-sequence FP8 model on a Gaudi card (set ``RESIN_GAUDI_QWEN35`` to a
-Qwen3.8-27B FP8 checkpoint directory; the model takes ~3 minutes to load and compile).
+"""The full FP8 model on a Gaudi card, one sequence at a time through the native executor with plans made here
+(``qwen_sequence``; set ``RESIN_GAUDI_QWEN35`` to a Qwen3.8-27B FP8 checkpoint directory; the model takes ~3
+minutes to load and compile).
 
 Greedy tokens of a 37-token prompt match the expected tokens; chunked and continued prefill and
 decode equal single-shot prefill; a decode batch equals its sequences decoded alone; nothing
@@ -14,6 +15,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+# the K and V page types: RESIN_GAUDI_CACHE_TYPES=fp8,fp8 runs the tests on an FP8 cache
+CACHE_TYPES = tuple(os.environ.get("RESIN_GAUDI_CACHE_TYPES", "bf16,bf16").split(","))
 
 CHECKPOINT = os.environ.get("RESIN_GAUDI_QWEN35")
 
@@ -33,27 +37,32 @@ EXPECTED_TOKENS = [11, 1345, 1510, 408, 258]
 
 @pytest.fixture(scope="module")
 def engine():
-    from resin_models_gaudi.qwen3_5.model import Qwen35Gaudi
-    from resin_models_gaudi.synapse.runtime import SynapseError, open_device
+    """The runner (its native executor makes the steps)."""
+    from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner
+    from resin_models_gaudi.synapse.runtime import SynapseError
 
     card = os.environ.get("RESIN_GAUDI_CARD")
     try:
-        device = open_device(None if card is None else int(card))
+        built = Qwen3_5GaudiRunner(
+            CHECKPOINT,
+            card=None if card is None else int(card),
+            max_batch_size=4,
+            max_seq_len=8192,
+            parent_capacity=12,
+            cache_types=CACHE_TYPES,
+        )
     except SynapseError as error:
         pytest.skip(f"no Gaudi card available: {error}")
-    built = Qwen35Gaudi(device, CHECKPOINT, parent_capacity=12)
-    built.compiles_at_start = device.compile_count
     yield built
     built.close()
-    device.close()
 
 
 @pytest.fixture(scope="module")
 def model(engine):
     """One sequence over the first six slabs."""
-    from resin_models_gaudi.qwen3_5.model import SingleSequence
+    from qwen_sequence import PlanSequence
 
-    return SingleSequence(engine, range(1, 7))
+    return PlanSequence(engine, range(1, 7))
 
 
 @pytest.fixture(scope="module")
@@ -122,10 +131,10 @@ def test_aligned_chunks_are_exact(model, text_ids):
 def test_decode_batch_equals_single(engine, text_ids):
     """Three sequences at different lengths decoded together (padded to a batch of 4) give the
     tokens and logits they give decoded one at a time."""
-    from resin_models_gaudi.qwen3_5.model import SingleSequence
+    from qwen_sequence import PlanSequence, decode_together
 
     lengths, offsets = (37, 300, 2100), (0, 500, 1000)
-    seqs = [SingleSequence(engine, range(1 + 4 * i, 5 + 4 * i)) for i in range(3)]
+    seqs = [PlanSequence(engine, range(1 + 4 * i, 5 + 4 * i)) for i in range(3)]
 
     def start():
         firsts = []
@@ -137,11 +146,8 @@ def test_decode_batch_equals_single(engine, text_ids):
     tokens = start()
     batched_tokens, batched_logits = [], []
     for _ in range(3):
-        out = engine.decode([seq.next_row() for seq in seqs], tokens)
-        batched_logits.append(engine.logits(len(seqs)))
-        for seq in seqs:
-            seq.advance()
-        tokens = out.tolist()
+        tokens = decode_together(seqs, tokens)
+        batched_logits.append(engine.model.logits(len(seqs)))
         batched_tokens.append(tokens)
 
     tokens = start()
@@ -158,4 +164,4 @@ def test_no_compiles_after_start(engine, model):
     model.reset()
     model.prefill(PROMPT * 3)
     model.decode(1)
-    assert engine.device.compile_count == engine.compiles_at_start
+    assert engine.compiles_after_start == 0

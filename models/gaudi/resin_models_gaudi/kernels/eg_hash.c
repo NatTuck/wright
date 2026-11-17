@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 Engram hash rows of one layer, for columns whose newest token is known only on the device.
 // Column t's n-gram of size n (lane l = 8 (n - 2) + head, 24 lanes) hashes
 //   h = A0[tok[t]] ^ X[l, t],  row = h mod p_l + offset_l

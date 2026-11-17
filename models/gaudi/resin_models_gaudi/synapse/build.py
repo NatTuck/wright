@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from pathlib import Path
 from blake3 import blake3
 
 from resin.kernel_cache import ArtifactCache
+from resin_models_gaudi.loading.progress import progress
 
 PACKAGE = Path(__file__).resolve().parent.parent
 NATIVE = Path(__file__).resolve().parent / "native"
@@ -43,6 +45,7 @@ RUNTIME_LIBRARY = "libresin_gaudi_rt.so"
 KERNEL_LIBRARY = "libresin_gaudi_tpc.so"
 KERNEL_MANIFEST = "kernels.json"
 PACK_LIBRARY = "libresin_gaudi_pack.so"
+SKIP_VALIDATION_LIBRARY = "libresin_gaudi_skip_validation.so"
 
 _INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
 
@@ -56,8 +59,9 @@ class NativeLibraries:
     kernel_digests: Mapping[str, str]
     """Kernel name (file stem) to the digest of its sources, headers and build flags."""
     glue_digest: str
-    runtime_digest: str
-    """The runtime builds every graph, so its source is part of each recipe's key."""
+    graph_digest: str
+    """The digest of the runtime's graph building (``native/graph.cpp`` and ``graph.h``), part of each recipe's
+    key. The rest of the runtime (streams, memory, launches) does not change a recipe, so it is not."""
     synapse_build: str
 
 
@@ -146,15 +150,22 @@ def kernel_digests() -> dict[str, str]:
     }
 
 
+RUNTIME_SOURCES = ("runtime.cpp", "graph.cpp")
+GRAPH_SOURCES = ("graph.h", "graph.cpp")
+
+
 def _identity(digests: Mapping[str, str]) -> tuple[str, str, str]:
-    glue = _digest(_tool_version(CXX), " ".join(CXXFLAGS), NATIVE / "glue.cpp")
+    """The identity of the native libraries, and the glue and graph digests that key recipes."""
+    cxx = _tool_version(CXX)
+    glue = _digest(cxx, " ".join(CXXFLAGS), NATIVE / "glue.cpp")
+    graph = _digest(cxx, " ".join(CXXFLAGS), *(NATIVE / name for name in GRAPH_SOURCES))
     runtime = _digest(
-        _tool_version(CXX),
+        cxx,
         " ".join(CXXFLAGS + RUNTIME_LIBS),
-        NATIVE / "runtime.cpp",
+        *(NATIVE / name for name in ("graph.h", *RUNTIME_SOURCES)),
     )
     kernels = json.dumps(dict(sorted(digests.items())))
-    return _digest(runtime, glue, kernels), glue, runtime
+    return _digest(runtime, glue, kernels), glue, graph
 
 
 def _run(*command: str | Path) -> None:
@@ -191,15 +202,19 @@ def _build(scratch: Path) -> None:
     objects = scratch / "k"
     objects.mkdir()
     sources = kernel_sources()
+    # Startup progress counts each kernel, and the two libraries as one more unit.
+    progress.phase("kernels", total=len(sources) + 1)
 
     def compile_kernel(item: tuple[str, Path]) -> tuple[str, Path]:
         name, source = item
         out = objects / f"{name}.o"
         _run(TPC_CLANG, source, "-c", *TPCFLAGS, f"-I{KERNELS}", "-o", out)
+        progress.advance(1)
         return name, out
 
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
         built = dict(pool.map(compile_kernel, sorted(sources.items())))
+    progress.note("links the libraries")
     _embed(scratch / "kernels_elf.h", built)
     include = f"-I{HABANA_INCLUDE}"
     glue = NATIVE / "glue.cpp"
@@ -220,17 +235,19 @@ def _build(scratch: Path) -> None:
         "-shared",
         "-o",
         scratch / RUNTIME_LIBRARY,
-        NATIVE / "runtime.cpp",
+        *(NATIVE / name for name in RUNTIME_SOURCES),
         f"-L{HABANA_LIB}",
         *RUNTIME_LIBS,
         f"-Wl,-rpath,{HABANA_LIB}",
     )
+    progress.advance(1)
+    progress.note("")
 
 
 def build_native(cache_root: str | os.PathLike[str] | None = None) -> NativeLibraries:
     """Return the validated native libraries, building them on a cache miss."""
     digests = kernel_digests()
-    identity, glue, runtime_digest = _identity(digests)
+    identity, glue, graph_digest = _identity(digests)
     store = ArtifactCache(cache_root or default_cache_root(), _abi())
     directory = Path("native") / identity[:32]
     names = (RUNTIME_LIBRARY, KERNEL_LIBRARY, KERNEL_MANIFEST)
@@ -244,9 +261,16 @@ def build_native(cache_root: str | os.PathLike[str] | None = None) -> NativeLibr
 
     store.root.mkdir(parents=True, exist_ok=True)
     with open(store.root / "native.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            progress.note("waits for the kernel build of another process")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            progress.note("")
         if not artifacts_valid():
-            logging.getLogger("wright").info("building the kernels for this Synapse version")
+            logger = logging.getLogger("wright")
+            logger.info(f"building the {len(kernel_sources())} kernels for this Synapse version")
+            start = time.monotonic()
             with tempfile.TemporaryDirectory(prefix="resin-gaudi-build-") as tmp:
                 scratch = Path(tmp)
                 _build(scratch)
@@ -259,15 +283,38 @@ def build_native(cache_root: str | os.PathLike[str] | None = None) -> NativeLibr
                     )
             if not artifacts_valid():
                 raise RuntimeError("published Gaudi native artifacts failed validation")
+            logger.info(f"kernels: built in {time.monotonic() - start:.1f} s")
     root = store.root / directory
     return NativeLibraries(
         runtime=root / RUNTIME_LIBRARY,
         kernels=root / KERNEL_LIBRARY,
         kernel_digests=json.loads((root / KERNEL_MANIFEST).read_text())["kernels"],
         glue_digest=glue,
-        runtime_digest=runtime_digest,
+        graph_digest=graph_digest,
         synapse_build=synapse_build(),
     )
+
+
+def build_skip_validation(cache_root: str | os.PathLike[str] | None = None) -> Path:
+    """Return the validated library of the ``skipvalidation`` feature (``native/skip_validation.c``), building it
+    on a miss."""
+    cc = _tool_version(CC)
+    source = NATIVE / "skip_validation.c"
+    identity = _digest(cc, " ".join(CFLAGS), source)
+    abi = "host-" + re.sub(r"[^A-Za-z0-9.]+", "-", cc).strip("-")
+    store = ArtifactCache(cache_root or default_cache_root(), abi)
+    artifact = Path("skip-validation") / identity[:32] / SKIP_VALIDATION_LIBRARY
+    store.root.mkdir(parents=True, exist_ok=True)
+    with open(store.root / "skip-validation.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not store.validate(artifact, identity=identity):
+            with tempfile.TemporaryDirectory(prefix="resin-gaudi-skip-validation-") as tmp:
+                out = Path(tmp) / SKIP_VALIDATION_LIBRARY
+                _run(CC, *CFLAGS, "-shared", "-o", out, source)
+                store.publish_from(out, artifact, identity=identity)
+            if not store.validate(artifact, identity=identity):
+                raise RuntimeError("published launch-validation library failed validation")
+    return store.root / artifact
 
 
 def build_pack(cache_root: str | os.PathLike[str] | None = None) -> Path:

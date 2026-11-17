@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Planar quantized weights and fp8 blocks -> bf16, one type per build (-DQT_<type>):
 //  default : syn_qmm.c -DDEQ interface, out[r, k, mat] at mat * smat + k * sk + r; item = (row block, superblock)
 //  -DPAGED : paged MoE interface, out[r, k, p] = W_{pe[p]}[r, k] as [M, K, P]; index space [row blocks, superblocks,

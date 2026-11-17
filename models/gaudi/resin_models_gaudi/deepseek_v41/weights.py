@@ -28,23 +28,15 @@ from dataclasses import dataclass
 import numpy as np
 
 from resin.models.deepseek_v41.config import DeepSeekV41Config
-from resin_models_gaudi.glm5_3_flash.weights import Safetensors
-from resin_models_gaudi.qwen3_5.checkpoint import _POOL, kperm, tperm
+from resin_models_gaudi.loading.convert import POOL, kperm, tperm
+from resin_models_gaudi.loading.source import Safetensors
 
-DTYPES = {
-    "BF16": np.uint16,
-    "F32": np.float32,
-    "F8_E4M3": np.uint8,
-    "F8_E8M0": np.uint8,
-    "I8": np.uint8,
-    "I64": np.int64,
-}
 FP8_MAX = 240.0
 EXACT_SPREAD = 13  # the MXFP4 dequant is exact for blocks at most this many exponents below k's block
 
 
 def reader(path) -> Safetensors:
-    return Safetensors(path, DTYPES)
+    return Safetensors(path)
 
 
 # ------------------------------------------------------------------ FP8 encodings
@@ -141,7 +133,7 @@ def mx8_rows(
         if count:
             inexact[b] = int(np.count_nonzero(~_EXACT.reshape(-1)[idx]))
 
-    list(_POOL.map(one, range(M // 32)))
+    list(POOL.map(one, range(M // 32)))
     row_scales = np.exp2(r.astype(np.float64)).astype(np.float32)
     if (
         tau and K % 256
@@ -257,7 +249,7 @@ def expert_slots(
         codes2[e] = src.read(f"{name}.w2.weight")[:, c2]
         scales2[e] = src.read(f"{name}.w2.scale")[:, s2]
 
-    list(_POOL.map(one, range(experts)))
+    list(POOL.map(one, range(experts)))
     return ExpertSlots(
         codes13.reshape(experts, -1),
         scales13.reshape(experts, -1),

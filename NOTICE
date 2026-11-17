@@ -152,16 +152,18 @@ preservation of empty rows; it does not produce attention outputs.
 
 Wright
 
-Wright is a modified version of Resin. It starts from Resin commit
-2638d8509b6661913a17642ef44e3f30e35f47e9, https://github.com/ekzhang/resin. MODIFICATIONS.md lists the
-Resin files that Wright changed. The Apache License 2.0 in LICENSE applies to Wright, except for the
-kernels below.
+Wright uses a modified version of Resin for its scheduler and front-end. The modified Resin starts from
+Resin commit 2638d8509b6661913a17642ef44e3f30e35f47e9, https://github.com/ekzhang/resin. MODIFICATIONS.md
+lists the Resin files that Wright changed.
 
-The TPC-C kernels in models/gaudi/resin_models_gaudi/kernels/ are licensed under the PolyForm Noncommercial
-License 1.0.0, in models/gaudi/resin_models_gaudi/kernels/LICENSE. They are not licensed under the Apache
-License 2.0. The rest of the engine needs these kernels to run.
+Wright's own code, including the TPC-C kernels in models/gaudi/resin_models_gaudi/kernels/, is licensed
+under the GNU Affero General Public License v3.0 only (AGPL-3.0-only), in LICENSE, or under a separate
+commercial license from the author. COMMERCIAL.md tells how to get a commercial license.
 
-Required Notice: Copyright Aaron Botsis
+The Resin files and the adapted third-party parts that this file lists keep their own licenses. Resin is
+licensed under the Apache License 2.0, in LICENSES/Apache-2.0.txt.
+
+Copyright Aaron Botsis
 
 The GGUF block formats in models/gaudi/resin_models_gaudi/gguf/ and
 models/gaudi/resin_models_gaudi/synapse/native/pack.c follow the format of ggml-quants.c in llama.cpp:

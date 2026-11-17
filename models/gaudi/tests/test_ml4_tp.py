@@ -49,9 +49,9 @@ def _worker(
     import torch.distributed as dist
 
     from resin.models.mistral_large4.config import MistralLarge4Config
+    from resin_models_gaudi import ranks as par
     from resin_models_gaudi.gguf.reader import GgufModel
     from resin_models_gaudi.mistral_large4 import model as M
-    from resin_models_gaudi.mistral_large4 import parallel as par
     from resin_models_gaudi.mistral_large4.cache import CacheGeometry
     from resin_models_gaudi.synapse.runtime import open_device
 

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // mHC residual update after a sub-layer (mhc_post without the rms, spread over the hidden dim):
 //   Xo_j = post_j y + sum_i comb[i][j] X_i        (y summed over NR rank slices when NR > 1)
 // The next site's 1 / rms(Xo) comes from mhc_mix.

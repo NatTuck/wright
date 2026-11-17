@@ -105,6 +105,12 @@ def test_native_http_server_rejects_zero_settings(setting):
         {"reasoning": True, "thinking_levels": ()},
         {"thinking_levels": ("low",)},
         {"reasoning": False, "thinking_levels": ("low",)},
+        {"default_temperature": -0.5},
+        {"default_temperature": "1"},
+        {"default_top_p": 0.0},
+        {"default_top_p": 1.5},
+        {"default_top_k": 0},
+        {"default_top_k": 2.0},
     ],
 )
 def test_model_capabilities_rejects_invalid_values(options):
@@ -160,3 +166,14 @@ def test_native_http_server_rejects_unknown_capabilities():
             engine, _Recipe(), model="test", capabilities={"thinking_levels": ["low"]}
         )
     engine.close()
+
+
+def test_model_capabilities_forward_the_sampling_defaults():
+    capabilities = ModelCapabilities(
+        default_temperature=0.6, default_top_p=0.95, default_top_k=20
+    )
+    assert capabilities.to_wire() == {
+        "default_temperature": 0.6,
+        "default_top_p": 0.95,
+        "default_top_k": 20,
+    }

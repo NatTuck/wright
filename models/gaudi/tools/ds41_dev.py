@@ -1,7 +1,7 @@
 """A warm DeepSeek-V4.1 process: the weights stay on the cards while scripts run against them.
 
 usage: ds41_dev.py CHECKPOINT DIR [--layers N] [--ranks R | --slice R/N] [--engram host|card]
-                   [--profile PDIR] [--dspark]
+                   [--profile PDIR] [--dspark] [--replay K]
 
 Each rank loads the weights once, then runs every new DIR/*.py in name order with ``exec``. A script sees
 ``device``, ``cfg``, ``rank``, ``nranks``, ``weights`` (name -> device address), ``build()`` (a fresh
@@ -35,6 +35,9 @@ def main() -> None:
     parser.add_argument("--slice")
     parser.add_argument("--profile")
     parser.add_argument("--dspark", action="store_true", help="load the DSpark stages too")
+    parser.add_argument(
+        "--replay", type=int, default=0, help="bounded replay's kept span (launch_replay)"
+    )
     args = parser.parse_args()
     if args.slice:
         rank, nranks = (int(x) for x in args.slice.split("/"))
@@ -74,7 +77,7 @@ def run(rank: int, nranks: int, args) -> None:
     device = open_device()
     barrier = None
     if nranks > 1 and not args.slice:
-        from resin_models_gaudi.mistral_large4 import parallel
+        from resin_models_gaudi import ranks as parallel
 
         parallel.init_gloo(rank, nranks, 29645)
         parallel.hccl_rendezvous(device, rank, nranks)
@@ -97,7 +100,7 @@ def run(rank: int, nranks: int, args) -> None:
         return DeepSeekV41Gaudi(
             device, args.checkpoint, cfg, capacity=args.capacity, max_seq_len=args.max_seq_len, rank=rank,
             nranks=nranks, layers=args.layers, engram=args.engram, weights=weights, barrier=barrier, recipes=recipes,
-            log=log, **{"dspark": args.dspark, **options},
+            log=log, **{"dspark": args.dspark, "replay": args.replay, **options},
         )  # fmt: skip
 
     first = make()

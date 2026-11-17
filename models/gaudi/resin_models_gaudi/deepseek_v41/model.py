@@ -23,20 +23,21 @@ Engram hash ids are computed on the host from each row's last tokens (``Row.befo
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 
 from resin.models.deepseek_v41 import DeepSeekV41Config
+from resin_models_gaudi.common.sampling import PARAMS, TOP_MAX
 from resin_models_gaudi.deepseek_v41 import layers as L
 from resin_models_gaudi.deepseek_v41.cache import (
     HISTORY_TOKENS,
     INDEX_ROWS,
     PAGE_ROWS,
     PAGE_TOKENS,
-    PAIR_ROWS,
+    PENDING_SLOTS,
     STATE_FLOATS,
     CacheGeometry,
 )
@@ -44,35 +45,32 @@ from resin_models_gaudi.deepseek_v41.rope import cs_table, layer_frequencies
 from resin_models_gaudi.deepseek_v41.weights import (
     RankSlices,
     engram_hash_tables,
-    engram_rows,
     engram_table,
     prepare_compressed,
     prepare_draft_stage,
     prepare_engram,
     prepare_layer,
     reader,
-    split64,
     table_rows,
 )
 from resin_models_gaudi.glm5_3_flash.layers import sample_graph
 from resin_models_gaudi.glm5_3_flash.model import (
-    _SAMPLE_LAST,
-    _SAMPLE_TABLE,
-    _SAMPLED,
-    _SAMPLED_BYTES,
-    Staged,
     _Op,
-    _sampled_fields,
 )
-from resin_models_gaudi.qwen3_5.sampling import PARAMS
+from resin_models_gaudi.glm5_3_flash.weights import NS
+from resin_models_gaudi.loading.convert import kperm
+from resin_models_gaudi.loading.progress import info, progress, weight_file_bytes
+from resin_models_gaudi.loading.upload import WeightLoader
 from resin_models_gaudi.synapse.graph import Recipe, RecipeCache
-from resin_models_gaudi.synapse.progress import info
 from resin_models_gaudi.synapse.runtime import Device
 
-DECODE_BUCKETS = (1, 2, 4, 8, 16)
+DECODE_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
 PREFILL_BUCKETS = (32, 128, 512, 1024, 2048)
 PAGED_T = 128  # prefill launches this wide decode each routed expert once per page of its rows
 MAX_T = DECODE_BUCKETS[-1]
+# steps of up to GATHER_T columns all-gather the ranks' partials and sum them in the next graph (one collective
+# that moves T x nranks columns); wider steps all-reduce them
+GATHER_T = 16
 TMAX = PREFILL_BUCKETS[-1]
 QUERY_BLOCK = 128  # prefill columns per window slot
 INDEX_KEYS = 2048  # index keys per index slot
@@ -90,11 +88,29 @@ DENSE_KEYS = 2048
 DSPARK_ROWS = (
     2  # rows per speculative step: (block + 1) columns each fit the decode buckets
 )
-RADIX_MIN = 16384  # decode steps whose columns see more index keys pick their top 512 by radix passes
+RADIX_MIN = 20480  # decode steps whose columns see more index keys pick their top 512 by radix passes (ix_thr counts up to 20480 keys)
 J = 24  # Engram rows per column: (max n-gram - 1) x heads
+# the registers of a decode step's native program: sparse, cand, candidate launches, and per index ratio
+# (1, 2) the radix selection and the index launches
+_R_SPARSE, _R_CAND, _R_IXC = 0, 1, 2
+_R_RADIX = {1: 3, 2: 4}
+_R_IX = {1: 5, 2: 6}
+_R_COLUMN = 7  # the column whose logits a one-column head gathers
+# per index ratio, a prefill step's dense attention and its prefiltered selection
+_R_DENSE = {1: 8, 2: 9}
+_R_PF = {1: 10, 2: 11}
+_REGISTERS = 12
 WORKSPACE_RESERVE = 3 << 30
-_HOST_EVENT = 60  # 60, 61: the pinned table copies' uploads
-_STAGE_EVENT = 56  # 56, 57: the sampler's staging copies
+# the sampler's outputs for up to MAX_T columns: tokens, logprobs, top ids, top logprobs (256-byte aligned)
+_SAMPLED = {
+    "tok_out": 0,
+    "lp_out": 4 * MAX_T,
+    "top_idx": 8 * MAX_T,
+    "top_lp": 8 * MAX_T + 4 * TOP_MAX * MAX_T,
+}
+_SAMPLED_BYTES = 8 * MAX_T + 8 * TOP_MAX * MAX_T
+_SAMPLE_TABLE = 4 * PARAMS * MAX_T + 256  # the rows' parameters, then ``last``
+_SAMPLE_LAST = 4 * PARAMS * MAX_T
 
 
 def bucket(n: int, prefill: bool) -> int:
@@ -104,6 +120,34 @@ def bucket(n: int, prefill: bool) -> int:
     raise ValueError(
         f"{n} columns exceed the {'prefill' if prefill else 'decode'} buckets"
     )
+
+
+def _native_rows(rows) -> tuple[np.ndarray, ...]:
+    """``Ds41Fill``'s row arguments: per row its column, pos0, real tokens and first window block, then the
+    WINDOW rows and ids, the HISTORY rows and the tokens before pos0 of every row, flat with their offsets."""
+
+    def flat(parts):
+        lens = [len(p) for p in parts]
+        indptr = np.zeros(len(parts) + 1, np.int64)
+        np.cumsum(lens, out=indptr[1:])
+        values = (
+            np.concatenate([np.asarray(p, np.int64) for p in parts])
+            if indptr[-1]
+            else np.zeros(0, np.int64)
+        )
+        return indptr, values
+
+    window_indptr, window = flat([r.window for r in rows])
+    _, window_ids = flat([r.window_ids for r in rows])
+    history_indptr, history = flat([r.history for r in rows])
+    before_indptr, before = flat([r.before for r in rows])
+    return (
+        np.array([r.column for r in rows], np.int64),
+        np.array([r.pos0 for r in rows], np.int64),
+        np.array([r.real for r in rows], np.int64),
+        np.array([r.window_first for r in rows], np.int64),
+        window_indptr, window, window_ids, history_indptr, history, before_indptr, before,
+    )  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +319,9 @@ class _Program:
         self.layers: list[dict] = []
         self.head: _Op | None = None
         self.inject: _Op | None = None
+        # bounded replay (prefill shapes): the cut owner's store-only launch and the buffers of its inputs
+        self.store: _Op | None = None
+        self.cut: tuple[int, int, int] | None = None  # (X, c, p)
 
 
 class DeepSeekV41Gaudi:
@@ -296,7 +343,15 @@ class DeepSeekV41Gaudi:
         barrier: Callable[[], None] | None = None,
         log: Callable[[str], None] = info,
         dspark: bool = False,
+        replay: int = 0,
+        defer_cache: bool = False,
     ) -> None:
+        """``defer_cache``: stop after the weights and the buffers; :meth:`attach` then makes the cache arena,
+        the step tables and the recipes, which depend on its capacity.
+
+        ``replay``: bounded replay's kept span (0: off). A prefill chunk then runs the layers after the cut
+        (the first ratio-1 layer, the KV owner of every layer after it) only on its columns among the prompt's last
+        ``replay`` positions; see ``launch_replay``."""
         if engram not in ("card", "host"):
             raise ValueError(f"engram {engram!r}: 'card' or 'host'")
         self.device, self.cfg, self.log = device, cfg, log
@@ -317,10 +372,10 @@ class DeepSeekV41Gaudi:
         self.geo = CacheGeometry.from_config(
             cfg, layers=self.n_layers, max_write=TMAX, draft_layers=self.stages
         )
-        # decode steps all-gather the ranks' partials and sum them in the next graph
+        # narrow decode steps all-gather the ranks' partials and sum them in the next graph
         self.d = replace(
             L.Dims.of(cfg, nranks, self.sl.vocab.stop - self.sl.vocab.start),
-            gather_tokens=MAX_T if nranks > 1 and gather else 0,
+            gather_tokens=GATHER_T if nranks > 1 and gather else 0,
         )
         self.d_draft = replace(
             self.d,
@@ -331,6 +386,8 @@ class DeepSeekV41Gaudi:
         self.recipes = recipes or RecipeCache(device)
         self.src = reader(checkpoint)
         self.engram_layers = tuple(e for e in cfg.engram_layer_ids if e < self.n_layers)
+        self.replay = replay
+        self.cut = self._replay_cut() if replay else None
         self.freqs = {r: layer_frequencies(cfg, r) for r in (0, 1)}
         # index score rows: every compressed entry a ratio-1 owner can hold, in whole 4096-key groups
         self.kmax = -(-(max_seq_len + TMAX) // 4096) * 4096
@@ -346,6 +403,7 @@ class DeepSeekV41Gaudi:
         )
         self._hash = None
         self._allocs: list[int] = []
+        self.loader: WeightLoader | None = None  # None: ``weights`` given
         t0 = time.time()
         self.w = weights if weights is not None else self._load(barrier)
         log(f"ds41 rank {rank}/{nranks}: weights in {time.time() - t0:.0f} s")
@@ -361,12 +419,36 @@ class DeepSeekV41Gaudi:
                     self.w[f"{key}_r"] = self.w[key] + rank * rows * 6144
                     self.w[f"{key}_r.s"] = self.w[f"{key}.s"] + 4 * rank * rows
         self._buffers()
+        self.capacity: int | None = None
+        if not defer_cache:
+            self.attach(capacity)
+
+    def attach(
+        self,
+        capacity: int | Callable[[int], int],
+        *,
+        slab_rows: int | None = None,
+        arena: int | None = None,
+    ) -> None:
+        """The cache arena of ``capacity`` slabs (a callable gets the free card memory less the workspace
+        reserve), its pending state, the step tables and the recipes: every part that depends on the capacity.
+        ``slab_rows``: slabs of that many rows (another model's slab size), each with as many blocks as fit.
+        ``arena``: the address of a cleared arena of ``capacity`` such slabs plus the null slab, which other
+        models of the card share (the caller allocates and frees it); else the model allocates its own."""
+        if self.capacity is not None:
+            raise RuntimeError("the cache arena is attached already")
+        if slab_rows is not None:
+            self.geo = self.geo.with_slab_rows(slab_rows)
+        device, log = self.device, self.log
         if callable(capacity):
             capacity = capacity(device.memory_info()[0] - self.workspace_reserve)
         self.capacity = capacity
         self.arena_blocks = self.geo.arena_blocks(capacity)
-        self.arena = self._malloc(self.arena_blocks * 1024 * 512)
-        device.memset32(self.arena, 0, self.arena_blocks * 1024 * 128)
+        if arena is None:
+            self.arena = self._malloc(self.arena_blocks * 1024 * 512)
+            device.memset32(self.arena, 0, self.arena_blocks * 1024 * 128)
+        else:
+            self.arena = arena
         state = self.geo.state_bytes(capacity)
         self.state = self._malloc(state)
         device.memset32(self.state, 0, state // 4)
@@ -377,23 +459,47 @@ class DeepSeekV41Gaudi:
         self.tables = {s: _Tables(s, self) for s in self.shapes}
         size = max(t.nbytes for t in self.tables.values())
         self.table = self._malloc(size)
-        self.host = [device.host_buffer(size, np.uint8) for _ in range(2)]
-        self._host_turn, self._host_pending = 0, [False, False]
-        for tb in self.tables.values():
-            for h in self.host:
-                tb.bind(h)
         self._layer_rows = np.array(
             [self.geo.layer_offset(k) for k in range(self.n_layers + self.stages)],
             np.int64,
         )
+        # the native executor (deepseek_v41.native) fills every step's tables and runs its programs
+        self._native = self._native_fill()
+        self._glue = device.glue
+        if self._glue is None:
+            raise RuntimeError(
+                "DeepSeek-V4.1 steps run in the native executor: it needs the runtime library's glue (Device.glue)"
+            )
+        self._native_programs: dict[Shape, object] = {}
         self._programs: dict[Shape, _Program] = {}
         self._draft_programs: dict[Shape, dict] = {}
-        self.probe = None  # (layer, ops, T): after each layer's ffn and its collective
+        self._draft_natives: dict[Shape, object] = {}  # the draft programs as native programs (_draft_native)
         self._sample_ops: dict[tuple, _Op] = {}
-        self._staging = [Staged(device, _STAGE_EVENT + k) for k in range(2)]
-        self._stage_turn = 0
-        self._column = False  # the last step all-gathered one column's logits
+        # device event slots: the sampler's staging copies, and the pinned tables' uploads
+        self._stage_event, self._host_event = device.event_slots(2), device.event_slots(2)
         self._compile()
+
+    def _replay_cut(self) -> int:
+        """The first ratio-1 layer, when every later layer reads its compressed KV and index keys: the layers
+        after it keep nothing of a prompt's earlier positions but their windows."""
+        cfg, n = self.cfg, self.n_layers
+        ratios = cfg.compress_ratios[:n]
+        cut = next((i for i, r in enumerate(ratios) if r == 1), None)
+        if cut is None or cut not in cfg.kv_source_layers:
+            raise ValueError("bounded replay needs a ratio-1 KV owner")
+        if any(ratios[i] != 1 or cfg.kv_owner(i) != cut for i in range(cut, n)):
+            raise ValueError(
+                f"bounded replay: a layer after {cut} keeps its own compressed KV"
+            )
+        if any(e >= cut for e in self.engram_layers):
+            raise ValueError(f"bounded replay: an Engram layer after {cut}")
+        if self.stages and any(t < cut for t in cfg.dspark_target_layer_ids):
+            raise ValueError(f"bounded replay: a DSpark target layer before {cut}")
+        if not cfg.sliding_window <= self.replay <= TMAX:
+            raise ValueError(
+                f"bounded replay keeps {self.replay} positions: {cfg.sliding_window} to {TMAX}"
+            )
+        return cut
 
     @property
     def workspace_reserve(self) -> int:
@@ -461,41 +567,46 @@ class DeepSeekV41Gaudi:
 
     # ------------------------------------------------------------------ weights
     def _load(self, barrier) -> dict[str, int]:
-        dev, cfg, src, sl = self.device, self.cfg, self.src, self.sl
-        w: dict[str, int] = {}
+        cfg, src, sl = self.cfg, self.src, self.sl
+        self.loader = loader = WeightLoader(self.device, self.recipes)
+        files = weight_file_bytes(self.checkpoint, "*.safetensors")
+        self.device.begin_load(files // self.nranks)
 
-        def put(name: str, array: np.ndarray) -> None:
-            a = np.ascontiguousarray(array)
-            w[name] = dev.malloc(max(256, a.nbytes))
-            dev.h2d(w[name], a)
+        def put(prefix: str, parts: dict[str, np.ndarray]) -> None:
+            loader.load((prefix + name, a, "plain") for name, a in parts.items())
 
-        from resin_models_gaudi.qwen3_5.checkpoint import kperm
-
-        put("emb", src.read("embed.weight"))
-        put("head", kperm(src.read("head.weight", sl.vocab)))
-        put("norm", (src.read("norm.weight").astype(np.uint32) << 16).view(np.float32))
+        put(
+            "",
+            {
+                "emb": src.read("embed.weight"),
+                "head": kperm(src.read("head.weight", sl.vocab)),
+                "norm": (src.read("norm.weight").astype(np.uint32) << 16).view(
+                    np.float32
+                ),
+            },
+        )
         for layer in range(self.n_layers):
             if barrier is not None:
                 barrier()  # the ranks read each layer's shards together
             t0 = time.time()
+            progress.note(f"layer {layer + 1} of {self.n_layers}")
             parts = prepare_layer(src, cfg, layer, sl)
             if cfg.compress_ratios[layer]:
                 parts.update(prepare_compressed(src, cfg, layer))
             if layer in self.engram_layers:
                 parts.update(prepare_engram(src, layer))
-            for name, array in parts.items():
-                put(f"l{layer}.{name}", array)
+            put(f"l{layer}.", parts)
             del parts
             if layer in self.engram_layers and self.engram == "card":
-                self._load_table(w, layer)
+                self._load_table(loader, layer)
             self.log(f"layer {layer} in {time.time() - t0:.0f} s")
         for k in range(self.stages):
             t0 = time.time()
-            for name, array in prepare_draft_stage(src, cfg, k, sl).items():
-                put(f"l{self.n_layers + k}.{name}", array)
+            put(f"l{self.n_layers + k}.", prepare_draft_stage(src, cfg, k, sl))
             self.log(f"DSpark stage {k} in {time.time() - t0:.0f} s")
-        self._draft_names(w)
-        return w
+        self.device.end_load()
+        self._draft_names(loader.w)
+        return loader.w
 
     def _draft_names(self, w: dict[str, int]) -> None:
         """The DSpark tensors the inject and Markov graphs read by plain names (their stage's copies)."""
@@ -551,14 +662,14 @@ class DeepSeekV41Gaudi:
                 )
                 self.device.h2d(address, np.ascontiguousarray(a))
 
-    def _load_table(self, w: dict[str, int], layer: int) -> None:
+    def _load_table(self, loader: WeightLoader, layer: int) -> None:
         """This rank's rows of an Engram table, converted in chunks."""
-        dev = self.device
+        dev, w = self.device, loader.w
         total = self.src.info(f"layers.{layer}.engram.embed.weight")[1][0]
         rows = table_rows(total, self.rank, self.nranks)
         n = rows.stop - rows.start
-        w[f"l{layer}.eg_table"] = table = dev.malloc(256 * n)
-        w[f"l{layer}.eg_rs"] = scales = dev.malloc(4 * n)
+        w[f"l{layer}.eg_table"] = table = loader.malloc(256 * n)
+        w[f"l{layer}.eg_rs"] = scales = loader.malloc(4 * n)
         w[f"l{layer}.eg_row0"] = rows.start
         w[f"l{layer}.eg_rows"] = n
         for first, data, rs in engram_table(self.src, layer, rows):
@@ -580,7 +691,7 @@ class DeepSeekV41Gaudi:
             return address
 
         f = np.float32
-        self.pzero = const(np.zeros((max(TMAX, MAX_T * self.nranks), H), f))
+        self.pzero = const(np.zeros((max(TMAX, GATHER_T * self.nranks), H), f))
 
         def identity(t: int) -> np.ndarray:
             """(24, t) in numpy: pre one-hot(0), post 0, comb I"""
@@ -600,7 +711,7 @@ class DeepSeekV41Gaudi:
         self.cbuf = [buf(4 * 24 * T), buf(4 * 24 * T)]
         self.pbuf = [buf(4 * H * T), buf(4 * H * T)]
         self.pall = [
-            buf(4 * H * MAX_T * self.nranks) for _ in range(2)
+            buf(4 * H * GATHER_T * self.nranks) for _ in range(2)
         ]  # the partials all-gathered
         W = nh * T
         self.io = {
@@ -640,7 +751,10 @@ class DeepSeekV41Gaudi:
         )
         self.sampled_buf = buf(_SAMPLED_BYTES)
         self.sampled = {n: self.sampled_buf + off for n, off in _SAMPLED.items()}
-        self.sample_table = buf(4096)
+        self.sample_table = buf(_SAMPLE_TABLE)
+        if self.cut is not None:
+            # bounded replay: the kept columns' streams, partial and coefficients pass through here
+            self.replay_scratch = buf(4 * (NS * H + H + 24) * bucket(self.replay, True))
 
     def _graphs(self) -> dict[tuple, object]:
         dev, d, cfg, nb = self.device, self.d, self.cfg, self.arena_blocks
@@ -651,6 +765,10 @@ class DeepSeekV41Gaudi:
             graphs["embed", s] = L.embed_graph(dev, d, T, cfg.vocab_size)
             graphs["ffn", s] = L.ffn_graph(dev, d, T, paged=s.prefill and T >= PAGED_T)
             graphs["head", s] = L.head_graph(dev, d, T)
+            if self.cut is not None and s.prefill:
+                graphs["store", s] = L.owner_store_graph(
+                    dev, d, T, nb, ratio=1, groups=T, state_rows=R
+                )
             if self.stages:
                 taps = len(cfg.dspark_target_layer_ids)
                 graphs["inject", s] = L.inject_graph(dev, d, T, self.stages, nb, taps)
@@ -781,16 +899,12 @@ class DeepSeekV41Gaudi:
         return ("pre", s, ratio, owner, source, residual, capture)
 
     def _compile(self) -> None:
-        t0 = time.time()
+        progress.building_graphs()
         graphs = self._graphs()
         recipes = self.recipes.compile_many(list(graphs.values()))
         self.r: dict[tuple, Recipe] = dict(zip(graphs.keys(), recipes, strict=True))
         for g in graphs.values():
             g.destroy()
-        cached = sum(r.from_cache for r in recipes)
-        self.log(
-            f"ds41: {len(recipes)} recipes ({cached} cached) in {time.time() - t0:.1f} s"
-        )
         self.compiles_at_start = self.device.compile_count
         # constant inputs, one buffer per name: ones for rope_b* and one, zeros for the rest, each as large as
         # its largest use
@@ -1021,6 +1135,9 @@ class DeepSeekV41Gaudi:
                             layer,
                             {**common, **dense, "p_out": p[pnext]},
                         )
+            if layer == self.cut and s.prefill:
+                prog.store = self._op(self.r["store", s], layer, {**common, **attn_io})
+                prog.cut = (attn_io["X"], attn_io["c"], attn_io["p"])
             cin, pin = c[cnext], p[pnext]
             cnext, pnext = 1 - cnext, 1 - pnext
             other = next(k for k in (0, 1) if k != cur)
@@ -1048,217 +1165,48 @@ class DeepSeekV41Gaudi:
         return prog
 
     # ------------------------------------------------------------------ the step
-    def forward(
-        self,
-        tokens: np.ndarray,
-        positions: np.ndarray,
-        rows: Sequence[Row],
-        prefill: bool = False,
-    ):
-        """T columns (``tokens``, ``positions``) whose sequences are ``rows`` -> logits (n, V) f32"""
-        T = self.launch(tokens, positions, rows, prefill)
-        return self.logits_host(T)[: len(tokens)]
-
-    def logits_host(self, T: int) -> np.ndarray:
-        self.device.sync()
-        V = self.d.vocab
-        out = self.device.d2h(self.logits_all, (self.nranks, T, V), np.float32)
-        return np.ascontiguousarray(out.transpose(1, 0, 2).reshape(T, self.nranks * V))
-
-    def sample(self, tokens, positions, rows, params, last=None, prefill=False):
-        """A step, then the device sampler over every column (decode) or column ``last`` (a prefill chunk's last
-        real token) -> (tokens, logprobs, top ids, top logprobs)"""
-        T = self.launch(
-            tokens, positions, rows, prefill, "all" if last is None else last
-        )
-        return self.sample_launched(Shape(T, prefill), params, last)
-
-    def sample_launched(self, s: Shape, params: np.ndarray, last: int | None = None):
-        R = self._sample_launch(s, params, last)
-        dev = self.device
-        dev.sync()
-        out = dev.d2h(self.sampled_buf, (_SAMPLED_BYTES,), np.uint8)
-        return _sampled_fields(out, R, len(params))
-
-    def sample_async(self, s: Shape, params: np.ndarray) -> Staged:
-        """Sample every column of the decode step just launched and copy the results into a pinned staging
-        buffer without waiting; ``Staged.result`` waits for them."""
-        self._sample_launch(s, params, None)
-        k = self._stage_turn
-        self._stage_turn ^= 1
-        staged = self._staging[k]
-        staged.drain()
-        self.device.d2h_async(staged.buffer, self.sampled_buf)
-        self.device.record(_STAGE_EVENT + k)
-        staged.arm(s.T, len(params))
-        return staged
-
-    def _sample_launch(self, s: Shape, params: np.ndarray, last: int | None) -> int:
-        if last is not None and self._column:  # the step gathered only column ``last``
-            s, last = Shape(1, False), None
-        R = 1 if last is not None else s.T
-        n = len(params)
-        table = np.zeros(_SAMPLE_TABLE // 4, np.float32)
-        table[: n * PARAMS] = np.asarray(params, np.float32).ravel()
-        table.view(np.int32)[_SAMPLE_LAST // 4] = 0 if last is None else last
-        dev = self.device
-        dev.h2d_nb(self.sample_table, table)
-        op = self._sample_ops.get((s, R))
-        if op is None:
-            op = self._sample_ops[s, R] = self._op(
-                self.r["sample", s, R], None,
-                {**self.sampled, "logits_all": self.logits_all, "samp_params": self.sample_table,
-                 "last": self.sample_table + _SAMPLE_LAST},
-            )  # fmt: skip
-        op.run(dev.lib)
-        return R
-
-    def launch(
-        self,
-        tokens: np.ndarray | None,
-        positions: np.ndarray,
-        rows: Sequence[Row],
-        prefill: bool = False,
-        logits: str | int | None = "all",
-    ) -> int:
-        """Enqueue a step through the head and the logits all-gather; returns its bucket. ``tokens`` None: a
-        decode step whose columns' tokens are the previous step's samples, read on the device. ``logits``: "all"
-        columns; one column (its index), all-gathered alone for sample_launched(..., last=that column); or None
-        (no head: a prefill chunk that samples nothing)."""
-        dev, d = self.device, self.d
-        n = len(positions)
-        s = Shape(bucket(n, prefill), prefill)
-        if prefill and len(rows) != 1:
-            raise ValueError("a prefill step runs one row")
-        if tokens is None and not self.hashed(s):
-            raise ValueError(
-                "device tokens need a decode step with the Engram tables on the cards"
-            )
-        tb = self.tables[s]
-        k = self._host_turn
-        self._host_turn ^= 1
-        if self._host_pending[k]:
-            dev.wait(_HOST_EVENT + k)
-        counts = self._fill(
-            k,
-            tb,
-            None if tokens is None else np.asarray(tokens),
-            np.asarray(positions),
-            rows,
-        )
-        dev.h2d_async(self.table, self.host[k][: tb.nbytes])
-        dev.record(_HOST_EVENT + k)
-        self._host_pending[k] = True
-        if tokens is None:
-            dev.d2d(
-                self.table + tb.off["tok"],
-                self.sampled_buf + _SAMPLED["tok_out"],
-                4 * n,
-            )
-        lib, prog = dev.lib, self._program(s)
-        T = s.T
-        ccl = self.nranks > 1
-        prog.embed.run(lib)
-        for layer, ops in enumerate(prog.layers):
-            if "eg" in ops:
-                if "eg_gather" in ops:
-                    ops["eg_gather"].run(lib)
-                    if ccl:
-                        dev.allreduce(self.io["eg_emb"], 256 * J * T)
-                ops["eg"].run(lib)
-                if "eg_gate" in ops:
-                    if ccl:
-                        dev.allgather(
-                            self.io["eg_kv"], self.io["eg_kv_all"], self.eg_rows_r * T
-                        )
-                    ops["eg_gate"].run(lib)
-            ratio = self.cfg.compress_ratios[layer]
-            dense = counts.get(("dense", ratio), False)
-            (ops["attn_dense"] if dense and "attn_dense" in ops else ops["attn"]).run(
-                lib
-            )
-            if "ix" in ops:
-                ratio = self.cfg.compress_ratios[layer]
-                sel = ops["sel"]
-                if counts["sparse"] and "ixc" in ops:
-                    # only the candidate entries
-                    for op in ops["ixc"][: counts["ixc"]]:
-                        op.run(lib)
-                    sel["sparse"].run(lib)
-                else:
-                    for op in ops["ix"][: counts[ratio]]:
-                        op.run(lib)
-                    if counts["pf", ratio] and "pf" in sel:
-                        sel[
-                            "pf_all" if not counts["cand"] and "pf_all" in sel else "pf"
-                        ].run(lib)
-                    elif not counts["cand"] and "all" in sel:
-                        sel["all"].run(lib)
-                    else:
-                        sel[counts["radix", ratio]].run(lib)
-            if "out" in ops:
-                (ops["out_dense"] if dense and "out_dense" in ops else ops["out"]).run(
-                    lib
-                )
-            if ccl:
-                self._reduce(ops["p_attn"], s)
-            ops["ffn"].run(lib)
-            if ccl:
-                self._reduce(ops["p_ffn"], s)
-            if self.probe is not None:
-                self.probe(layer, ops, T)
-        if (
-            prog.inject is not None
-        ):  # the DSpark stages' window keys at the step's positions
-            prog.inject.run(lib)
-        self._column = False
-        if logits is None:
-            return T
-        prog.head.run(lib)
-        if ccl and logits == "all":
-            dev.allgather(self.logits, self.logits_all, d.vocab * T)
-        elif ccl:  # one column, gathered as a one-column step's logits
-            dev.allgather(
-                self.logits + 4 * d.vocab * int(logits), self.logits_all, d.vocab
-            )
-            self._column = True
-        return T
 
     # ------------------------------------------------------------------ DSpark
-    def draft(self, anchors: np.ndarray, rows: Sequence[Row]) -> np.ndarray:
-        """DSpark's drafts (B, block) for up to DSPARK_ROWS rows: row b's block is its anchor ``anchors[b]`` (the
-        token at position ``rows[b].pos0``, not yet processed) and block - 1 noise tokens, through the stages
-        (each column against the window keys of the target's last positions before the anchor and its block's
-        keys), the head with the last stage's norm, and the Markov steps."""
-        B, K, dev, d = len(rows), self.block, self.device, self.d
-        if not self.stages or not 0 < B <= DSPARK_ROWS:
-            raise ValueError(f"drafts need DSpark and 1 to {DSPARK_ROWS} rows")
-        s = Shape(bucket(B * K, False), False)
-        tb = self.tables[s]
-        k = self._host_turn
-        self._host_turn ^= 1
-        if self._host_pending[k]:
-            dev.wait(_HOST_EVENT + k)
-        self._fill_draft(k, tb, np.asarray(anchors, np.int64), rows)
-        dev.h2d_async(self.table, self.host[k][: tb.nbytes])
-        dev.record(_HOST_EVENT + k)
-        self._host_pending[k] = True
-        lib, prog = dev.lib, self._draft_program(s)
-        ccl = self.nranks > 1
-        prog["embed"].run(lib)
+
+    def _draft_native(self, s: Shape, prog: dict):
+        """``_draft_launches`` as one native program: the Markov launch of ``registers[0]`` rows a select."""
+        from resin._resin import GaudiProgram
+
+        T, ccl = s.T, self.nranks > 1
+        native = GaudiProgram(1)
+        native.section("draft")
+
+        def launch(op) -> None:
+            native.launch(op.recipe.handle, op.slots.tolist(), op.addresses.tolist())
+
+        def reduce(partial: int) -> None:
+            count = self.d.hidden * T
+            if self.d.gathered(T):
+                native.allgather(partial, self.pall[self.pbuf.index(partial)], count)
+            else:
+                native.allreduce(partial, count)
+
+        launch(prog["embed"])
         for ops in prog["stages"]:
-            ops["attn"].run(lib)
+            launch(ops["attn"])
             if ccl:
-                self._reduce(ops["p_attn"], s)
-            ops["ffn"].run(lib)
+                reduce(ops["p_attn"])
+            launch(ops["ffn"])
             if ccl:
-                self._reduce(ops["p_ffn"], s)
-        prog["head"].run(lib)
+                reduce(ops["p_ffn"])
+        launch(prog["head"])
         if ccl:
-            dev.allgather(self.logits, self.logits_all, d.vocab * s.T)
-        prog["markov"][B].run(lib)
-        dev.sync()
-        return dev.d2h(self.io["dsp_out"], (K, B), np.int32).T.astype(np.int64)
+            native.allgather(self.logits, self.logits_all, self.d.vocab * T)
+        rows = sorted(prog["markov"])  # the Markov launch of each row count, the arms in this order
+        table = [rows.index(b) if b in prog["markov"] else -1 for b in range(rows[-1] + 1)]
+        native.select([(0, rows[-1] + 1)], table)
+        for b in rows:
+            native.arm()
+            launch(prog["markov"][b])
+        native.end()
+        native.finish()
+        self._draft_natives[s] = native
+        return native
 
     def _draft_program(self, s: Shape) -> dict:
         if (prog := self._draft_programs.get(s)) is not None:
@@ -1328,411 +1276,247 @@ class DeepSeekV41Gaudi:
         self._draft_programs[s] = prog
         return prog
 
-    def _fill_draft(
-        self, k: int, tb: _Tables, anchors: np.ndarray, rows: Sequence[Row]
-    ) -> None:
-        """A draft step's tables: row b's block in columns b block .. b block + block - 1 at positions pos0 ..
-        (their RoPE), each column's window slot over the stages' pages of the target's last positions before
-        pos0 (the block's own keys are not stored), and the block keys' columns and slots."""
-        cfg, s, v = self.cfg, tb.shape, tb.v[k]
-        T, K, nh, B = s.T, self.block, self.d.heads, len(rows)
-        n = B * K
-        self.host[k][: tb.nbytes] = 0
-        row_of, i_of = np.repeat(np.arange(B), K), np.tile(np.arange(K), B)
-        start = np.array([r.pos0 for r in rows], np.int64)
-        tok = np.full(n, cfg.dspark_noise_token_id, np.int64)
-        tok[i_of == 0] = anchors
-        v["tok"][:n] = tok
-        v["meta"][:] = (int(start[0]), n, 0, 0)
-        pos = np.zeros(T, np.int64)
-        pos[:n] = start[row_of] + i_of
-        for r in (0, 1):
-            cs = self._cs(r, pos)
-            v[f"cs{r}"][:] = cs
-            v[f"cs{r}_inv"][:, :64] = cs[:, :64]
-            v[f"cs{r}_inv"][:, 64:] = -cs[:, 64:]
-        q = (
-            start[row_of] - 1
-        )  # every column's window ends at the position before its anchor
-        key0 = np.maximum(q - (cfg.sliding_window - 1), 0) // PAGE_TOKENS * PAGE_TOKENS
-        cols, zeros = np.arange(n), np.zeros(n, np.int64)
-        slots = v["slots"]
-        slots[:, 0] = -1
-        slots[:n] = np.stack(
-            [zeros, nh * cols, q, key0, start[row_of], zeros, zeros, np.full(n, cfg.sliding_window)], 1
-        )  # fmt: skip
-        pages = s.win_keys // PAGE_TOKENS
-        lat0 = np.full((s.win_slots, pages), -1, np.int64)
-        for col in range(n):
-            r = rows[row_of[col]]
-            idx = key0[col] // PAGE_TOKENS + np.arange(pages) - r.window_first
-            ok = (
-                (idx >= 0)
-                & (idx < len(r.window))
-                & (idx + r.window_first <= q[col] // PAGE_TOKENS)
-            )
-            ok &= q[col] >= 0
-            lat0[col] = np.where(ok, np.asarray(r.window)[np.where(ok, idx, 0)], -1)
-        v["lat"][:] = -1
-        v["rows"][:] = -1  # nothing stored
-        for st in range(self.stages):
-            layer = self.n_layers + st
-            v["lat"][layer] = np.where(lat0 >= 0, lat0 + self._layer_rows[layer], -1)
-        v["dsp_bidx"][: n * K] = (row_of[:, None] * K + np.arange(K)).ravel()
-        ls = v["dsp_lslots"]
-        ls[:, 0] = -1
-        ls[:n] = np.stack(
-            [zeros, nh * cols, np.full(n, K), zeros, np.full(n, K), cols, zeros, zeros],
-            1,
-        )
-        v["dsp_anchor"][:B] = anchors
-
-    def _reduce(self, partial: int, s: Shape) -> None:
-        """Sum a sub-layer's partial over the ranks, or all-gather it for the next graph to sum."""
-        count = self.d.hidden * s.T
-        if self.d.gathered(s.T):
-            self.device.allgather(partial, self.pall[self.pbuf.index(partial)], count)
-        else:
-            self.device.allreduce(partial, count)
-
     # ------------------------------------------------------------------ tables
-    def _cs(self, r: int, positions: np.ndarray) -> np.ndarray:
-        """cs_table(positions, freqs[r]); for many positions, rows of the precomputed table"""
-        positions = np.asarray(positions, np.int64)
-        if len(positions) <= 64:
-            return cs_table(positions, self.freqs[r])
-        return self._cs_all[r][positions]
 
-    def _fill(
-        self, k: int, tb: _Tables, tokens, positions, rows: Sequence[Row]
-    ) -> dict[int, int]:
-        """Write a step's tables into host copy ``k``; returns the index launches per ratio."""
-        cfg, geo, s, v = self.cfg, self.geo, tb.shape, tb.v[k]
-        T, n, nh, R = s.T, len(positions), self.d.heads, len(rows)
-        for a, b in tb.zero:
-            self.host[k][a:b] = 0
-        if tokens is not None:
-            v["tok"][:n] = tokens
-        v["meta"][:] = (int(positions[0]), n, 0, 0)
-        pos = np.zeros(T, np.int64)
-        pos[:n] = positions
-        for r in (0, 1):
-            cs = self._cs(r, pos)
-            v[f"cs{r}"][:] = cs
-            v[f"cs{r}_inv"][:, :64] = cs[:, :64]
-            v[f"cs{r}_inv"][:, 64:] = -cs[:, 64:]
-        # each row's blocks, padded: WINDOW rows and ids from logical block wfirst, HISTORY rows from block 0
-        wlen = max(len(r.window) for r in rows)
-        wrow, wid = np.zeros((R, wlen), np.int64), np.zeros((R, wlen), np.int64)
-        hist = np.full(
-            (R, max(self.pages, max(len(r.history) for r in rows))), -1, np.int64
-        )
-        wfirst, pos0 = np.empty(R, np.int64), np.empty(R, np.int64)
-        prev_id = np.zeros(R, np.int64)  # the WINDOW block id of position pos0 - 1
-        col_row = np.full(T, -1, np.int64)
-        slot_row, slot_b0 = [], []
-        for k, r in enumerate(rows):
-            wrow[k, : len(r.window)], wid[k, : len(r.window)] = r.window, r.window_ids
-            hist[k, : len(r.history)] = r.history
-            wfirst[k], pos0[k] = r.window_first, r.pos0
-            if r.pos0:
-                prev_id[k] = r.window_ids[(r.pos0 - 1) // PAGE_TOKENS - r.window_first]
-            col_row[r.column : r.column + r.real] = k
-            for b0 in range(0, r.real, s.qb):
-                slot_row.append(k)
-                slot_b0.append(b0)
-        cols = np.flatnonzero(col_row >= 0)
-        live = col_row >= 0
-        cr, cp = col_row[cols], pos[cols]
-        block = cp // PAGE_TOKENS - wfirst[cr]
-        win = np.zeros(T, np.int64)
-        win_id = np.zeros(T, np.int64)
-        win[cols], win_id[cols] = wrow[cr, block], wid[cr, block]
-        last = np.array([r.pos0 + r.real - 1 for r in rows], np.int64)
-        last_col = np.array([r.column + r.real - 1 for r in rows], np.int64)
-        # window slots, and every layer's store rows and window pages
-        sr, sb = np.array(slot_row, np.int64), np.array(slot_b0, np.int64)
-        S, pages = len(sr), s.win_keys // PAGE_TOKENS
-        q0 = pos0[sr] + sb
-        key0 = np.maximum(q0 - (cfg.sliding_window - 1), 0) // PAGE_TOKENS * PAGE_TOKENS
-        col0 = np.array([rows[k].column for k in slot_row], np.int64) + sb
-        slots = v["slots"]
-        slots[:, 0] = -1
-        slots[:S] = np.stack(
-            [np.zeros(S, np.int64), nh * col0, q0, key0, last[sr] + 1, np.zeros(S, np.int64),
-             np.zeros(S, np.int64), np.full(S, cfg.sliding_window)], 1,
-        )  # fmt: skip
-        pg = key0[:, None] // PAGE_TOKENS + np.arange(pages)
-        ok = pg <= last[sr, None] // PAGE_TOKENS
-        lat0 = np.full((s.win_slots, pages), -1, np.int64)
-        lat0[:S] = np.where(
-            ok, wrow[sr[:, None], np.where(ok, pg - wfirst[sr, None], 0)], -1
-        )
-        off = self._layer_rows[:, None, None]
-        v["lat"][:] = np.where(lat0 >= 0, lat0[None] + off, -1)
-        slot_pos = cp % PAGE_TOKENS
-        rows0 = np.full((T, 8), -1, np.int64)
-        rows0[cols, 0] = win[cols] + slot_pos
-        rows0[cols, 3] = win[cols] + PAGE_TOKENS
-        rows0[cols, 4] = slot_pos
-        shift = np.zeros((T, 8), np.int64)
-        shift[cols, 0] = shift[cols, 3] = 1
-        np.add(rows0[None], shift[None] * off, out=v["rows"], casting="unsafe")
-        # compressor: ratio-2 groups (completed at odd positions) and pending tokens, ratio-1 entries
-        odd = cols[cp % 2 == 1]
-        gr = col_row[odd]
-        inside = pos[odd] - 1 >= pos0[gr]
-        G2 = len(odd)
-        entries2 = np.full(s.groups2, -1, np.int64)
-        entries2[:G2] = pos[odd] // 2
-        if geo.pending_owners:
-            v["cs_g2"][:] = self._cs(1, np.where(entries2 >= 0, 2 * entries2, 0))
-        ends = last % 2 == 0
-        npend = len(geo.pending_owners)
-        for i, o in enumerate(geo.pending_owners):
-            groups = v[f"cmp_groups.{o}"]
-            groups[:G2, 0] = np.where(inside, odd - 1, -1)
-            groups[:G2, 1] = odd
-            groups[:G2, 2] = np.where(inside, 0, prev_id[gr] * npend + i)
-            pend = v[f"cmp_rows.{o}"]
-            pend[:] = -1
-            pend[last_col[ends]] = win_id[last_col[ends]] * npend + i
-        if len(geo.pending_owners) < len(geo.owners):
-            v["cs_g1"][:] = self._cs(1, np.where(live, pos, 0))
-        for o in geo.owners:
-            ratio, op, ooff = (
-                cfg.compress_ratios[o],
-                geo.owner_pages(o),
-                geo.owner_offset(o),
-            )
-            store = v[f"cmp_store.{o}"]
-            store[:] = -1
-            g, j, er = (
-                (np.arange(G2), entries2[:G2], gr) if ratio > 1 else (cols, cp, cr)
-            )
-            P = j // PAGE_TOKENS
-            page = hist[er, P // op] + ooff + PAIR_ROWS * (P % op)
-            e = j % PAGE_TOKENS
-            store[g, 0] = page + e
-            store[g, 2] = (
-                4 * (page + PAGE_ROWS) + e
-            )  # FP8 index key: unit e of the index page
-            store[g, 5] = page + PAGE_ROWS + INDEX_ROWS - 1  # its scale: row 32, f32 e
-            store[g, 6] = e
-            store[g, 3] = page + PAGE_TOKENS
-            store[g, 4] = e
-        # indexer: visible entries, compressed pages, index launches
-        counts = {"sparse": False, "cand": True}
-        lanes = np.arange(INDEX_KEYS // PAGE_TOKENS)
-        for ratio in (1, 2):
-            v[f"ix_vis{ratio}"][:] = np.where(live, (pos + 1) // ratio, 0)
-            counts["radix", ratio] = (
-                not s.prefill and int(v[f"ix_vis{ratio}"].max()) > RADIX_MIN
-            )
-            vis = v[f"ix_vis{ratio}"]
-            counts["pf", ratio] = bool(
-                s.prefill
-                and PREFILTER_BLOCKS
-                and np.all(vis[live] > max(PREFILTER_MIN, 8 * PREFILTER_BLOCKS))
-            )
-            if counts["pf", ratio]:
-                # blocks of 8 entries, in whole groups of 64 for ix_thr; the packed entries
-                nb = -(-vis // 8)
-                v[self._visb(ratio)][:] = np.minimum(-(-nb // 64) * 64, self.kmax // 8)
-                v["ix_visc"][:] = np.where(live, 8 * PREFILTER_BLOCKS, 0)
-            counts["dense", ratio] = self.dense(s) and bool(
-                np.all(vis[live] <= DENSE_KEYS)
-            )
-            if counts["dense", ratio]:
-                # a slot per query block over entries 0 .. klen - 1 (what its last column sees), and the
-                # owners' latent pages of those entries
-                kl = np.minimum(q0 + s.qb, last[sr] + 1) // ratio
-                cslots = v[f"cslots{ratio}"]
-                cslots[:] = 0
-                cslots[:, 0] = -1
-                z = np.zeros(S, np.int64)
-                cslots[:S] = np.stack(
-                    [z, nh * col0, q0, z, kl, col0, np.full(S, ratio), z], 1
-                )
-                pg = np.arange(DENSE_KEYS // PAGE_TOKENS)
-                ok = pg[None, :] * PAGE_TOKENS < kl[:, None]
-                for o in geo.owners:
-                    if cfg.compress_ratios[o] != ratio:
-                        continue
-                    op, ooff = geo.owner_pages(o), geo.owner_offset(o)
-                    lat = v[f"cmp_lat.{o}"]
-                    lat[:] = -1
-                    lat[:S] = np.where(
-                        ok,
-                        hist[sr[:, None], np.where(ok, pg // op, 0)]
-                        + ooff
-                        + PAIR_ROWS * (pg % op),
-                        -1,
-                    )
-            if (
-                cfg.candidate_source_layer >= 0
-                and ratio == cfg.compress_ratios[cfg.candidate_source_layer]
-            ):
-                # candidate blocks of 8 entries, in whole groups of 64 for ix_thr
-                vis = v[f"ix_vis{ratio}"]
-                nb = -(-vis // 8)
-                v["ix_visb"][:] = np.minimum(-(-nb // 64) * 64, self.kmax // 8)
-                # every live column sees more than kc entries: index sources after the candidate source score
-                # only their columns' candidate entries
-                counts["cand"] = int(vis.max()) > cfg.candidate_topk_blocks * 8
-                sparse = self.ixc_launches(s) > 0 and bool(np.all(vis[live] > self.kc))
-                counts["sparse"] = sparse
-                if sparse:
-                    v["ix_visc"][:] = np.where(live, self.kc, 0)
-                    lc = np.flatnonzero(live)
-                    chunks = self.kc // INDEX_KEYS
-                    rec = np.zeros((len(lc) * chunks, 8), np.int64)
-                    rec[:, 1] = L.INDEX_HEADS * np.repeat(lc, chunks)
-                    # query position kc - 1: every compact entry is visible to the slot
-                    rec[:, 2] = self.kc - 1
-                    rec[:, 3] = INDEX_KEYS * np.tile(np.arange(chunks), len(lc))
-                    rec[:, 4] = self.kc
-                    rec[:, 5] = np.repeat(lc, chunks)
-                    rec[:, 6] = 1
-                    n = self.ixc_launches(s)
-                    table = np.zeros((n * s.ix_slots, 8), np.int64)
-                    table[:, 0] = -1
-                    table[: len(rec)] = rec
-                    counts["ixc"] = -(-len(rec) // s.ix_slots)
-                    for j in range(n):
-                        v[f"ixc.{j}"][:] = table[j * s.ix_slots : (j + 1) * s.ix_slots]
-            per = HISTORY_TOKENS // ratio // PAGE_TOKENS  # pages per HISTORY block
-            pr = np.where(
-                hist[:, :, None] >= 0, hist[:, :, None] + PAIR_ROWS * np.arange(per), -1
-            )
-            blocks = v[f"cmp_blocks{ratio}"]
-            blocks[~live] = -1
-            if R == 1:  # every column is the one row's (a broadcast, not a gather)
-                blocks[cols] = pr.reshape(R, -1)[0, : self.pages]
+    def _step_program(self, s: Shape, prog: _Program):
+        """``_step_launches``' calls of a step of ``s`` as one native program (``resin._resin.GaudiProgram``) with
+        a section per part (``_sections``): the embedding, each layer (in ``_run_layer``'s order: the dense or
+        plain attention and output launches, and a compressed layer's index launches and selection, chosen by the
+        step's counts, ``_step_registers``), the DSpark injection, the head for every column's logits and for
+        column ``registers[_R_COLUMN]`` (``_head``), and a prefill step's owner store (bounded replay)."""
+        native = self._native_programs.get(s)
+        if native is not None:
+            return native
+        from resin._resin import GaudiProgram
+
+        native = GaudiProgram(_REGISTERS)
+        T, ccl = s.T, self.nranks > 1
+
+        def launch(op) -> None:
+            native.launch(op.recipe.handle, op.slots.tolist(), op.addresses.tolist())
+
+        def reduce(partial: int) -> None:
+            count = self.d.hidden * T
+            if self.d.gathered(T):
+                native.allgather(partial, self.pall[self.pbuf.index(partial)], count)
             else:
-                blocks[cols] = pr.reshape(R, -1)[cr, : self.pages]
-            rec = []  # (row, b0, q0, key0, klen)
-            for k, r in enumerate(rows):
-                seen_all = (r.pos0 + r.real) // ratio
-                for b0 in range(0, r.real, s.qb):
-                    q = r.pos0 + b0
-                    seen = min((q + s.qb) // ratio, seen_all)
-                    rec.extend(
-                        (k, b0, q, key, seen_all) for key in range(0, seen, INDEX_KEYS)
-                    )
-            launches = -(-len(rec) // s.ix_slots)
-            if launches > self.ix_launches(s, ratio):
-                raise ValueError("a step's index launches exceed the table capacity")
-            counts[ratio] = launches
-            if not rec:
-                continue
-            rk, rb, rq, rkey, rlen = np.array(rec, np.int64).T
-            col = np.array([rows[k].column for k in rk], np.int64) + rb
-            table = np.zeros((launches * s.ix_slots, 8), np.int64)
-            table[:, 0] = -1
-            table[: len(rec)] = np.stack(
-                [
-                    np.zeros_like(rk),
-                    L.INDEX_HEADS * col,
-                    rq,
-                    rkey,
-                    rlen,
-                    col,
-                    np.full_like(rk, ratio),
-                    np.zeros_like(rk),
-                ],
-                1,
-            )
-            P = rkey[:, None] // PAGE_TOKENS + lanes
-            ok = (
-                lanes
-                < np.minimum(len(lanes), -(-(rlen - rkey) // PAGE_TOKENS))[:, None]
-            )
-            owners = [o for o in geo.owners if cfg.compress_ratios[o] == ratio]
-            for o in owners:
-                op, ooff = geo.owner_pages(o), geo.owner_offset(o)
-                pages_o = np.full((launches * s.ix_slots, len(lanes)), -1, np.int64)
-                pages_o[: len(rec)] = np.where(
-                    ok,
-                    hist[rk[:, None], np.where(ok, P // op, 0)]
-                    + ooff
-                    + PAIR_ROWS * (P % op)
-                    + PAGE_ROWS,
-                    -1,
-                )
-                for j in range(launches):
-                    v[f"ix{ratio}.{j}.{o}"][:] = pages_o[
-                        j * s.ix_slots : (j + 1) * s.ix_slots
-                    ]
-            for j in range(launches):
-                v[f"ix{ratio}.{j}"][:] = table[j * s.ix_slots : (j + 1) * s.ix_slots]
-        # Engram
-        if self.engram_layers and self.hashed(s):
-            xor = self._engram_older(rows, T, tokens)
-            for layer in self.engram_layers:
-                k = self.cfg.engram_layer_ids.index(layer)
-                v[f"eg_xh.{layer}"][:, :J] = xor[:, k, :, 0]
-                v[f"eg_xl.{layer}"][:, :J] = xor[:, k, :, 1]
-        elif self.engram_layers:
-            ids = self._engram_ids(rows, tokens, T)
-            for layer in self.engram_layers:
-                k = self.cfg.engram_layer_ids.index(layer)
-                if self.engram == "card":
-                    v[f"eg.{layer}"][:] = ids[:, k]
-                else:
-                    emb = v[f"eg.{layer}"]
-                    for r in rows:
-                        c = slice(r.column, r.column + r.real)
-                        emb[c] = engram_rows(
-                            self.src, layer, ids[c, k].reshape(-1)
-                        ).reshape(r.real, -1)
-        return counts
+                native.allreduce(partial, count)
 
-    def _engram_ids(
-        self, rows: Sequence[Row], tokens: np.ndarray, T: int
-    ) -> np.ndarray:
-        """(T, Engram layers, J) i32 hashed rows of every column (padding: row 0)"""
-        h = self._engram_hash()
-        n = self.cfg.engram_max_ngram_size
-        out = np.zeros((T, len(self.cfg.engram_layer_ids), J), np.int32)
-        windows = np.zeros(
-            (T, n), np.int64
-        )  # each column's token and those before it, newest first
-        blocked = np.zeros((T, n), bool)
-        back = np.arange(n)
-        for r in rows:
-            c = slice(r.column, r.column + r.real)
-            seq = np.concatenate(
-                [np.asarray(r.before, np.int64), np.asarray(tokens[c], np.int64)]
+        def dense_or(ops: dict, name: str, ratio: int) -> None:
+            """``name``'s launch, or its dense form in a step whose counts say dense for ``ratio``"""
+            if ratio in _R_DENSE and f"{name}_dense" in ops:
+                native.select([(_R_DENSE[ratio], 2)], [0, 1])
+                native.arm()
+                launch(ops[name])
+                native.arm()
+                launch(ops[f"{name}_dense"])
+                native.end()
+            else:
+                launch(ops[name])
+
+        def index(ratio: int, ops: dict) -> None:
+            """``_run_layer``'s index launches and selection: by candidates in a sparse step, else the first
+            counts[ratio] index launches and the prefiltered, all, or radix selection"""
+            sel, arms = ops["sel"], []
+
+            def arm(register: int, launches: list, select) -> int:
+                arms.append((register, launches, select))
+                return len(arms) - 1
+
+            sparse = arm(_R_IXC, ops["ixc"], sel["sparse"]) if "ixc" in ops and "sparse" in sel else -1
+            every = arm(_R_IX[ratio], ops["ix"], sel["all"]) if "all" in sel else -1
+            radix = [arm(_R_IX[ratio], ops["ix"], sel[r]) if r in sel else -1 for r in (False, True)]
+            pf = arm(_R_IX[ratio], ops["ix"], sel["pf"]) if "pf" in sel else -1
+            pf_all = arm(_R_IX[ratio], ops["ix"], sel["pf_all"]) if "pf_all" in sel else -1
+
+            def chosen(is_sparse: int, cand: int, by_radix: int, prefiltered: int) -> int:
+                if is_sparse and "ixc" in ops:
+                    return sparse
+                if prefiltered and "pf" in sel:
+                    return pf_all if not cand and "pf_all" in sel else pf
+                if not cand and "all" in sel:
+                    return every
+                return radix[by_radix]
+
+            # keys (sparse, cand, radix, prefiltered), the first the most significant; -1: a step _run_layer
+            # cannot make
+            table = [chosen(*key) for key in np.ndindex(2, 2, 2, 2)]
+            keys = [(_R_SPARSE, 2), (_R_CAND, 2), (_R_RADIX[ratio], 2), (_R_PF[ratio], 2)]
+            native.select(keys, table)
+            for register, launches, select in arms:
+                native.arm()
+                native.take(register)
+                for op in launches:
+                    launch(op)
+                native.end()
+                launch(select)
+            native.end()
+
+        native.section("embed")
+        launch(prog.embed)
+        for layer, ops in enumerate(prog.layers):
+            native.section(f"layer {layer}")
+            ratio = self.cfg.compress_ratios[layer]
+            if "eg" in ops:
+                if "eg_gather" in ops:
+                    launch(ops["eg_gather"])
+                    if ccl:
+                        native.allreduce(self.io["eg_emb"], 256 * J * T)
+                launch(ops["eg"])
+                if "eg_gate" in ops:
+                    if ccl:
+                        native.allgather(self.io["eg_kv"], self.io["eg_kv_all"], self.eg_rows_r * T)
+                    launch(ops["eg_gate"])
+            dense_or(ops, "attn", ratio)
+            if "ix" in ops:
+                index(ratio, ops)
+            if "out" in ops:
+                dense_or(ops, "out", ratio)
+            if ccl:
+                reduce(ops["p_attn"])
+            launch(ops["ffn"])
+            if ccl:
+                reduce(ops["p_ffn"])
+        native.section("inject")
+        if prog.inject is not None:
+            launch(prog.inject)
+        # the head (``_head``): every column's logits, or one column's (gathered as a one-column step's)
+        native.section("head")
+        if prog.head is not None:
+            launch(prog.head)
+            if ccl:
+                native.allgather(self.logits, self.logits_all, self.d.vocab * T)
+        native.section("head_column")
+        if prog.head is not None:
+            launch(prog.head)
+            if ccl:
+                native.allgather((self.logits, _R_COLUMN, 4 * self.d.vocab), self.logits_all, self.d.vocab)
+        native.section("store")
+        if prog.store is not None:
+            launch(prog.store)
+        native.finish()  # the program holds copies of the ops' bindings
+        self._native_programs[s] = native
+        return native
+
+    def _native_fill(self):
+        """The native step fill (``resin._resin.Ds41Fill``, built with the ``gaudi`` feature) of every shape's tables
+        (the CPU tests keep a numpy fill of the same tables)."""
+        try:
+            from resin._resin import Ds41Fill
+        except ImportError as error:
+            raise RuntimeError(
+                "DeepSeek-V4.1 steps run in the native executor: resin must be built with the gaudi feature"
+            ) from error
+        cfg, geo = self.cfg, self.geo
+        if self.engram == "host" and self.engram_layers:
+            raise ValueError("the native fill hashes the Engram rows on the cards (engram='card')")
+        engram = None
+        if self.engram_layers:
+            h = self._engram_hash()
+            engram = (
+                np.asarray(h.token_map, np.int64).tolist(),
+                int(h.pad_id),
+                np.asarray(h.multipliers, np.int64).ravel().tolist(),
+                cfg.engram_max_ngram_size,
+                cfg.engram_n_heads,
+                len(cfg.engram_layer_ids),
+                np.asarray(h.primes, np.int64).ravel().tolist(),
+                np.asarray(h.offsets, np.int64).ravel().tolist(),
             )
-            at = len(r.before) + np.arange(r.real)[:, None] - back
-            windows[c] = seq[np.maximum(at, 0)]
-            blocked[c] = (r.pos0 + np.arange(r.real))[:, None] < back
-        cols = np.concatenate([np.arange(r.column, r.column + r.real) for r in rows])
-        out[cols] = h.hash(
-            np.where(blocked[cols], h.pad_id, h.token_map[windows[cols]])
+        cs = cfg.candidate_source_layer
+        native = Ds41Fill(
+            heads=self.d.heads,
+            index_heads=L.INDEX_HEADS,
+            sliding_window=cfg.sliding_window,
+            layer_rows=self._layer_rows.tolist(),
+            owners=[
+                (cfg.compress_ratios[o], geo.owner_pages(o), geo.owner_offset(o))
+                for o in geo.owners
+            ],
+            pending=[geo.owners.index(o) for o in geo.pending_owners],
+            pages=self.pages,
+            kmax=self.kmax,
+            kc=self.kc,
+            candidate=(cfg.compress_ratios[cs], cfg.candidate_topk_blocks)
+            if cs >= 0
+            else None,
+            engram=engram,
+            cs0=np.ascontiguousarray(self._cs_all[0], np.float32),
+            cs1=np.ascontiguousarray(self._cs_all[1], np.float32),
+            radix_min=RADIX_MIN,
+            prefilter=(PREFILTER_BLOCKS, PREFILTER_MIN),
+            dense_keys=DENSE_KEYS,
+            geometry=(PAGE_TOKENS, HISTORY_TOKENS, PAGE_ROWS, INDEX_ROWS, INDEX_KEYS, PENDING_SLOTS),
         )
-        return out
-
-    def _engram_older(self, rows: Sequence[Row], T: int, tokens=None) -> np.ndarray:
-        """(T, Engram layers, J, 2) i32: per decode column and lane 8 (n - 2) + head, the XOR of the products of
-        the n - 1 tokens before the column's (``Row.before``, then the row's earlier columns of the step:
-        ``tokens``, needed when a row has more than one column), as (hi, lo); ``eg_hash`` adds the column's
-        own."""
-        h = self._engram_hash()
-        n = self.cfg.engram_max_ngram_size
-        older = np.full((T, n - 1), h.pad_id, np.int64)
-        for r in rows:
-            if r.real != 1 and tokens is None:
-                raise ValueError(
-                    "a step with several columns per row needs its tokens on the host"
-                )
-            seen = np.asarray(r.before, np.int64)
-            for j in range(r.real):
-                if j:
-                    seen = np.append(seen, tokens[r.column + j - 1])
-                before = seen[::-1][: n - 1]  # newest first
-                older[r.column + j, : len(before)] = h.token_map[before]
-        xor = h.older(older)  # (T, layers, n - 1)
-        heads = self.cfg.engram_n_heads
-        return split64(np.repeat(xor, heads, axis=2))
+        for s, tb in self.tables.items():
+            off = tb.off
+            layers = range(self.n_layers + self.stages)
+            dense = self.dense(s)
+            native.add_shape(
+                {
+                    "t": s.T,
+                    "prefill": s.prefill,
+                    "qb": s.qb,
+                    "win_slots": s.win_slots,
+                    "win_pages": s.win_keys // PAGE_TOKENS,
+                    "groups2": s.groups2,
+                    "ix_visb2": off["ix_visb2"],
+                    "cslots": (off["cslots1"], off["cslots2"]) if dense else None,
+                    "cmp_lat": [off[f"cmp_lat.{o}"] for o in geo.owners] if dense else [],
+                    "draft": (off["dsp_bidx"], off["dsp_lslots"], off["dsp_anchor"])
+                    if "dsp_bidx" in off
+                    else None,
+                    "engram_ids": [
+                        (off[f"eg.{layer}"], cfg.engram_layer_ids.index(layer))
+                        for layer in self.engram_layers
+                    ]
+                    if not self.hashed(s)
+                    else [],
+                    "ix_slots": s.ix_slots,
+                    "nbytes": tb.nbytes,
+                    "zero": [(int(a), int(b)) for a, b in tb.zero],
+                    "tok": off["tok"],
+                    "meta": off["meta"],
+                    "cs": (off["cs0"], off["cs1"]),
+                    "cs_inv": (off["cs0_inv"], off["cs1_inv"]),
+                    "cs_g2": off["cs_g2"],
+                    "cs_g1": off["cs_g1"],
+                    "cmp_store": [off[f"cmp_store.{o}"] for o in geo.owners],
+                    "cmp_groups": [off[f"cmp_groups.{o}"] for o in geo.pending_owners],
+                    "cmp_rows": [off[f"cmp_rows.{o}"] for o in geo.pending_owners],
+                    "slots": off["slots"],
+                    "rows": [off[f"rows.{layer}"] for layer in layers],
+                    "lat": [off[f"lat.{layer}"] for layer in layers],
+                    "ix_visb": off["ix_visb"],
+                    "ix_visc": off["ix_visc"],
+                    "ixc": [off[f"ixc.{j}"] for j in range(self.ixc_launches(s))],
+                    "ix_vis": (off["ix_vis1"], off["ix_vis2"]),
+                    "cmp_blocks": (off["cmp_blocks1"], off["cmp_blocks2"]),
+                    "ix": tuple(
+                        [off[f"ix{r}.{j}"] for j in range(self.ix_launches(s, r))]
+                        for r in (1, 2)
+                    ),
+                    "ix_owner": tuple(
+                        [
+                            [
+                                off[f"ix{r}.{j}.{o}"]
+                                for o in geo.owners
+                                if cfg.compress_ratios[o] == r
+                            ]
+                            for j in range(self.ix_launches(s, r))
+                        ]
+                        for r in (1, 2)
+                    ),
+                    "engram": [
+                        (
+                            off[f"eg_xh.{layer}"],
+                            off[f"eg_xl.{layer}"],
+                            cfg.engram_layer_ids.index(layer),
+                        )
+                        for layer in self.engram_layers
+                    ]
+                    if self.engram_layers and self.hashed(s)
+                    else [],
+                }
+            )
+        return native

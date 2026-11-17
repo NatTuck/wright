@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Prefill pages: each pooled row r takes token gidx[r]'s FP8 row and scale from the per-token quantization
 // (ds_xq_lin with one copy per token): out[:, r] = q[:, t], sx[r] = s[t]. Rows of no token (gidx outside
 // [0, T)) get scale 0 (ds_xact skips them) and their FP8 row is not written.

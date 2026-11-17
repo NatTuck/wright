@@ -173,6 +173,38 @@ prefill chunks and decode steps reuse the exact same follower object. Completion
 cancellation and retraction release that state after outstanding work has drained.
 Plans already in flight retain their own references and array storage.
 
+Every rank of a request replica reaches the others through a `StepTransport`
+(`resin/backend/step_transport.py`): replica commands, the readiness gate before
+the first device collective, the execution status after a step, the status of
+bind, release and metrics commands, and the end of each engine step. Startup
+checks and driver votes do not use the transport. There are two transports:
+
+- `GlooStepTransport` uses the Gloo broadcasts and votes that this section
+  describes. It is the default of `DistributedWorker`.
+- `SocketStepTransport` (`resin/backend/socket_transport.py`) uses one Unix socket
+  between the driver and each follower (`resin._resin.StepChannelDriver` and
+  `StepChannelFollower`). A command is one frame per follower, in the same layout
+  as the Gloo command. For a forward, each follower sends PREPARED and waits for
+  GO, so no rank enters a device collective alone. After the step, each follower
+  sends ACCEPTED and continues; only the driver waits for it, before its enqueue
+  returns. Bind, release and metrics commands get one DONE per follower. A
+  successful engine step sends nothing more. A failed step sends a finish command
+  with the error, as the Gloo transport does.
+
+`create_step_transport(groups, mode, timeout=...)` makes the transport on every rank
+of a replica. `socket` needs all ranks of the replica on one Linux host and one
+replica per communication domain (attention DP 1); `auto` uses it when those
+conditions are true, and Gloo when they are not. The driver listens in a new
+private directory and sends the path and a random token to the followers through
+Gloo. The driver accepts only followers that send the token and run as the same
+user, then removes the path. A rank that cannot start the channel stops every rank
+of the replica. When a process exits, the kernel closes its sockets, and the next
+read or write of each other rank fails in less than a millisecond. Each wait has a
+deadline and checks for Python signals every 100 ms. Before a wait blocks, it polls
+the socket for up to 200 microseconds (`RESIN_STEP_CHANNEL_SPIN_US`, 0 to block at
+once), because the next frame of a step usually arrives within that time. Multi-card Gaudi serving uses
+`create_step_transport` with `--step-transport` (default `auto`).
+
 Successful step commands use typed Gloo broadcasts: a fixed integer header and
 a native plan archive. The archive schema is derived directly from Rust's
 `BatchPlan` and cache-group types using rkyv; Python does not repeat their field
@@ -328,6 +360,75 @@ successful execution votes, plan transport, and HTTP rounds use typed buffers.
 Shared-memory command
 transport, expert load balancing, and prefix-aware replica routing remain
 separate work.
+
+## Replicas of a one-card model
+
+A server can also serve a model whose Engines run in other processes, one per card
+(`crates/resin-py/src/http_replicas.rs`). These replicas are not attention-DP
+replicas: they do not join a distributed step, and they do not wait for each other.
+
+- The frontend process makes a `_ReplicaRouter` on a socket path, and
+  `HttpServer.register_replicas(router, model=...)` serves its model beside the
+  frontend's own model, which can be a `DistributedEngine`.
+- Each replica process makes an Engine and a `_ReplicaServer` with the path and the
+  run token. The replica joins the router as the step channel's followers do (the
+  token, the same user), and sends READY with its model's metadata. Every replica
+  must send the same metadata.
+- A router thread sends each request to one replica in an INGRESS frame (`HttpIngress`
+  JSON). The replica admits it into its own HTTP session, steps its Engine, and sends
+  EVENTS frames (`HttpEvents` JSON) after each step that has events. Cancellations and
+  shutdown travel in INGRESS frames.
+- The router does not block on a replica. Each replica has its own queue of INGRESS
+  frames, and the router writes it only when that replica's socket takes more. So a
+  replica that reads slowly does not stop the router from reading the events of the
+  others. A replica that reads none of its queue for 120 s fails.
+- The router keeps the turns of a conversation on one replica: rendezvous hashing of a
+  conversation key over the serving replicas. The key is the request's
+  `prompt_cache_key`, `user`, or Anthropic `metadata.user_id`, else a hash of the tools
+  and the messages up to the first user message. When that replica has more than
+  `max(2, batch / 8)` more requests than the least busy one, the conversation moves to
+  the least busy replica.
+- A replica whose Engine fails sends FAILED. The router ends that replica's requests
+  with the error, logs the error, removes the replica's metrics, and sends new requests
+  to the others. When no replica serves, new requests fail at once. An EVENTS frame that
+  is not valid, or metrics that are not valid, fail that replica only. A server that
+  stops after a replica failed still exits normally.
+- Once a second the router asks each replica for its engine metrics and publishes them
+  as its own part of `/metrics`, with the replica number in `attn_dp_rank`. When the
+  replicas' Engines record metrics, the replicas send the first-token event, so the
+  router records the time to the first token.
+
+`deploy.serving.main_layout` uses this for `wright` with one `--device` list for each
+model: the first model spans its cards, and each other model runs one replica per card.
+
+### Replicas on the cards of a multi-card model
+
+A replica can also share its card with a rank of the first model (not rank 0, which
+serves HTTP). A card can belong to only one process, so the replica runs in that rank's
+process:
+
+- The rank takes the card of its own module (`claim_card(module=...)`), because the
+  replica of that card has a fixed index.
+- The replica loads first, on a runtime context of its own (`Device.context()`): a
+  stream with its own workspace and staging buffers. Then
+  the rank's model loads and sizes its KV cache from the memory that the replica leaves.
+  A replica can fill `--gpu-memory-utilization` of the card (default 0.25).
+- The rank follows its driver on the main thread. A second thread serves the replica,
+  with the replica's context current.
+- A card gate (`resin_models_gaudi.synapse.card_gate.CardGate`) decides whose step comes
+  next on the card. The rank's transport (`GatedTransport`) tells the gate when a step
+  of the first model starts and when its work is on the device. The replica's
+  `_ReplicaServer(gate=...)` calls `gate.acquire(0.02)` before each Engine step and
+  `gate.release()` after it. When the gate gives no turn, the replica reads the
+  router's frames and asks again, so its socket does not fill.
+- The first model goes first. A replica step starts when the first model has had no
+  step on the card for 5 ms and its last step is done on the device. With a `--share`
+  weight above 0, a replica step can also start while the first model is busy, until
+  the replica has used its share of the card's time.
+- The gate keeps the steps of the two models whole on the device, in order, with
+  device events: a replica step in the first model's busy time waits on the device for
+  the first model's step before it, and the next step of the first model waits on the
+  device for that replica step. The host does not wait for either.
 
 ## Source references and validation
 

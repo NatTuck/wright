@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 candidate blocks, level one: the largest score of each block of 8 compressed entries of a
 // column over its visible entries (vis[c]). Blocks with no visible entry hold -3e38, and the block holding the
 // newest visible entry holds +3e38, so ix_thr's KS-th largest block keeps it. Block b of a group of 64 blocks

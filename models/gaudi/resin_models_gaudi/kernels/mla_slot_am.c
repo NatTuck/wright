@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA slot attention, accumulate, for a prefill chunk (Mistral-Large-4; mla_slot_acc's merge for one
 // slot per launch holding every column of the query block, so columns map one to one):
 //   n = max(acc_m, mx),  wa = exp(acc_m - n) acc_l,  ws = exp(mx - n),  den = wa + ws l,

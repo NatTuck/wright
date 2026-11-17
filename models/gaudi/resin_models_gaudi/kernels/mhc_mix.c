@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // mHC site projection on the TPC: mixT[t, j] = fn_j . X_t.
 // Member 0 also writes rt[:, t] = 1 / rms(X_t) (all lanes; eps as mhc_post), the site's r.
 // tensors: 0 fn (K, 32) f32 (row j contiguous)  1 X (K, T) f32 | 2 mixT (T, 32) f32  3 rt (64, T) f32

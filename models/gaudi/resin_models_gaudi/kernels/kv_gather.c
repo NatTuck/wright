@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Gather token-major K or V pages of the cache arena into a dense (256, C, S) bf16 slab: slot s
 // takes C / 128 pages, and row t of page j lands at (., j * 128 + t, s).
 // The arena is viewed as (256, PR, NB) bf16 rows of 512 bytes; a page is 128 rows, one per key
@@ -15,7 +15,13 @@
 
 #define VG_KEYS 32
 
+// -DDEP (kv_gather_d.c): one more input ``dep``, unread: a data edge from the node that wrote the pages this
+// launch reads (the K/V store of the same graph), which orders the two.
+#ifdef DEP
+void main(tensor arena, tensor pages, tensor slots, tensor dep, tensor out, int sig)
+#else
 void main(tensor arena, tensor pages, tensor slots, tensor out, int sig)
+#endif
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();

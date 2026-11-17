@@ -19,10 +19,11 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    AppState, ModelMetadata,
+    AppState, ModelMetadata, Models,
     protocol::{
         ConversationRequest, GenerationEvent, RequestFailure, ResponseAccumulator, json_error,
     },
+    request_log::RequestReceipt,
     ui::index_html,
 };
 
@@ -58,10 +59,8 @@ pub(crate) struct ChatRequest {
     tools: Vec<Value>,
     max_completion_tokens: Option<usize>,
     max_tokens: Option<usize>,
-    #[serde(default = "default_temperature")]
-    temperature: f64,
-    #[serde(default = "default_top_p")]
-    top_p: f64,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     top_k: Option<u32>,
     seed: Option<i64>,
     logprobs: Option<bool>,
@@ -75,6 +74,9 @@ pub(crate) struct ChatRequest {
     stream: bool,
     #[serde(default)]
     stream_options: StreamOptions,
+    /// Stream `prompt_progress` chunks while the prompt is processed (llama.cpp's field).
+    #[serde(default)]
+    return_progress: bool,
     n: Option<u32>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
@@ -91,10 +93,8 @@ pub(crate) struct ResponsesRequest {
     #[serde(default)]
     tools: Vec<Value>,
     max_output_tokens: Option<usize>,
-    #[serde(default = "default_temperature")]
-    temperature: f64,
-    #[serde(default = "default_top_p")]
-    top_p: f64,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     top_k: Option<u32>,
     seed: Option<i64>,
     logprobs: Option<bool>,
@@ -109,20 +109,12 @@ pub(crate) struct ResponsesRequest {
     extra: BTreeMap<String, Value>,
 }
 
-const fn default_temperature() -> f64 {
-    1.0
+pub async fn index(State(models): State<Models>) -> Html<String> {
+    Html(index_html(models.first().routed_dp_size))
 }
 
-const fn default_top_p() -> f64 {
-    1.0
-}
-
-pub async fn index(State(state): State<AppState>) -> Html<String> {
-    Html(index_html(state.routed_dp_size))
-}
-
-pub async fn health(State(state): State<AppState>) -> Response {
-    if state.jobs.is_closed() {
+pub async fn health(State(models): State<Models>) -> Response {
+    if models.routes.iter().any(|state| state.jobs.is_closed()) {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "unavailable"})),
@@ -143,88 +135,120 @@ struct ModelEntry<'a> {
     metadata: &'a ModelMetadata,
 }
 
-pub async fn models(State(state): State<AppState>) -> Json<Value> {
-    let entry = ModelEntry {
-        id: &state.model,
-        object: "model",
-        created: 0,
-        owned_by: "resin",
-        metadata: &state.metadata,
-    };
-    Json(json!({"object": "list", "data": [entry]}))
+pub async fn models(State(models): State<Models>) -> Json<Value> {
+    let entries = models
+        .routes
+        .iter()
+        .map(|state| ModelEntry {
+            id: &state.model,
+            object: "model",
+            created: 0,
+            owned_by: "resin",
+            metadata: &state.metadata,
+        })
+        .collect::<Vec<_>>();
+    Json(json!({"object": "list", "data": entries}))
 }
 
 pub async fn chat_completions(
-    State(state): State<AppState>,
+    State(models): State<Models>,
     headers: HeaderMap,
     Json(mut body): Json<ChatRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+    let receipt = RequestReceipt::new(
+        models.first(),
+        &headers,
+        "chatcmpl",
+        "POST /v1/chat/completions",
+    );
+    let state = match models.route(&body.model, "invalid_request_error") {
+        Ok(state) => state,
+        Err(response) => return receipt.reject(*response),
+    };
+    body.routed_dp_rank = match routed_rank(state, &headers, body.routed_dp_rank) {
         Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
+        Err(response) => return receipt.reject(*response),
     };
     let stream = body.stream;
     let include_usage = body.stream_options.include_usage;
-    let request = match chat_request(&state, body) {
+    let request = match chat_request(state, body, &receipt) {
         Ok(request) => request,
-        Err(response) => return *response,
+        Err(response) => return receipt.reject(*response),
     };
     let receiver = match state.enqueue(request.clone()) {
         Ok(receiver) => receiver,
         Err((status, message)) => {
-            return (status, Json(json_error(message, "server_error"))).into_response();
+            return receipt
+                .reject((status, Json(json_error(message, "server_error"))).into_response());
         }
     };
-    if stream {
+    receipt.queued(state, &request, stream);
+    receipt.respond(if stream {
         chat_stream(request, receiver, include_usage).into_response()
     } else {
         chat_response(request, receiver).await
-    }
+    })
 }
 
 /// Chat tokenization: the prompt tokens a chat completion with the same body would submit,
 /// rendered by the same recipe (`count` equals that completion's `usage.prompt_tokens`).
 pub async fn tokenize(
-    State(state): State<AppState>,
+    State(models): State<Models>,
     headers: HeaderMap,
     Json(mut body): Json<ChatRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
-        Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
+    let receipt = RequestReceipt::new(models.first(), &headers, "tokenize", "POST /tokenize");
+    let state = match models.route(&body.model, "invalid_request_error") {
+        Ok(state) => state,
+        Err(response) => return receipt.reject(*response),
     };
-    let mut request = match chat_request(&state, body) {
+    body.routed_dp_rank = match routed_rank(state, &headers, body.routed_dp_rank) {
+        Ok(rank) => rank.map(|rank| json!(rank)),
+        Err(response) => return receipt.reject(*response),
+    };
+    let mut request = match chat_request(state, body, &receipt) {
         Ok(request) => request,
-        Err(response) => return *response,
+        Err(response) => return receipt.reject(*response),
     };
     request.tokenize_only = true;
     let mut receiver = match state.enqueue(request) {
         Ok(receiver) => receiver,
         Err((status, message)) => {
-            return (status, Json(json_error(message, "server_error"))).into_response();
+            return receipt
+                .reject((status, Json(json_error(message, "server_error"))).into_response());
         }
     };
-    while let Some(event) = receiver.recv().await {
+    let response = loop {
+        let Some(event) = receiver.recv().await else {
+            break internal_error("tokenization ended without a result");
+        };
         match event {
             GenerationEvent::Tokenized { token_ids } => {
-                return Json(json!({"count": token_ids.len(), "tokens": token_ids}))
-                    .into_response();
+                break Json(json!({"count": token_ids.len(), "tokens": token_ids})).into_response();
             }
             GenerationEvent::Rejected { message } => {
-                return failure_response(RequestFailure::Rejected(message));
+                break failure_response(RequestFailure::Rejected(message));
             }
             GenerationEvent::Error { message } => {
-                return failure_response(RequestFailure::Server(message));
+                break failure_response(RequestFailure::Server(message));
             }
             _ => {}
         }
-    }
-    internal_error("tokenization ended without a result")
+    };
+    receipt.respond(response)
 }
 
-fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<ConversationRequest> {
-    validate_model(state, &body.model)?;
-    validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
+fn chat_request(
+    state: &AppState,
+    body: ChatRequest,
+    receipt: &RequestReceipt,
+) -> RequestResult<ConversationRequest> {
+    let (temperature, top_p, top_k) = (
+        state.metadata.temperature(body.temperature),
+        state.metadata.top_p(body.top_p),
+        state.metadata.top_k(body.top_k),
+    );
+    validate_sampling(temperature, top_p, top_k, body.seed)?;
     validate_logprobs(body.top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
     if body.messages.is_empty() {
@@ -240,14 +264,15 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
         ));
     }
     Ok(ConversationRequest {
-        id: state.request_id("chatcmpl"),
+        id: receipt.id.clone(),
+        client_request_id: receipt.client_request_id.clone(),
         model: body.model,
         messages: body.messages,
         tools: function_tools(body.tools)?,
         max_output_tokens,
-        temperature: body.temperature,
-        top_p: body.top_p,
-        top_k: body.top_k,
+        temperature,
+        top_p,
+        top_k,
         seed: body.seed,
         logprobs: body.logprobs.unwrap_or(false) || body.top_logprobs.unwrap_or(0) > 0,
         top_logprobs: body.top_logprobs.unwrap_or(0),
@@ -260,6 +285,7 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
         reasoning_effort: body.reasoning_effort,
         extra: body.extra,
         tokenize_only: false,
+        return_progress: body.stream && body.return_progress,
     })
 }
 
@@ -342,6 +368,11 @@ fn chat_stream(
                     chunk
                 }
                 GenerationEvent::FirstToken | GenerationEvent::Tokenized { .. } | GenerationEvent::StopSequence(_) => continue,
+                GenerationEvent::PromptProgress(progress) => {
+                    let mut chunk = chat_chunk(&request, created, json!({}), None);
+                    chunk["prompt_progress"] = json!(progress);
+                    chunk
+                }
                 GenerationEvent::PromptLogprobs(tokens) => {
                     let mut chunk = chat_chunk(&request, created, json!({}), None);
                     chunk["resin"] = json!({"prompt_logprobs": tokens});
@@ -405,38 +436,50 @@ fn chat_chunk(
 }
 
 pub async fn responses(
-    State(state): State<AppState>,
+    State(models): State<Models>,
     headers: HeaderMap,
     Json(mut body): Json<ResponsesRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+    let receipt = RequestReceipt::new(models.first(), &headers, "resp", "POST /v1/responses");
+    let state = match models.route(&body.model, "invalid_request_error") {
+        Ok(state) => state,
+        Err(response) => return receipt.reject(*response),
+    };
+    body.routed_dp_rank = match routed_rank(state, &headers, body.routed_dp_rank) {
         Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
+        Err(response) => return receipt.reject(*response),
     };
     let stream = body.stream;
-    let request = match responses_request(&state, body) {
+    let request = match responses_request(state, body, &receipt) {
         Ok(request) => request,
-        Err(response) => return *response,
+        Err(response) => return receipt.reject(*response),
     };
     let receiver = match state.enqueue(request.clone()) {
         Ok(receiver) => receiver,
         Err((status, message)) => {
-            return (status, Json(json_error(message, "server_error"))).into_response();
+            return receipt
+                .reject((status, Json(json_error(message, "server_error"))).into_response());
         }
     };
-    if stream {
+    receipt.queued(state, &request, stream);
+    receipt.respond(if stream {
         responses_stream(request, receiver).into_response()
     } else {
         responses_response(request, receiver).await
-    }
+    })
 }
 
 fn responses_request(
     state: &AppState,
     mut body: ResponsesRequest,
+    receipt: &RequestReceipt,
 ) -> RequestResult<ConversationRequest> {
-    validate_model(state, &body.model)?;
-    validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
+    let (temperature, top_p, top_k) = (
+        state.metadata.temperature(body.temperature),
+        state.metadata.top_p(body.top_p),
+        state.metadata.top_k(body.top_k),
+    );
+    validate_sampling(temperature, top_p, top_k, body.seed)?;
     validate_logprobs(body.top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
     body.logprobs = Some(
@@ -469,14 +512,15 @@ fn responses_request(
         body.extra.insert("reasoning".to_owned(), reasoning);
     }
     Ok(ConversationRequest {
-        id: state.request_id("resp"),
+        id: receipt.id.clone(),
+        client_request_id: receipt.client_request_id.clone(),
         model: body.model,
         messages,
         tools: function_tools(body.tools)?,
         max_output_tokens,
-        temperature: body.temperature,
-        top_p: body.top_p,
-        top_k: body.top_k,
+        temperature,
+        top_p,
+        top_k,
         seed: body.seed,
         logprobs: body.logprobs.unwrap_or(false) || body.top_logprobs.unwrap_or(0) > 0,
         top_logprobs: body.top_logprobs.unwrap_or(0),
@@ -489,6 +533,7 @@ fn responses_request(
         reasoning_effort,
         extra: body.extra,
         tokenize_only: false,
+        return_progress: false,
     })
 }
 
@@ -641,7 +686,7 @@ fn responses_stream(
                 GenerationEvent::Logprobs(tokens) => {
                     yield Ok(Event::default().data(event_json("resin.generation_logprobs.delta", sequence, json!({"logprobs": tokens})).to_string())); sequence += 1;
                 }
-                GenerationEvent::FirstToken | GenerationEvent::Tokenized { .. } | GenerationEvent::StopSequence(_) => continue,
+                GenerationEvent::FirstToken | GenerationEvent::PromptProgress(_) | GenerationEvent::Tokenized { .. } | GenerationEvent::StopSequence(_) => continue,
                 GenerationEvent::PromptLogprobs(tokens) => {
                     yield Ok(Event::default().data(event_json("resin.prompt_logprobs", sequence, json!({"logprobs": tokens})).to_string())); sequence += 1;
                 }
@@ -703,23 +748,6 @@ fn function_tools(tools: Vec<Value>) -> RequestResult<Vec<Value>> {
         .collect()
 }
 
-fn validate_model(state: &AppState, model: &str) -> RequestResult<()> {
-    if model == state.model.as_ref() {
-        Ok(())
-    } else {
-        Err(Box::new(
-            (
-                StatusCode::NOT_FOUND,
-                Json(json_error(
-                    format!("model {model:?} is not served; expected {:?}", state.model),
-                    "invalid_request_error",
-                )),
-            )
-                .into_response(),
-        ))
-    }
-}
-
 pub(crate) fn validate_sampling(
     temperature: f64,
     top_p: f64,
@@ -744,6 +772,8 @@ pub(crate) fn validate_sampling(
 }
 
 pub(crate) fn invalid_request(message: impl Into<String>) -> Box<Response> {
+    let message = message.into();
+    log::debug!(target: crate::request_log::TARGET, "invalid request: {message}");
     Box::new(
         (
             StatusCode::BAD_REQUEST,

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Prefill MoE, pass 2: 2^psh-row pages per local expert (ceil(count / 2^psh)), allocated in expert order:
 // po[e] = first page of expert e, pe[p] = expert of page p (-1: unused). Pages beyond P are not
 // allocated (their pairs overflow to the per-token kernels).

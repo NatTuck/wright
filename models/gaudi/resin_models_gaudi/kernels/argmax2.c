@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Argmax stage 2: reduce the per-member [max, index] partials to the token id of each column.
 // tensors: 0 part (64, NB, B) f32 | 1 tok (1, B) i32.  index space: [B]
 #include "common.h"

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 compressed attention of a prefill slot over every visible entry, softmax partials with each
 // column's top-512 list as a mask (mla_slot_pk with DeepSeek's lists): entry key0 + i is kept for column col when
 // it is visible (key0 + i < (its position + 1) / ratio and < klen) and its index score key k = mkey(score[key0 + i,

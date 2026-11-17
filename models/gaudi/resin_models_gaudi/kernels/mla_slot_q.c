@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA slot queries (Mistral-Large-4): copy each slot's M query columns out of the chunk's Q.
 // Q is (D, W) bf16 (one KV group: the latent is shared by every head), column = h + hpg * t;
 // slot s takes columns qcol0 .. qcol0 + M - 1. Slots of group -1 are padding and are skipped

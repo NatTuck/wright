@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked gated delta rule for prefill, stage 1a: q / k of one shared q/k head kh per member.
 // Qn / Kn are per q/k head, dims (128, 64, nk, NC); the graph replicates them to the value heads
 // (h = kh + r nk).

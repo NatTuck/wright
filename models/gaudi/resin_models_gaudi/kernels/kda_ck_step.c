@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked KDA, stage 4 (sequential over chunks): S' = diag(e^G_63) S - X + B per head, X = KW S
 // (KW = kL^T W), B = kL^T U. S rows are key channels (dim 1), columns value channels (dim 0).
 // tensors: 0 S (128,128,nh,1) f32  1 X  2 B  3 cs (192, nh, 1) f32 (rows 0..127 = e^G_63) | 4 S' (128,128,nh,1)

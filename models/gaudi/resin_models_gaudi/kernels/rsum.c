@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Sum of the ranks' partials after an all-gather:
 // out[c, t] = sum_r in[c, t, r]. tensors: 0 in (C, T, NR) f32 | 1 out (C, T) f32. index space: [C/128, T]
 #include "common.h"

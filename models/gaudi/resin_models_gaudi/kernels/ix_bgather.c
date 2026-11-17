@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 prefill selection: the scores of a column's listed blocks of 8 entries, packed. blist holds
 // indices into ix_bmax's block maxima (block b of a group of 64 at lane 8 (b % 8) + b / 8 of the group's
 // vector), as ix_list wrote them. Listed block j of column c fills entries 8 j .. 8 j + 7 of cs with its

@@ -27,6 +27,20 @@ pub struct ConversationRequest {
     /// generating: the tokens a generation request with the same body would submit.
     #[serde(default)]
     pub tokenize_only: bool,
+    /// Report prompt processing as `GenerationEvent::PromptProgress` events (a streamed
+    /// chat completion with `"return_progress": true`).
+    #[serde(default)]
+    pub return_progress: bool,
+    /// The client's `x-request-id` header, which names the request in the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
+}
+
+impl ConversationRequest {
+    /// The name the log gives this request: the client's request id, else the generated one.
+    pub fn log_id(&self) -> &str {
+        self.client_request_id.as_deref().unwrap_or(&self.id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,6 +86,10 @@ pub enum GenerationEvent {
     Started {
         input_tokens: usize,
     },
+    /// How much of the prompt the engine has processed, for a request with
+    /// `return_progress`. Sent at admission and after each prefill step; the sender drops
+    /// an update when the client's queue is nearly full, so the stream never waits on one.
+    PromptProgress(PromptProgress),
     ReasoningDelta(String),
     TextDelta {
         delta: String,
@@ -112,6 +130,17 @@ pub enum GenerationEvent {
     Error {
         message: String,
     },
+}
+
+/// Prompt processing of one request, in tokens. `processed` counts the prompt tokens in the
+/// KV cache, `cache` included, so it starts at `cache` and ends at `total`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PromptProgress {
+    pub total: usize,
+    pub cache: usize,
+    pub processed: usize,
+    /// Milliseconds since the engine admitted the request.
+    pub time_ms: u64,
 }
 
 /// A vocabulary token, independent of response parsing and UTF-8 buffering.
@@ -233,6 +262,7 @@ impl ResponseAccumulator {
                 self.time_to_first_token_ms = *time_to_first_token_ms;
             }
             GenerationEvent::FirstToken
+            | GenerationEvent::PromptProgress(_)
             | GenerationEvent::Tokenized { .. }
             | GenerationEvent::Rejected { .. }
             | GenerationEvent::Error { .. } => {}

@@ -28,13 +28,13 @@ GEMM_NT = struct.pack("??", False, True)
 
 
 def bf16_bits(x: np.ndarray) -> np.ndarray:
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_rne
+    from resin_models_gaudi.loading.convert import bf16_rne
 
     return bf16_rne(x)
 
 
 def as_f32(bits: np.ndarray) -> np.ndarray:
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_to_f32
+    from resin_models_gaudi.loading.convert import bf16_to_f32
 
     return bf16_to_f32(bits)
 
@@ -84,7 +84,7 @@ def live_keys(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Slot tables with a full, a partial-page and a short klen; stale rows NaN-filled.
     Returns (slots (S, 8), live (S, C/128, 128) mask of page rows holding keys < klen)."""
-    from resin_models_gaudi.qwen3_5.checkpoint import sigma_perm
+    from resin_models_gaudi.loading.convert import sigma_perm
 
     klen = np.full(S, C, np.int32)
     klen[[1, 7, 9]] = [0, 1000, 37]

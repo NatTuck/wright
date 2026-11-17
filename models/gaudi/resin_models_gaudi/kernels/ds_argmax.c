@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 DSpark: each column's argmax over its first V rows of x (ties: the lowest index), as i32 in
 // every lane of out[:, c] and, at row c of idx, in lane 0.
 // tensors: 0 x (V', T) f32 | 1 out (64, T) i32  2 idx (T) i32

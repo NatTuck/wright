@@ -5,7 +5,7 @@ use axum::{
 use http_body_util::BodyExt;
 use resin_http::{
     FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, ModelMetadata,
-    RouteConfig, ServedModel, TokenLogprob, router,
+    PromptProgress, RouteConfig, ServedModel, TokenLogprob, router,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -1183,4 +1183,241 @@ async fn rejected_admission_is_a_client_error() {
     )
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+fn defaults_router() -> axum::Router {
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(32);
+    tokio::spawn(async move {
+        while let Some(job) = receiver.recv().await {
+            let request = serde_json::to_string(&job.request).unwrap();
+            let _ = job
+                .events
+                .send(GenerationEvent::TextDelta {
+                    delta: request,
+                    logprobs: vec![],
+                })
+                .await;
+            let _ = job
+                .events
+                .send(GenerationEvent::Finished {
+                    reason: FinishReason::Stop,
+                    input_tokens: 1,
+                    cached_tokens: 0,
+                    output_tokens: 1,
+                    elapsed_ms: 1.0,
+                    generation_elapsed_ms: 1.0,
+                    time_to_first_token_ms: 0.0,
+                })
+                .await;
+        }
+    });
+    let metadata = ModelMetadata {
+        default_temperature: Some(0.6),
+        default_top_p: Some(0.95),
+        default_top_k: std::num::NonZeroU32::new(20),
+        ..ModelMetadata::default()
+    };
+    router(
+        ServedModel::new("test-model", metadata),
+        jobs,
+        RouteConfig {
+            enable_anthropic: true,
+            ..RouteConfig::default()
+        },
+        None,
+    )
+}
+
+#[tokio::test]
+async fn requests_without_sampling_fields_take_the_model_defaults() {
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"model": "test-model", "messages": [{"role":"user","content":"hi"}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": "test-model", "input": "hi"}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "test-model", "max_tokens": 8, "messages": [{"role":"user","content":"hi"}]}),
+        ),
+    ] {
+        let (status, response) = json_response(
+            defaults_router(),
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        let content = if path.ends_with("completions") {
+            &response["choices"][0]["message"]["content"]
+        } else if path.ends_with("responses") {
+            &response["output"][0]["content"][0]["text"]
+        } else {
+            &response["content"][0]["text"]
+        };
+        let normalized: Value = serde_json::from_str(content.as_str().unwrap()).unwrap();
+        assert_eq!(normalized["temperature"], 0.6, "{path}");
+        assert_eq!(normalized["top_p"], 0.95, "{path}");
+        assert_eq!(normalized["top_k"], 20, "{path}");
+        // a request's own values win
+        let mut body = body;
+        body["temperature"] = json!(0.0);
+        body["top_p"] = json!(1.0);
+        body["top_k"] = json!(1);
+        let (status, response) = json_response(
+            defaults_router(),
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        let content = if path.ends_with("completions") {
+            &response["choices"][0]["message"]["content"]
+        } else if path.ends_with("responses") {
+            &response["output"][0]["content"][0]["text"]
+        } else {
+            &response["content"][0]["text"]
+        };
+        let normalized: Value = serde_json::from_str(content.as_str().unwrap()).unwrap();
+        assert_eq!(normalized["temperature"], 0.0, "{path}");
+        assert_eq!(normalized["top_p"], 1.0, "{path}");
+        assert_eq!(normalized["top_k"], 1, "{path}");
+    }
+    let (status, models) = json_response(
+        defaults_router(),
+        Request::get("/v1/models").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models["data"][0]["default_temperature"], 0.6);
+    assert_eq!(models["data"][0]["default_top_k"], 20);
+}
+
+/// An actor that reports prompt progress (when the request asks for it), echoes the request's
+/// `return_progress` as text, and finishes.
+fn progress_router() -> axum::Router {
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(32);
+    tokio::spawn(async move {
+        while let Some(job) = receiver.recv().await {
+            let _ = job
+                .events
+                .try_send(GenerationEvent::Started { input_tokens: 4096 });
+            if job.request.return_progress {
+                for (processed, time_ms) in [(512, 0), (1024, 340), (4096, 1200)] {
+                    let _ = job
+                        .events
+                        .try_send(GenerationEvent::PromptProgress(PromptProgress {
+                            total: 4096,
+                            cache: 512,
+                            processed,
+                            time_ms,
+                        }));
+                }
+            }
+            let _ = job.events.try_send(GenerationEvent::TextDelta {
+                delta: job.request.return_progress.to_string(),
+                logprobs: vec![],
+            });
+            let _ = job.events.try_send(GenerationEvent::Finished {
+                reason: FinishReason::Stop,
+                input_tokens: 4096,
+                cached_tokens: 512,
+                output_tokens: 1,
+                elapsed_ms: 1300.0,
+                generation_elapsed_ms: 1.0,
+                time_to_first_token_ms: 1200.0,
+            });
+        }
+    });
+    router("test-model", jobs, RouteConfig::default(), None)
+}
+
+fn progress_request(stream: bool, return_progress: Option<bool>) -> Request<Body> {
+    let mut body = json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello!"}],
+        "stream": stream,
+    });
+    if let Some(flag) = return_progress {
+        body["return_progress"] = json!(flag);
+    }
+    Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[test]
+fn prompt_progress_crosses_processes_as_tagged_json() {
+    let event = GenerationEvent::PromptProgress(PromptProgress {
+        total: 10,
+        cache: 2,
+        processed: 6,
+        time_ms: 5,
+    });
+    let value = serde_json::to_value(&event).unwrap();
+    assert_eq!(
+        value,
+        json!({"type": "prompt_progress", "data": {"total": 10, "cache": 2, "processed": 6, "time_ms": 5}})
+    );
+    let restored: GenerationEvent = serde_json::from_value(value).unwrap();
+    assert!(matches!(restored, GenerationEvent::PromptProgress(p) if p.processed == 6));
+}
+
+#[tokio::test]
+async fn chat_stream_reports_prompt_progress_when_asked() {
+    let events = stream_events(progress_router(), progress_request(true, Some(true))).await;
+    let progress = events
+        .iter()
+        .filter(|event| event.get("prompt_progress").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(progress.len(), 3);
+    assert_eq!(progress[0]["object"], "chat.completion.chunk");
+    assert_eq!(
+        progress[0]["choices"],
+        json!([{"index": 0, "delta": {}, "finish_reason": null, "logprobs": null}])
+    );
+    assert_eq!(
+        progress[1]["prompt_progress"],
+        json!({"total": 4096, "cache": 512, "processed": 1024, "time_ms": 340})
+    );
+    // Progress comes before the first content.
+    let first_content = events
+        .iter()
+        .position(|event| event["choices"][0]["delta"]["content"] == "true")
+        .unwrap();
+    let last_progress = events
+        .iter()
+        .rposition(|event| event.get("prompt_progress").is_some())
+        .unwrap();
+    assert!(last_progress < first_content);
+}
+
+#[tokio::test]
+async fn prompt_progress_is_opt_in_and_stream_only() {
+    for flag in [None, Some(false)] {
+        let events = stream_events(progress_router(), progress_request(true, flag)).await;
+        assert!(
+            events
+                .iter()
+                .all(|event| event.get("prompt_progress").is_none())
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["choices"][0]["delta"]["content"] == "false")
+        );
+    }
+    // A non-streamed completion has no place for progress: the request does not ask for it.
+    let (status, body) =
+        json_response(progress_router(), progress_request(false, Some(true))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["message"]["content"], "false");
 }

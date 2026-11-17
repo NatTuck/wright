@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 Engram lookup, one rank's share: each token's J hashed rows of a row-sharded table, dequantized.
 // Row r of the table is 256 FP8 (E4M3 bias 7) values times rs[r]. This rank holds global rows row0 .. row0 + R - 1;
 // a hashed row outside them gives zeros, so the sum over the ranks is the full lookup.

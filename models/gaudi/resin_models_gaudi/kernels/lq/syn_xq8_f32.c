@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // int8 activation for the quantized int8 GEMVs (syn_qmm -DI8): x [K, N] f32 (column view: element
 // offset + column stride, dim 0 contiguous), K a multiple of 32, per 32-step group g:
 //   dx = max |x| / 127, xq = round(x / dx)

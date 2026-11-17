@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // GLM DSA indexer, paged: pool keys and the raw [k | gate] tail into the arena. Pool P =
 // tokens 4P .. 4P + 3; its key is sum_slot softmax_slot(gate + ape[slot]) k per channel (tools/glm_np.py indexer).
 // Column n of the launch, by rows (8, T) i32:

@@ -18,46 +18,29 @@ mHC, norms, the router, the DSA indexer, the latent projection and the embedding
 
 from __future__ import annotations
 
-import json
-import os
-import struct
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
 from resin.models.glm5_3_flash.config import Glm53Config
-from resin_models_gaudi.qwen3_5.checkpoint import (
-    _POOL,
+from resin_models_gaudi.loading.convert import (
     BLOCK,
-    E4M3,
+    POOL,
     bf16_rne,
     bf16_to_f32,
+    disable_hugepage_madvise,
     kperm,
     pcat,
     tperm,
 )
+from resin_models_gaudi.loading.source import Safetensors
+from resin_models_gaudi.loading.upload import Fp8
 
-try:
-    np._core.multiarray._set_madvise_hugepage(False)  # type: ignore[attr-defined]
-except AttributeError:  # numpy < 2
-    np.core.multiarray._set_madvise_hugepage(False)  # type: ignore[attr-defined]
+disable_hugepage_madvise()
 
-_DTYPES = {
-    "BF16": np.uint16,
-    "F32": np.float32,
-    "F8_E4M3": np.uint8,
-    "I64": np.int64,
-}
 NS = 4  # mHC streams
 TEXT = "model.language_model."
-
-
-@dataclass(frozen=True, slots=True)
-class Fp8:
-    bytes: np.ndarray
-    block_scales: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,102 +69,6 @@ class RankSlices:
             dense=part(cfg.intermediate_size, 256),
             vocab=part(cfg.vocab_size, 1),
         )
-
-
-class Safetensors:
-    """The release's shards, read with ``os.preadv``, never through a memory map."""
-
-    def __init__(
-        self, path: str | os.PathLike[str], dtypes: dict[str, type] = _DTYPES
-    ) -> None:
-        self.path = Path(path)
-        self.dtypes = dtypes
-        index = json.loads((self.path / "model.safetensors.index.json").read_text())
-        self.weight_map: dict[str, str] = index["weight_map"]
-        self._headers: dict[str, tuple[dict, int]] = {}
-        self._fds: dict[str, int] = {}
-
-    def __contains__(self, name: str) -> bool:
-        return name in self.weight_map
-
-    def _entry(self, name: str) -> tuple[int, dict, int]:
-        shard = self.weight_map[name]
-        if shard not in self._headers:
-            fd = os.open(self.path / shard, os.O_RDONLY)
-            n = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
-            self._fds[shard] = fd
-            self._headers[shard] = (json.loads(os.pread(fd, n, 8)), 8 + n)
-        header, base = self._headers[shard]
-        return self._fds[shard], header[name], base
-
-    def info(self, name: str) -> tuple[str, tuple[int, ...]]:
-        _, e, _ = self._entry(name)
-        return e["dtype"], tuple(e["shape"])
-
-    def read(self, name: str, rows: slice | None = None) -> np.ndarray:
-        """A tensor (or a range of its first dimension) as a fresh array in its own dtype."""
-        fd, e, base = self._entry(name)
-        dtype, shape = np.dtype(self.dtypes[e["dtype"]]), tuple(e["shape"])
-        start = base + e["data_offsets"][0]
-        if rows is not None:
-            row_bytes = int(np.prod(shape[1:])) * dtype.itemsize
-            start += rows.start * row_bytes
-            shape = (rows.stop - rows.start, *shape[1:])
-        out = np.empty(shape, dtype)
-        view = memoryview(out.reshape(-1).view(np.uint8))
-        offset = 0
-        while offset < len(view):
-            n = os.preadv(fd, [view[offset : offset + (1 << 30)]], start + offset)
-            if n <= 0:
-                raise OSError(f"short read of {name}")
-            offset += n
-        return out
-
-    def f32(self, name: str, rows: slice | None = None) -> np.ndarray:
-        a = self.read(name, rows)
-        if a.dtype == np.uint16:
-            return bf16_to_f32(a)
-        if a.dtype == np.uint8:
-            raise ValueError(f"{name}: block FP8, use fp8_f32")
-        return np.asarray(a, np.float32)
-
-    def bf16(self, name: str, rows: slice | None = None) -> np.ndarray:
-        a = self.read(name, rows)
-        if a.dtype != np.uint16:
-            raise ValueError(f"{name}: expected bf16, got {a.dtype}")
-        return a
-
-    def fp8(
-        self, name: str, rows: slice | None = None
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """(raw OCP e4m3 bytes, block scales) of rows aligned to 128."""
-        dtype, _ = self.info(name)
-        if dtype != "F8_E4M3":
-            raise ValueError(f"{name}: expected block FP8, got {dtype}")
-        scale_rows = (
-            None if rows is None else slice(rows.start // BLOCK, rows.stop // BLOCK)
-        )
-        return self.read(name, rows), self.f32(name + "_scale_inv", scale_rows)
-
-    def fp8_f32(self, name: str, rows: slice | None = None) -> np.ndarray:
-        """The dequantized tensor, f32, for load-time folds."""
-        w, s = self.fp8(name, rows)
-        return block_f32(w, s)
-
-    def close(self) -> None:
-        for fd in self._fds.values():
-            os.close(fd)
-        self._fds.clear()
-        self._headers.clear()
-
-
-def block_f32(w: np.ndarray, s: np.ndarray) -> np.ndarray:
-    """(M, K) block FP8 bytes and (M/128, K/128) scales -> f32"""
-    M, K = w.shape
-    values = np.nan_to_num(E4M3[w])
-    return (
-        values.reshape(M // BLOCK, BLOCK, K // BLOCK, BLOCK) * s[:, None, :, None]
-    ).reshape(M, K)
 
 
 def pair_rows(n: int) -> np.ndarray:
@@ -214,7 +101,7 @@ def _experts(src: Safetensors, cfg: Glm53Config, prefix: str, sl: RankSlices):
         x2[e] = d[:, sl.expert].T[pw]
         s2[e] = ds[:, cols].T
 
-    list(_POOL.map(one, range(E)))
+    list(POOL.map(one, range(E)))
     return Fp8(x13, s13), Fp8(x2, s2)
 
 

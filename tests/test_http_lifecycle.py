@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import threading
 import time
@@ -161,6 +162,9 @@ def test_models_lists_given_capabilities_and_prefix_cache():
         thinking_levels=("low", "high"),
         input_modalities=("text",),
         output_modalities=("text",),
+        default_temperature=0.6,
+        default_top_p=0.95,
+        default_top_k=20,
     )
     with running_server(
         runner,
@@ -182,6 +186,9 @@ def test_models_lists_given_capabilities_and_prefix_cache():
         "supports_prompt_caching": True,
         "input_modalities": ["text"],
         "output_modalities": ["text"],
+        "default_temperature": 0.6,
+        "default_top_p": 0.95,
+        "default_top_k": 20,
     }
 
 
@@ -224,14 +231,21 @@ def test_configured_intake_queue_rejects_overflow_then_drains_and_recovers():
                     responses.enter_context(post(base, request_body(stream=True)))
                 )
                 assert rendering.wait(timeout=2)
-                # The actor holds the first job; exactly two more fit in ingress.
-                for _ in range(2):
-                    streams.append(
-                        responses.enter_context(post(base, request_body(stream=True)))
-                    )
-                with pytest.raises(urllib.error.HTTPError) as caught:
-                    post(base, request_body())
-                with caught.value as response:
+                # The first job renders, up to three more wait for the render thread, and two fit in
+                # ingress: a request after those is turned away.
+                caught = None
+                for _ in range(8):
+                    try:
+                        streams.append(
+                            responses.enter_context(
+                                post(base, request_body(stream=True))
+                            )
+                        )
+                    except urllib.error.HTTPError as error:
+                        caught = error
+                        break
+                assert caught is not None and 3 <= len(streams) <= 6, len(streams)
+                with caught as response:
                     assert response.code == 429
                     assert "queue is full" in json.load(response)["error"]["message"]
             finally:
@@ -622,9 +636,219 @@ def test_admission_burst_yields_to_inference_before_draining_queue():
                 assert connection.recv(1024).startswith(b"HTTP/1.1 200")
             recipe.resume.set()
             assert first_step.wait(timeout=3)
-            assert counts_at_step[0] == 4
+            # at most four jobs render at a time (beside the loop): the first step comes before the
+            # queue drains
+            assert 1 <= counts_at_step[0] <= 4
             assert errors == []
         finally:
             recipe.resume.set()
             for connection in connections:
                 connection.close()
+
+
+def test_a_rendering_prompt_does_not_hold_the_steps_of_others():
+    """A prompt renders beside the Engine's loop: while one request's render blocks, the running
+    request keeps stepping."""
+    blocked = threading.Event()
+    release = threading.Event()
+
+    class SlowRecipe(Recipe):
+        def render(self, messages, *, tools=(), options=None):
+            if messages[0].content[0].text == "long":
+                blocked.set()
+                assert release.wait(timeout=5)
+            return super().render(messages, tools=tools, options=options)
+
+    steps = []
+
+    class CountingRunner(Runner):
+        def forward(self, plan):
+            steps.append(len(plan.sequence_ids))
+            return super().forward(plan)
+
+    with running_server(CountingRunner(), SlowRecipe()) as (*_, errors, base, _port):
+        with ExitStack() as responses:
+            try:
+                running = responses.enter_context(
+                    post(base, request_body(stream=True, max_tokens=400))
+                )
+                waiting = []
+                threading.Thread(
+                    target=lambda: waiting.append(post(base, request_body("long"))),
+                    daemon=True,
+                ).start()
+                assert blocked.wait(timeout=2)
+                before = len(steps)
+                deadline = time.monotonic() + 2
+                while len(steps) < before + 5 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                assert len(steps) >= before + 5, "the loop waited for a render"
+            finally:
+                release.set()
+            assert running.read().decode().rstrip().endswith("data: [DONE]")
+            deadline = time.monotonic() + 5
+            while not waiting and time.monotonic() < deadline:
+                time.sleep(0.01)
+            with waiting[0] as response:
+                assert json.load(response)["choices"][0]["message"]["content"] == "okok"
+        assert errors == []
+
+
+class _Captured(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def lines(self):
+        return [record.getMessage() for record in self.records]
+
+
+@contextmanager
+def capturing_wright_logs(level=logging.DEBUG):
+    """The ``wright`` logger with its own handler: the server's log setup may have
+    stopped propagation to the root logger that caplog listens on."""
+    logger = logging.getLogger("wright")
+    handler = _Captured()
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    resin.set_log_level(level)
+    try:
+        yield handler
+    finally:
+        resin.set_log_level(logging.CRITICAL + 1)
+        logger.setLevel(previous)
+        logger.removeHandler(handler)
+
+
+def test_request_lifecycle_is_logged_under_the_client_request_id():
+    with (
+        capturing_wright_logs() as captured,
+        running_server(Runner()) as (
+            *_,
+            base,
+            _port,
+        ),
+    ):
+        request = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=request_body(max_tokens=3),
+            headers={"Content-Type": "application/json", "X-Request-Id": "job-7"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.headers["x-request-id"] == "job-7"
+            body = json.load(response)
+        assert body["id"].startswith("chatcmpl_"), (
+            "the client id names the log, not the body"
+        )
+        assert body["usage"]["completion_tokens"] == 3
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not any(
+            "job-7: finished" in line for line in captured.lines()
+        ):
+            time.sleep(0.01)
+    lines = captured.lines()
+    text = "\n".join(lines)
+    assert "job-7: POST /v1/chat/completions received" in text
+    assert (
+        "job-7: queued behind 0 requests: 1 messages, 0 tools, max_output_tokens 3"
+        in text
+    )
+    assert "job-7: admitted as engine request #" in text
+    assert "1 prompt tokens, 0 cached" in text
+    assert "job-7: prefill done: 1 tokens computed (0 cached)" in text
+    assert "first token" in text
+    decode_lines = [
+        line for line in lines if " decode: 1 rows [job-7]: 1 tokens in" in line
+    ]
+    assert len(decode_lines) == 2, text
+    assert all(line.startswith("step ") for line in decode_lines), text
+    assert [
+        line for line in lines if " prefill: 1 rows [job-7]: 1 tokens in" in line
+    ], text
+    finished = [line for line in lines if "job-7: finished (length)" in line]
+    assert len(finished) == 1, text
+    assert "3 tokens generated in" in finished[0]
+    assert "per step min" in finished[0]
+    headers = [line for line in lines if line.startswith("job-7: headers {")]
+    assert headers and "x-request-id: job-7" in headers[0], text
+    bodies = [line for line in lines if line.startswith("job-7: request {")]
+    assert bodies and '"client_request_id":"job-7"' in bodies[0], text
+    assert all(record.name == "wright.http" for record in captured.records), {
+        record.name for record in captured.records
+    }
+
+
+def test_requests_without_a_client_id_log_under_the_response_id():
+    with (
+        capturing_wright_logs(logging.INFO) as captured,
+        running_server(Runner()) as (
+            *_,
+            base,
+            _port,
+        ),
+    ):
+        with post(base, request_body(max_tokens=1)) as response:
+            body = json.load(response)
+            assert response.headers["x-request-id"] == body["id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not any(
+            f"{body['id']}: finished" in line for line in captured.lines()
+        ):
+            time.sleep(0.01)
+    lines = captured.lines()
+    assert any(
+        line == f"{body['id']}: POST /v1/chat/completions received" for line in lines
+    ), lines
+    assert not any(line.startswith(f"{body['id']}: headers") for line in lines), (
+        "debug only"
+    )
+    assert all(record.levelno >= logging.INFO for record in captured.records)
+
+
+def test_invalid_requests_log_their_rejection():
+    with (
+        capturing_wright_logs() as captured,
+        running_server(Runner()) as (
+            *_,
+            base,
+            _port,
+        ),
+    ):
+        request = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=json.dumps(
+                {"model": "test", "messages": [], "max_tokens": 1}
+            ).encode(),
+            headers={"Content-Type": "application/json", "X-Request-Id": "bad-1"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            urllib.request.urlopen(request, timeout=5)
+        assert failure.value.code == 400
+        assert failure.value.headers["x-request-id"] == "bad-1"
+    lines = captured.lines()
+    assert "bad-1: POST /v1/chat/completions rejected: HTTP 400 Bad Request" in lines, (
+        lines
+    )
+    assert "invalid request: messages must not be empty" in lines, lines
+
+
+def test_native_log_level_follows_the_python_level():
+    logger = logging.getLogger("wright")
+    handler = _Captured()
+    logger.addHandler(handler)
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        resin.set_log_level(logging.WARNING)
+        with running_server(Runner()) as (*_, base, _port):
+            with post(base, request_body(max_tokens=1)) as response:
+                json.load(response)
+        assert not [line for line in handler.lines() if "received" in line]
+    finally:
+        resin.set_log_level(logging.CRITICAL + 1)
+        logger.setLevel(previous)
+        logger.removeHandler(handler)

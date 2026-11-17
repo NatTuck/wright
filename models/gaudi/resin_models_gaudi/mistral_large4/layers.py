@@ -20,6 +20,7 @@ import struct
 from dataclasses import dataclass
 
 from resin.models.mistral_large4.config import MistralLarge4Config
+from resin_models_gaudi.common.sampling import PARAMS, sampler
 from resin_models_gaudi.gguf.planar import LAYOUT, QMV8, nmem_for
 from resin_models_gaudi.gguf.planar import size as planar_size
 from resin_models_gaudi.mistral_large4 import lq
@@ -29,7 +30,6 @@ from resin_models_gaudi.mistral_large4.cache import (
     STORE_FIELDS,
 )
 from resin_models_gaudi.mistral_large4.weights import RankSlices
-from resin_models_gaudi.qwen3_5.sampling import PARAMS, sampler
 from resin_models_gaudi.synapse.graph import Graph, Tensor
 from resin_models_gaudi.synapse.runtime import BF16, F32, I8, I32, U8, Device
 
@@ -1071,7 +1071,7 @@ def head_columns_graph(
 def sample_graph(
     device: Device, dims: Dims, tokens: int, rows: int, nranks: int
 ) -> Graph:
-    """The device sampler (``qwen3_5.sampling``) over the softcapped logits
+    """The device sampler (``common.sampling``) over the softcapped logits
     ``cap * tanh(z / cap)`` of every column (rows = T) or of column ``last`` (rows = 1).
     ``logits_all`` is the ranks' all-gathered vocabulary slices, (V_r, T, nranks)."""
     d, T, R = dims, tokens, rows

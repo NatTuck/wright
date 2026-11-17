@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Speculative verify of the batched gated-delta-net decode (FP8 path): Tq tokens of each of B
 // sequences (columns b * Tq + t), each sequence's tokens in order from its arena state, which is
 // not written. The math per token is gdn_decode's. Each token's recurrent update is recorded
@@ -13,6 +13,13 @@
 //          11 pconv (C, Tq, B) f32
 // params: eps, nk. index space: [nv, B]
 #include "common.h"
+
+// -DSIGGATE (Qwen3.8-Flash-Next): sigmoid output gate instead of silu
+#ifdef SIGGATE
+#define OGATE(z) nl_sigm(z)
+#else
+#define OGATE(z) nl_silu(z)
+#endif
 
 #define DK 128
 
@@ -212,9 +219,9 @@ void main(tensor p, tensor ps, tensor ba, tensor conv_w, tensor arena, tensor ba
                 zc[0] += 64;
                 const float64 z1 = PLOAD(zc);
                 int5 oc = {h * DK, col, 0, 0, 0};
-                v_f32_st_tnsr(oc, out, o0 * rr * nw0 * nl_silu(z0));
+                v_f32_st_tnsr(oc, out, o0 * rr * nw0 * OGATE(z0));
                 oc[0] += 64;
-                v_f32_st_tnsr(oc, out, o1 * rr * nw1 * nl_silu(z1));
+                v_f32_st_tnsr(oc, out, o1 * rr * nw1 * OGATE(z1));
             }
         }
     }

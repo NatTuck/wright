@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // GLM mHC collapse + the sub-layer's RMSNorm, one member per token:
 //   c = sum_s pre_s X_s  (pre from coef; mode 1: pre_s = 1/4, the final HC head mean)
 //   h = c / rms(c) * w  ->  h16 (bf16, sigma order: the module GEMMs' operand) and h32 (f32)

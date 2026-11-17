@@ -2,6 +2,8 @@
 
 uv run --no-default-groups --group gaudi scripts/sweep.py \
     --qwen /path/to/Qwen3.8-27B-FP8 \
+    --qwen-dflash /path/to/Qwen3.8-27B-DFlash2 \
+    --qwen-dspine /path/to/Qwen3.8-27B-DSpine-b16 \
     --mistral /path/to/Mistral-Large-4-1T-A52B-GGUF \
     --mistral-tokenizer /path/to/Mistral-Large-4-1T-A52B-NVFP4 \
     --mistral-drafter /path/to/Mistral-Large-4-drafter \
@@ -58,6 +60,8 @@ class Config:
     body: dict = field(default_factory=dict)
     server: tuple[str, ...] = ()
     folder: str | None = None  # the checkpoint's folder under --qwen35
+    # the option that names the drafter checkpoint, such as "qwen_dflash"
+    drafter: str | None = None
     sampling: dict | None = None  # None reads the checkpoint's generation_config.json
 
 
@@ -82,6 +86,8 @@ CONFIGS = (
     Config("qwen-mtp0", draft_tokens=0, **_QWEN),
     Config("qwen-mtp1", draft_tokens=1, **_QWEN),
     Config("qwen-mtp2", draft_tokens=2, **_QWEN),
+    Config("qwen-dflash7", draft_tokens=7, drafter="qwen_dflash", **_QWEN),
+    Config("qwen-dspine15", draft_tokens=15, drafter="qwen_dspine", **_QWEN),
     Config("glm-8cards-mtp0", draft_tokens=0, **_GLM8),
     Config("glm-8cards-mtp1", draft_tokens=1, **_GLM8),
     Config("glm-8cards-mtp2", draft_tokens=2, **_GLM8),
@@ -198,6 +204,13 @@ def server_command(config: Config, args, context: int | None = None) -> list[str
     if args.gpu:
         line += ["--gpu", args.gpu]
     line += shlex.split(args.server_args)
+    if config.drafter is not None:
+        drafter = getattr(args, config.drafter)
+        if drafter is None:
+            raise SystemExit(
+                f"{config.name} needs --{config.drafter.replace('_', '-')}"
+            )
+        line += ["--assistant-checkpoint", str(drafter)]
     if config.family == "mistral":
         line += ["--tokenizer", str(tokenizer)]
         if config.draft_tokens:
@@ -757,6 +770,12 @@ def report(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qwen", type=Path)
+    parser.add_argument(
+        "--qwen-dflash", type=Path, help="the DFlash 2 drafter of Qwen3.8-27B"
+    )
+    parser.add_argument(
+        "--qwen-dspine", type=Path, help="the DSpine drafter of Qwen3.8-27B"
+    )
     parser.add_argument("--mistral", type=Path)
     parser.add_argument("--mistral-tokenizer", type=Path)
     parser.add_argument("--mistral-drafter", type=Path)

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 candidate blocks, sparse scoring: the compact scores of a column with every entry whose position
 // (cpos, ix_cgather) is at or past the column's visible entries vis[c] set to -3e38.
 // tensors: 0 score (KC, T) f32  1 cpos (KC, T) i32  2 vis (T) i32 | 3 out (KC, T) f32

@@ -7,8 +7,8 @@ name = "resin-models-gaudi"
 version = "0.1.0"
 description = "LLM implementations for Resin on Intel Gaudi2, over the Synapse graph compiler"
 requires-python = ">=3.11"
-license = "Apache-2.0 AND PolyForm-Noncommercial-1.0.0"
-license-files = ["resin_models_gaudi/kernels/LICENSE"]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "NOTICE", "LICENSES/*.txt"]
 dependencies = [
   "resin==0.1.0",
   "numpy>=1.26,<3",

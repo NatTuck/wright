@@ -62,7 +62,10 @@ only the unmatched suffix.
 A model can declare `CacheLayout(replay_suffix_tokens=N)` when a restored
 history needs its final `N` inputs recomputed. Prefix lookup caps the hit at
 `prefill_length - N` before applying cache alignment. The scheduler does not
-interpret those inputs or choose model layers. `BatchPlan.prefill_lengths`
+interpret those inputs or choose model layers. A prefill chunk that passes
+`prefill_length - N` stops at the last cache boundary at or before that point.
+Thus the request publishes the longest prefix that a repeat of its prompt can
+restore. `BatchPlan.prefill_lengths`
 provides each request's final prefill endpoint across chunks, including
 generated inputs when reconstructing a retracted request. Scored prompts still
 take the full prefill path.
@@ -97,3 +100,39 @@ read_window_tokens + 1` across Window groups and rejects decode lookahead that
 exceeds it. The same bound is checked before native cache growth or copy-on-write.
 This prevents a later write in a chunk from overwriting the earlier queries'
 history, including when a prefix hit shares those pages with another request.
+
+## Several Engines on one pool
+
+A process that serves more than one model has one Engine for each model. These Engines can use
+one pool of slabs, so the models share the cache memory of the card:
+
+```python
+pool = CachePool(parent_capacity)
+first = Engine(first_runner, cache_pool=pool)
+second = Engine(second_runner, cache_pool=pool, cache_floor=64)
+```
+
+Each runner declares a `CacheLayout` with the pool's `parent_capacity`. All runners address one
+device arena, and they use the same slab size. Every runner's `ResourceBinding` has the same
+`cache_pool_id`.
+
+The rules for slabs are these:
+
+- A free slab goes to the Engine that needs it next. The slab belongs to that Engine while it
+  holds that Engine's blocks, and it goes back to the pool when it is free.
+- When an Engine needs a slab and no slab is free, the pool evicts the least recently used cached
+  prefix of any Engine. The prefixes of all Engines are in one LRU order.
+- An Engine never evicts the live requests of another Engine.
+- An Engine admits requests only to the capacity that the other Engines leave: the pool's
+  capacity less the live slabs (or the floor, if it is larger) of each other Engine.
+- `cache_floor` reserves slabs for an Engine. The other Engines do not take the free slabs that
+  the floor still needs. They do not evict that Engine's prefixes while it holds no more slabs
+  than its floor.
+- If an Engine cannot grow a request because other Engines' live requests hold the slabs, its
+  step does nothing and it waits. If every other Engine that holds live slabs also waits, the
+  Engine gives back the slabs of one of its own requests, which restarts later, so that the
+  others can continue. A request that cannot fit, with no live request of another Engine to wait
+  for, fails as it does with one Engine.
+
+Slab counts in `/metrics` (`cache_slabs`) are the pool's. Group and prefix metrics are each
+Engine's own. `CachePool.bound_slabs()` gives the slabs that each Engine's blocks occupy.

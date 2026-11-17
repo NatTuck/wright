@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // GLM mHC residual update after a sub-layer, one member per token:
 //   Xo_j = post_j y + sum_i comb[i][j] X_i        (y summed over NR rank slices when NR > 1)
 // mode 1 (embedding init): Xo_j = y for every stream (X, coef unused).

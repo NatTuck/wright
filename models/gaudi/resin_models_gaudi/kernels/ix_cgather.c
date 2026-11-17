@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 candidate blocks, sparse scoring: the FP8 index keys of one slot's 256 candidate blocks of 8
 // entries into a dense slab with their scales (as ds_ix_gather), and each slab entry's position. Slot s is column c = slots[5, s]
 // and slab entries key0 .. key0 + 2047 (key0 = slots[3, s]) of the column's candidate entries: block u of the

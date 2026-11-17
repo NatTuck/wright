@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Sampling, pass 2 of 5 (select): one member per row merges the scan's chunk statistics and
 // candidates (the per-lane top 8 of every chunk) into
 //   - the row maximum m, the log-sum-exp of the raw logits (lse) and the tempered total

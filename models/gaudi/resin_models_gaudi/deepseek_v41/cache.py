@@ -11,18 +11,20 @@ The arena holds ``parent_capacity + 1`` slabs (slab 0 is null); a slab is one WI
   A ratio-2 owner has one such page pair per block, a ratio-1 owner two.
 
 The ratio-2 compressor's pending token (the first of a pair whose second has not run) is f32 [kv | score]
-(1024 values) in a separate state buffer: one row per (WINDOW block, ratio-2 owner), in the block of the
-pending token's position.
+(1024 values) in a separate state buffer: PENDING_SLOTS rows per (WINDOW block, ratio-2 owner), in the block of
+the pending token's position, slot (position // 2) % PENDING_SLOTS. A verify step stores the state of every even
+column (a rejected draft can end the committed range at any of them), so the slots of the even positions one
+step can hold and of the position before it must differ: a step writes at most 2 * PENDING_SLOTS - 2 positions
+of a row (``CacheGeometry.max_pending_columns``).
 
 The Engine's prefix cache shares blocks at multiples of 256 tokens. There every compressor group is complete,
 so a sequence that starts from cached blocks needs from them only its keys and entries. The tokens that Engram
-hashes before its first position are on the host (``EngramContext``).
+hashes before its first position are on the host (the native executor's ``Ds41Context``).
 """
 
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -38,6 +40,7 @@ PAIR_ROWS = PAGE_ROWS + INDEX_ROWS
 BLOCK_UNIT = 128
 WINDOW_GROUP, HISTORY_GROUP = 0, 1
 STATE_FLOATS = 1024
+PENDING_SLOTS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +55,8 @@ class CacheGeometry:
     """tokens one step may write to a row (its window blocks must all be resident)"""
     draft_layers: int = 0
     """DSpark stages after the backbone, each with a latent page in every WINDOW block"""
+    shared_slab_rows: int = 0
+    """the rows of a slab that another model's slabs share (0: this model's own, ``own_slab_rows``)"""
 
     @classmethod
     def from_config(
@@ -95,8 +100,22 @@ class CacheGeometry:
         return max(BLOCK_UNIT, -(-rows // BLOCK_UNIT) * BLOCK_UNIT)
 
     @property
-    def slab_rows(self) -> int:
+    def own_slab_rows(self) -> int:
+        """the smallest slab: one WINDOW block or the HISTORY blocks that fit beside it"""
         return max(self.window_block_rows, self.history_block_rows)
+
+    @property
+    def slab_rows(self) -> int:
+        return self.shared_slab_rows or self.own_slab_rows
+
+    def with_slab_rows(self, rows: int) -> CacheGeometry:
+        """The geometry in slabs of ``rows`` rows, which a slab of another model sets: each holds as many WINDOW
+        or HISTORY blocks as fit."""
+        if rows < self.own_slab_rows or rows % BLOCK_UNIT:
+            raise ValueError(
+                f"a shared slab of {rows} rows: at least {self.own_slab_rows}, in units of {BLOCK_UNIT}"
+            )
+        return replace(self, shared_slab_rows=rows)
 
     @property
     def slab_bytes(self) -> int:
@@ -107,15 +126,32 @@ class CacheGeometry:
         """owners with a pending state (ratio 2)"""
         return tuple(o for o, r in zip(self.owners, self.ratios, strict=True) if r > 1)
 
+    @property
+    def state_rows_per_block(self) -> int:
+        """pending-state rows of one WINDOW block: PENDING_SLOTS per ratio-2 owner (at least one row)"""
+        return max(len(self.pending_owners), 1) * PENDING_SLOTS
+
+    @property
+    def max_pending_columns(self) -> int:
+        """the most positions of one row a decode or verify step may write: the slots of its even positions and of
+        the position before it must differ"""
+        return 2 * PENDING_SLOTS - 2
+
     def state_bytes(self, parent_capacity: int) -> int:
         return (
-            (parent_capacity + 1) * max(len(self.pending_owners), 1) * STATE_FLOATS * 4
+            self.window_blocks(parent_capacity)
+            * self.state_rows_per_block
+            * STATE_FLOATS
+            * 4
         )
 
-    def layout(self, parent_capacity: int) -> CacheLayout:
+    def layout(self, parent_capacity: int, replay: int = 0) -> CacheLayout:
+        """``replay``: bounded replay's kept span; a prefix hit then leaves at least that many prompt tokens to
+        compute (the layers after the cut have no windows before it)."""
         read = self.window
         return CacheLayout(
             parent_capacity=parent_capacity,
+            replay_suffix_tokens=replay,
             groups=[
                 CacheGroupLayout(
                     PAGE_TOKENS,
@@ -133,7 +169,13 @@ class CacheGeometry:
 
     def capacity_for(self, free_bytes: int) -> int:
         """the largest parent capacity whose arena and state fit ``free_bytes`` (slab 0 is null)"""
-        per = self.slab_bytes + max(len(self.pending_owners), 1) * STATE_FLOATS * 4
+        per = (
+            self.slab_bytes
+            + (self.slab_rows // self.window_block_rows)
+            * self.state_rows_per_block
+            * STATE_FLOATS
+            * 4
+        )
         return max(0, free_bytes // per - 2)
 
     def arena_blocks(self, parent_capacity: int) -> int:
@@ -167,10 +209,15 @@ class CacheGeometry:
         """rows from a WINDOW block's first row to the layer's latent page (DSpark stage k: layer layers + k)"""
         return layer * PAGE_ROWS
 
-    def state_row(self, block_id, owner: int):
-        """the pending-state row of a ratio-2 owner in a WINDOW block"""
+    def state_row(self, block_id, owner: int, position):
+        """the pending-state row of a ratio-2 owner for the token at ``position`` in WINDOW block ``block_id``"""
+        return self.pending_row(block_id, self.pending_owners.index(owner), position)
+
+    def pending_row(self, block_id, index: int, position):
+        """``state_row`` with the owner's index among ``pending_owners``"""
         n = len(self.pending_owners)
-        return np.asarray(block_id, np.int64) * n + self.pending_owners.index(owner)
+        slot = np.asarray(position, np.int64) // 2 % PENDING_SLOTS
+        return (np.asarray(block_id, np.int64) * n + index) * PENDING_SLOTS + slot
 
     def entry_pages(self, owner: int, history_rows: np.ndarray) -> np.ndarray:
         """the first rows of an owner's latent pages (128 entries each) in entry order, from its row's HISTORY
@@ -184,85 +231,5 @@ class CacheGeometry:
         return rows.reshape(-1)
 
 
-_NONE = np.zeros(0, np.int64)
-logger = logging.getLogger("wright")
 
 
-class EngramContext:
-    """The ``n`` tokens before each position that Engram hashes, for every sequence of the runner.
-
-    ``seen`` records the tokens of a sequence as they are committed, from its first token. It also records the
-    last ``n`` tokens of each WINDOW block that they complete, by window block id. A sequence that the Engine
-    starts from cached blocks (a prefix hit, at a block boundary) has no record of its own. ``before`` then takes
-    its tokens from the record of the block before its first position, which is in its WINDOW table.
-
-    The Engine does not change a shared block, and the new owner of a free block writes it again before the
-    block can be shared. Thus the record of a block that a plan names is the record of that block's tokens."""
-
-    def __init__(self, n: int, window_blocks: int) -> None:
-        if n < 1:
-            raise ValueError("Engram hashes at least one token before a position")
-        self.n = n
-        self.last: dict[int, np.ndarray] = {}
-        """sequence id -> its last ``n`` committed tokens"""
-        self._windows: dict[int, tuple[int, np.ndarray]] = {}
-        """sequence id -> its WINDOW table of the latest plan: first logical block and the window block ids"""
-        self._tails = np.full((window_blocks, n), -1, np.int64)
-        """window block id -> the last ``n`` tokens of the block (-1: not recorded)"""
-
-    def before(
-        self, sequence: int, pos0: int, first: int, ids: np.ndarray
-    ) -> np.ndarray:
-        """The tokens before ``pos0`` that Engram hashes (those that exist), for a row whose WINDOW table starts
-        at logical block ``first`` with window block ids ``ids``."""
-        ids = np.asarray(ids, np.int64)
-        self._windows[sequence] = (first, ids)
-        if pos0 == 0:
-            return _NONE
-        last = self.last.get(sequence)
-        if last is None:
-            last = self._restore(sequence, pos0, first, ids)
-        return last[-min(self.n, pos0) :]
-
-    def _restore(
-        self, sequence: int, pos0: int, first: int, ids: np.ndarray
-    ) -> np.ndarray:
-        block = pos0 // PAGE_TOKENS - 1 - first
-        if pos0 % PAGE_TOKENS or not 0 <= block < len(ids):
-            raise RuntimeError(
-                f"sequence {sequence} starts at position {pos0}, which is not after a block in its WINDOW table"
-            )
-        tail = self._tails[ids[block]]
-        if (tail < 0).any():
-            raise RuntimeError(
-                f"sequence {sequence} starts at position {pos0} after a block with no recorded tokens"
-            )
-        self.last[sequence] = tail = tail[-min(self.n, pos0) :].copy()
-        logger.debug(
-            f"sequence {sequence} starts from cached blocks at position {pos0} after tokens {tail.tolist()}"
-        )
-        return tail
-
-    def seen(self, sequence: int, pos0: int, tokens) -> None:
-        """Record ``tokens``, committed at positions ``pos0`` and after. Call after ``before`` for a row of this
-        sequence whose WINDOW table covers those positions."""
-        last = self.last.get(sequence, _NONE) if pos0 else _NONE
-        full = np.concatenate([last, np.asarray(tokens, np.int64)])
-        start = pos0 - len(last)  # the position of full[0]
-        window = self._windows.get(sequence)
-        if window is not None:
-            first, ids = window
-            end = start + len(full)
-            for e in range(
-                -(-(pos0 + 1) // PAGE_TOKENS) * PAGE_TOKENS, end + 1, PAGE_TOKENS
-            ):
-                block = e // PAGE_TOKENS - 1 - first
-                if e - self.n >= start and 0 <= block < len(ids):
-                    self._tails[ids[block]] = full[e - self.n - start : e - start]
-        self.last[sequence] = full[-self.n :]
-
-    def release(self, sequences) -> None:
-        """Forget released sequences. The records of their blocks stay: cached blocks outlive their sequence."""
-        for sequence in sequences:
-            self.last.pop(int(sequence), None)
-            self._windows.pop(int(sequence), None)

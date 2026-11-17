@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DSA top-k threshold by radix, the choosing half of a pass (DeepSeek-V4.1; after ix_rcnt): with the counts
 // summed over the column's members, lo + i 2^sh for the largest i (0 .. 15) whose count is at least KS. After
 // the passes for sh = 28, 24, .. 0 from lo = 0, lo is the KS-th largest key, as ix_thr's. Columns that see at

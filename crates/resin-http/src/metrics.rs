@@ -146,15 +146,41 @@ struct Published {
 pub struct MetricsEndpoint {
     published: Arc<RwLock<Published>>,
     http: Option<Arc<HttpMetrics>>,
+    /// The frontend metrics of every served model, merged into each publication.
+    frontends: Arc<RwLock<Vec<Arc<HttpMetrics>>>>,
+    /// The engine snapshots of each publisher (an inference actor or a replica router), by
+    /// its part: a publication replaces its own part and merges all of them.
+    parts: Arc<RwLock<BTreeMap<usize, Vec<Vec<u8>>>>>,
+    part: usize,
 }
 
 impl MetricsEndpoint {
     /// Enable frontend metrics alongside engine snapshots. Frontend counters
     /// are singleton observations, independent of the distributed rank mesh.
     pub fn new(model_name: impl Into<String>) -> Self {
+        let http = Arc::new(HttpMetrics::new(model_name.into()));
         Self {
-            http: Some(Arc::new(HttpMetrics::new(model_name.into()))),
+            http: Some(http.clone()),
+            frontends: Arc::new(RwLock::new(vec![http])),
             ..Self::default()
+        }
+    }
+
+    /// The endpoint for another served model: the same publication, and frontend metrics
+    /// labelled with `model_name`.
+    pub fn for_model(&self, model_name: impl Into<String>) -> Self {
+        let http = Arc::new(HttpMetrics::new(model_name.into()));
+        let mut frontends = self
+            .frontends
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        frontends.push(http.clone());
+        Self {
+            published: self.published.clone(),
+            http: Some(http),
+            frontends: self.frontends.clone(),
+            parts: self.parts.clone(),
+            part: frontends.len() - 1,
         }
     }
 
@@ -188,10 +214,30 @@ impl MetricsEndpoint {
         }
     }
 
-    /// Replace the complete snapshot, preserving rank labels and grouping all
-    /// samples under consistent descriptors. Invalid publications leave both
+    /// Replace this endpoint's engine snapshots, preserving rank labels and grouping all
+    /// samples under consistent descriptors. The publication also holds the snapshots that
+    /// the other endpoints of the same server published. Invalid publications leave both
     /// cached representations unchanged.
     pub fn publish(&self, snapshots: Vec<Vec<u8>>) -> Result<(), MetricsPublishError> {
+        let mut parts = self
+            .parts
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = parts.insert(self.part, snapshots);
+        let result = self.publish_parts(&parts);
+        if result.is_err() {
+            match previous {
+                Some(previous) => parts.insert(self.part, previous),
+                None => parts.remove(&self.part),
+            };
+        }
+        result
+    }
+
+    fn publish_parts(
+        &self,
+        parts: &BTreeMap<usize, Vec<Vec<u8>>>,
+    ) -> Result<(), MetricsPublishError> {
         let mut families = BTreeMap::<String, MetricFamily>::new();
         let mut merge = |family: MetricFamily| -> Result<(), MetricsPublishError> {
             if let Some(previous) = families.get_mut(&family.name) {
@@ -213,12 +259,17 @@ impl MetricsEndpoint {
             }
             Ok(())
         };
-        for snapshot in snapshots {
-            for family in decode_metrics(&snapshot).map_err(MetricsPublishError::Decode)? {
+        for snapshot in parts.values().flatten() {
+            for family in decode_metrics(snapshot).map_err(MetricsPublishError::Decode)? {
                 merge(family)?;
             }
         }
-        if let Some(http) = &self.http {
+        let frontends = self
+            .frontends
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        for http in &frontends {
             for family in
                 prometheus_protobuf::encode(&http.registry).map_err(MetricsPublishError::Encode)?
             {

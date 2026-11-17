@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Slot attention, mask: the additive bf16 mask of each slot's C keys and Tq query
 // tokens. Key j (position key0 + j) is visible to token t (position qpos0 + t) when
 // key0 + j <= qpos0 + t and key0 + j < klen; visible keys get 0, the rest -30000. Padding slots

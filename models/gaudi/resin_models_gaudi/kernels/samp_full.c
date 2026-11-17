@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Sampling, pass 3 of 5 (full): the exact threshold and top list of rows samp_select flagged,
 // over the whole vocabulary (only when a chunk lane's 8 candidates did not reach the
 // threshold or the ntop-th logit). Unflagged rows pass samp_select's results through.

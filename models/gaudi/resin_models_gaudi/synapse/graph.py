@@ -12,16 +12,19 @@ import ctypes as C
 import mmap
 import os
 import tempfile
+import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from blake3 import blake3
 
 from resin.kernel_cache import ArtifactCache
+from resin_models_gaudi.loading.progress import info, logger, progress
 from resin_models_gaudi.synapse.build import default_cache_root
 from resin_models_gaudi.synapse.runtime import ITEM_SIZE, Device, SynapseError
 
@@ -96,6 +99,7 @@ class Graph:
         self._definition = blake3(name.encode())
         self._nodes = 0
         self._anonymous = 0
+        progress.graph_built()
         self.destroyed = False
 
     def _record(self, text: str, params: bytes = b"") -> None:
@@ -212,7 +216,7 @@ class Graph:
         for kernel in sorted(self.kernels):
             digest.update(f"{kernel}={libraries.kernel_digests[kernel]};".encode())
         digest.update(f"glue={libraries.glue_digest};".encode())
-        digest.update(f"runtime={libraries.runtime_digest};".encode())
+        digest.update(f"graph={libraries.graph_digest};".encode())
         digest.update(f"synapse={libraries.synapse_build};".encode())
         digest.update(compiler_environment().encode())
         return digest.hexdigest()
@@ -234,6 +238,8 @@ class Recipe:
     from_cache: bool
     persistent: dict[str, Tensor]
     _slots: dict[str, int] = field(default_factory=dict)
+    compile_seconds: float = 0.0
+    """The time of the compile that made this recipe here (0 for a recipe from the cache)."""
 
     def slot(self, name: str) -> int:
         slot = self._slots.get(name)
@@ -274,12 +280,21 @@ class Recipe:
 class LaunchPlan:
     """Launches of compiled recipes, each after rebinding some of its persistent tensors.
     ``steps`` holds (recipe, slots, addresses) per launch; later
-    bindings of a slot win. ``patch`` changes one binding's address between runs."""
+    bindings of a slot win. ``patch`` changes one binding's address between runs.
+
+    ``run`` makes the launches in one native call (``resin._resin.GaudiProgram``, built at the first run) when the
+    device has the glue for it (``Device.glue``), else in a Python loop. The native program keeps each launch's last
+    binding of each slot; a binding patched before the first run takes its address from a register, so ``patch``
+    costs no rebuild (patching another binding later rebuilds the program once)."""
 
     def __init__(
         self, device, steps: Sequence[tuple[Recipe, np.ndarray, np.ndarray]]
     ) -> None:
         self.device = device
+        self._recipes = [(recipe.handle, recipe.name) for recipe, _, _ in steps]
+        self._patched: dict[int, int] = {}  # binding index -> register
+        self._program: Any = None
+        self._registers = np.zeros(0, np.uint64)
         self.starts = np.zeros(len(steps) + 1, np.int64)
         self.starts[1:] = np.cumsum([len(slots) for _, slots, _ in steps])
         self.slots = np.ascontiguousarray(
@@ -304,8 +319,52 @@ class LaunchPlan:
 
     def patch(self, index: int, address: int) -> None:
         self.addresses[index] = address
+        register = self._patched.get(index)
+        if register is not None:
+            self._registers[register] = address
+            return
+        self._patched[index] = len(self._patched)
+        self._program = None  # the program has this binding as fixed: rebuild it
+
+    def _build(self) -> Any:
+        """The native program of these launches: per launch its last binding of each slot, fixed or (patched)
+        from a register."""
+        from resin._resin import GaudiProgram
+
+        program = GaudiProgram(len(self._patched))
+        program.section("launches")
+        slots, addresses = self.slots.tolist(), self.addresses.tolist()
+        bounds = zip(self.starts[:-1].tolist(), self.starts[1:].tolist(), strict=True)
+        for (handle, _), (a, b) in zip(self._recipes, bounds, strict=True):
+            last = {slots[i]: i for i in range(a, b)}  # a later binding of a slot wins
+            fixed = [i for i in last.values() if i not in self._patched]
+            dynamic = [
+                (slots[i], (0, self._patched[i], 1))
+                for i in last.values()
+                if i in self._patched
+            ]
+            program.launch(
+                handle,
+                [slots[i] for i in fixed],
+                [addresses[i] for i in fixed],
+                dynamic=dynamic,
+            )
+        program.finish()
+        self._registers = np.zeros(len(self._patched), np.uint64)
+        for index, register in self._patched.items():
+            self._registers[register] = self.addresses[index]
+        return program
 
     def run(self) -> None:
+        glue = self.device.glue
+        if glue is not None:
+            if self._program is None:
+                self._program = self._build()
+            try:
+                self._program.run(glue, self._registers, (0,))
+            except RuntimeError as error:  # a failed call, as the device reports one
+                raise SynapseError(f"launch plan: {error}") from error
+            return
         lib = self.device.lib
         bind, launch = lib.rg_bind_slots, lib.rg_launch
         for handle, slots, addresses, n, name in self._steps:
@@ -332,12 +391,19 @@ class RecipeCache:
     def misses(self) -> int:
         return self.store.misses
 
+    def _artifact(self, graph: Graph, identity: str) -> Path:
+        return Path(f"{graph.name}-{identity[:32]}.recipe")
+
+    def cached(self, graph: Graph) -> bool:
+        """Whether the cache has a recipe for ``graph`` (a file check; loading validates it)."""
+        return self.store.record_path(self._artifact(graph, graph.identity())).is_file()
+
     def compile(self, graph: Graph) -> Recipe:
         """Load ``graph``'s recipe from the cache, or compile and publish it."""
         identity = graph.identity()
-        artifact = Path(f"{graph.name}-{identity[:32]}.recipe")
+        artifact = self._artifact(graph, identity)
         device = self.device
-        loaded = {"from_cache": True}
+        loaded = {"from_cache": True, "seconds": 0.0}
         with tempfile.TemporaryDirectory(prefix="resin-gaudi-recipe-") as scratch:
             source = Path(scratch) / artifact.name
 
@@ -349,24 +415,86 @@ class RecipeCache:
 
             def build() -> int:
                 loaded["from_cache"] = False
-                return device.check(
+                start = time.monotonic()
+                handle = device.check(
                     device.lib.rg_compile(
                         graph.handle, graph.name.encode(), str(source).encode()
                     ),
                     f"compile {graph.name}",
                 )
+                loaded["seconds"] = time.monotonic() - start
+                device.count_compile()
+                return handle
 
             handle = self.store.load_or_build_from(
                 artifact, source=source, identity=identity, load=load, build=build
             )
         persistent = {n: t for n, t in graph.tensors.items() if t.persistent}
         return Recipe(
-            device, handle, graph.name, identity, loaded["from_cache"], persistent
+            device,
+            handle,
+            graph.name,
+            identity,
+            loaded["from_cache"],
+            persistent,
+            compile_seconds=loaded["seconds"],
         )
 
     def compile_many(
         self, graphs: Sequence[Graph], workers: int | None = None
     ) -> list[Recipe]:
-        """Compile or load ``graphs`` on ``workers`` threads; no launches may run meanwhile."""
-        with ThreadPoolExecutor(max_workers=workers or os.cpu_count()) as pool:
-            return list(pool.map(self.compile, graphs))
+        """Compile or load ``graphs`` on ``workers`` threads; no launches may run on the calling thread's context
+        meanwhile (it grows to the recipes' workspace). Startup progress counts them in its recipes phase: the
+        graphs not in the cache, then each graph as it is compiled here, compiled by another process (which
+        this one waited for) or loaded. The log gets one summary line, with the slowest compiles."""
+        if progress.current() == "recipes":
+            progress.extend(len(graphs))
+        else:
+            progress.phase("recipes", total=len(graphs))
+        progress.note("")
+        start = time.monotonic()
+        missing = [not self.cached(graph) for graph in graphs]
+        progress.recipes_planned(sum(missing))
+
+        context = self.device.current_context()
+
+        def one(item: tuple[Graph, bool]) -> Recipe:
+            graph, was_missing = item
+            with context.use():
+                recipe = self.compile(graph)
+            if not recipe.from_cache:
+                progress.recipe_done("compiled", recipe.compile_seconds)
+                logger.debug(f"recipe {graph.name}: compiled in {recipe.compile_seconds:.1f} s")
+            else:
+                progress.recipe_done("shared" if was_missing else "cached")
+            return recipe
+
+        threads = workers or os.cpu_count() or 1
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            recipes = list(pool.map(one, zip(graphs, missing, strict=True)))
+        progress.note("binding recipes")
+        info(_compile_summary(recipes, missing, time.monotonic() - start, min(threads, len(graphs))))
+        return recipes
+
+
+def _compile_summary(
+    recipes: Sequence[Recipe], missing: Sequence[bool], seconds: float, threads: int = 1
+) -> str:
+    """``recipes: 148 graphs in 9.1 s: 37 compiled (190 s of compile time on 37 threads), 111 from the
+    cache; slowest: ...``"""
+    compiled = [r for r in recipes if not r.from_cache]
+    shared = sum(m and r.from_cache for r, m in zip(recipes, missing, strict=True))
+    cached = len(recipes) - len(compiled) - shared
+    parts = []
+    if compiled:
+        busy = sum(r.compile_seconds for r in compiled)
+        on = f" on {min(threads, len(compiled))} threads" if threads > 1 and len(compiled) > 1 else ""
+        parts.append(f"{len(compiled)} compiled ({busy:.0f} s of compile time{on})")
+    if shared:
+        parts.append(f"{shared} compiled by another process")
+    parts.append(f"{cached} from the cache")
+    line = f"recipes: {len(recipes)} graphs in {seconds:.1f} s: " + ", ".join(parts)
+    slowest = sorted(compiled, key=lambda r: r.compile_seconds, reverse=True)[:3]
+    if slowest:
+        line += "; slowest: " + ", ".join(f"{r.name} {r.compile_seconds:.1f} s" for r in slowest)
+    return line

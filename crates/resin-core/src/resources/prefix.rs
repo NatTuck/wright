@@ -4,6 +4,9 @@ use std::sync::Arc;
 #[derive(Debug)]
 struct Entry<T> {
     snapshot: T,
+    /// When the entry was last inserted or hit, on a clock that several tries
+    /// can share; the LRU list is in this order.
+    stamp: u64,
     previous: Option<usize>,
     next: Option<usize>,
 }
@@ -59,11 +62,13 @@ impl<T> PrefixCache<T> {
         }
     }
 
-    pub(crate) const fn alignment(&self) -> u32 {
-        self.alignment
-    }
-
-    pub(crate) fn find(&mut self, tokens: &[u32], max_prefix_tokens: usize) -> Option<(u32, &T)> {
+    /// The longest cached prefix; a hit becomes the most recent entry at `stamp`.
+    pub(crate) fn find(
+        &mut self,
+        tokens: &[u32],
+        max_prefix_tokens: usize,
+        stamp: u64,
+    ) -> Option<(u32, &T)> {
         let alignment = self.alignment as usize;
         let usable = if tokens.len().is_multiple_of(alignment) {
             tokens.len().saturating_sub(alignment)
@@ -87,6 +92,11 @@ impl<T> PrefixCache<T> {
             return None;
         };
         self.remove_from_lru(node);
+        self.nodes[node]
+            .entry
+            .as_mut()
+            .expect("matched prefix node keeps its snapshot")
+            .stamp = stamp;
         self.push_recent(node);
         let entry = self.nodes[node]
             .entry
@@ -96,7 +106,8 @@ impl<T> PrefixCache<T> {
         Some((length as u32, &entry.snapshot))
     }
 
-    pub(crate) fn insert(&mut self, tokens: &[u32], snapshot: T) -> Option<T> {
+    /// Store `snapshot` for `tokens` as the most recent entry at `stamp`.
+    pub(crate) fn insert(&mut self, tokens: &[u32], snapshot: T, stamp: u64) -> Option<T> {
         debug_assert!(!tokens.is_empty() && tokens.len().is_multiple_of(self.alignment as usize));
         let mut node = 0usize;
         for block in tokens.chunks_exact(self.alignment as usize) {
@@ -115,6 +126,7 @@ impl<T> PrefixCache<T> {
         }
         let previous = self.nodes[node].entry.replace(Entry {
             snapshot,
+            stamp,
             previous: None,
             next: None,
         });
@@ -123,6 +135,37 @@ impl<T> PrefixCache<T> {
             self.entries += 1;
         }
         previous.map(|entry| entry.snapshot)
+    }
+
+    /// The stamp of the least recently used entry.
+    pub(crate) fn oldest_stamp(&self) -> Option<u64> {
+        let node = self.oldest?;
+        self.nodes[node].entry.as_ref().map(|entry| entry.stamp)
+    }
+
+    /// Remove every entry whose snapshot matches `matches` (an eviction each); returns their snapshots.
+    pub(crate) fn evict_matching(&mut self, mut matches: impl FnMut(&T) -> bool) -> Vec<T> {
+        let chosen: Vec<usize> = (0..self.nodes.len())
+            .filter(|&node| {
+                self.nodes[node]
+                    .entry
+                    .as_ref()
+                    .is_some_and(|entry| matches(&entry.snapshot))
+            })
+            .collect();
+        let mut snapshots = Vec::with_capacity(chosen.len());
+        for node in chosen {
+            self.remove_from_lru(node);
+            let entry = self.nodes[node]
+                .entry
+                .take()
+                .expect("chosen prefix node keeps its snapshot");
+            self.entries -= 1;
+            self.evictions = self.evictions.saturating_add(1);
+            self.prune(node);
+            snapshots.push(entry.snapshot);
+        }
+        snapshots
     }
 
     pub(crate) fn evict_lru(&mut self) -> Option<T> {
@@ -233,16 +276,37 @@ impl<T> PrefixCache<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::PrefixCache;
+
+    /// Increasing stamps, as the shared pool's clock gives them.
+    fn stamp() -> u64 {
+        static CLOCK: AtomicU64 = AtomicU64::new(1);
+        CLOCK.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn the_oldest_stamp_is_the_least_recent_entry() {
+        let mut cache = PrefixCache::new(1);
+        assert_eq!(cache.oldest_stamp(), None);
+        cache.insert(&[1], "one", 10);
+        cache.insert(&[2], "two", 20);
+        assert_eq!(cache.oldest_stamp(), Some(10));
+        assert!(cache.find(&[1, 99], usize::MAX, 30).is_some());
+        assert_eq!(cache.oldest_stamp(), Some(20));
+        assert_eq!(cache.evict_lru(), Some("two"));
+        assert_eq!(cache.oldest_stamp(), Some(30));
+    }
 
     #[test]
     fn hits_and_replacements_update_lru_order() {
         let mut cache = PrefixCache::new(1);
-        cache.insert(&[1], "one");
-        cache.insert(&[2], "two");
-        cache.insert(&[3], "three");
-        assert_eq!(cache.find(&[1, 99], usize::MAX), Some((1, &"one")));
-        assert_eq!(cache.insert(&[2], "new two"), Some("two"));
+        cache.insert(&[1], "one", stamp());
+        cache.insert(&[2], "two", stamp());
+        cache.insert(&[3], "three", stamp());
+        assert_eq!(cache.find(&[1, 99], usize::MAX, stamp()), Some((1, &"one")));
+        assert_eq!(cache.insert(&[2], "new two", stamp()), Some("two"));
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.evict_lru(), Some("three"));
         assert_eq!(cache.evict_lru(), Some("one"));
@@ -257,29 +321,29 @@ mod tests {
         let mut cache = PrefixCache::new(4);
         let tokens = (0..16).collect::<Vec<_>>();
         for end in [4, 8, 12] {
-            cache.insert(&tokens[..end], end);
+            cache.insert(&tokens[..end], end, stamp());
         }
-        assert_eq!(cache.find(&tokens, 8), Some((8, &8)));
-        assert_eq!(cache.find(&tokens, 7), Some((4, &4)));
-        assert_eq!(cache.find(&tokens, 0), None);
+        assert_eq!(cache.find(&tokens, 8, stamp()), Some((8, &8)));
+        assert_eq!(cache.find(&tokens, 7, stamp()), Some((4, &4)));
+        assert_eq!(cache.find(&tokens, 0, stamp()), None);
     }
 
     #[test]
     fn evicting_ancestors_preserves_descendants_and_reuses_pruned_nodes() {
         let mut cache = PrefixCache::new(1);
-        cache.insert(&[1], 1);
-        cache.insert(&[1, 2], 2);
-        cache.insert(&[1, 2, 3], 3);
+        cache.insert(&[1], 1, stamp());
+        cache.insert(&[1, 2], 2, stamp());
+        cache.insert(&[1, 2, 3], 3, stamp());
         assert_eq!(cache.evict_lru(), Some(1));
-        assert_eq!(cache.find(&[1, 2, 99], usize::MAX), Some((2, &2)));
+        assert_eq!(cache.find(&[1, 2, 99], usize::MAX, stamp()), Some((2, &2)));
         assert_eq!(cache.evict_lru(), Some(3));
         assert_eq!(cache.evict_lru(), Some(2));
         assert!(cache.nodes[0].children.is_empty());
         assert_eq!(cache.free_nodes.len(), 3);
 
-        cache.insert(&[4, 5], 4);
+        cache.insert(&[4, 5], 4, stamp());
         assert_eq!(cache.nodes.len(), 4);
-        assert_eq!(cache.find(&[4, 5, 99], usize::MAX), Some((2, &4)));
+        assert_eq!(cache.find(&[4, 5, 99], usize::MAX, stamp()), Some((2, &4)));
         assert_eq!(cache.evict_lru(), Some(4));
         assert_eq!(cache.oldest, None);
         assert_eq!(cache.newest, None);
@@ -289,7 +353,7 @@ mod tests {
     fn wide_cache_eviction_removes_exact_parent_edges() {
         let mut cache = PrefixCache::new(2);
         for id in 0..1024 {
-            cache.insert(&[id, id + 1], id);
+            cache.insert(&[id, id + 1], id, stamp());
         }
         for id in 0..1024 {
             assert_eq!(cache.evict_lru(), Some(id));

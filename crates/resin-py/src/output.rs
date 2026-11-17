@@ -157,6 +157,101 @@ impl ForwardOutput {
     }
 }
 
+/// Prompt score columns that Rust code made (`resin.backend.sampling.PromptScores.output`'s): the scored
+/// positions' logprobs and their indptr per row, and when any position asks for them its top lists and its extra
+/// targets, each as (indptr, token ids, logprobs).
+#[cfg(feature = "gaudi")]
+pub(crate) struct PromptColumns {
+    pub(crate) logprobs: Vec<f32>,
+    pub(crate) indptr: Vec<u32>,
+    pub(crate) top: Option<(Vec<u32>, Vec<u32>, Vec<f32>)>,
+    pub(crate) targets: Option<(Vec<u32>, Vec<u32>, Vec<f32>)>,
+}
+
+impl ForwardOutput {
+    /// Token rows and logprob columns that Rust code made (the native step executors): `scores` is
+    /// (logprobs, logprob_indptr) and `top` is (top_indptr, top_token_ids, top_logprobs).
+    #[cfg(feature = "gaudi")]
+    pub(crate) fn native(
+        py: Python<'_>,
+        token_ids: Vec<u32>,
+        token_indptr: Vec<u32>,
+        scores: Option<(Vec<f32>, Vec<u32>)>,
+        top: Option<(Vec<u32>, Vec<u32>, Vec<f32>)>,
+    ) -> PyResult<Self> {
+        Self::native_with_prompt(py, token_ids, token_indptr, scores, top, None)
+    }
+
+    /// `native` with the prompt score columns of a prefill.
+    #[cfg(feature = "gaudi")]
+    pub(crate) fn native_with_prompt(
+        py: Python<'_>,
+        token_ids: Vec<u32>,
+        token_indptr: Vec<u32>,
+        scores: Option<(Vec<f32>, Vec<u32>)>,
+        top: Option<(Vec<u32>, Vec<u32>, Vec<f32>)>,
+        prompt: Option<PromptColumns>,
+    ) -> PyResult<Self> {
+        let (logprobs, logprob_indptr) = match scores {
+            Some((values, indptr)) => (
+                Some(PyArray1::from_vec(py, values).unbind()),
+                Some(PyArray1::from_vec(py, indptr).unbind()),
+            ),
+            None => (None, None),
+        };
+        let (top_indptr, top_token_ids, top_logprobs) = match top {
+            Some((indptr, ids, values)) => (
+                Some(PyArray1::from_vec(py, indptr).unbind()),
+                Some(PyArray1::from_vec(py, ids).unbind()),
+                Some(PyArray1::from_vec(py, values).unbind()),
+            ),
+            None => (None, None, None),
+        };
+        type Columns = (
+            Option<Py<PyArray1<u32>>>,
+            Option<Py<PyArray1<u32>>>,
+            Option<Py<PyArray1<f32>>>,
+        );
+        let columns = |c: Option<(Vec<u32>, Vec<u32>, Vec<f32>)>| -> Columns {
+            match c {
+                Some((indptr, ids, values)) => (
+                    Some(PyArray1::from_vec(py, indptr).unbind()),
+                    Some(PyArray1::from_vec(py, ids).unbind()),
+                    Some(PyArray1::from_vec(py, values).unbind()),
+                ),
+                None => (None, None, None),
+            }
+        };
+        let (prompt_logprobs, prompt_logprob_indptr, prompt_top, prompt_targets) = match prompt {
+            Some(p) => (
+                Some(PyArray1::from_vec(py, p.logprobs).unbind()),
+                Some(PyArray1::from_vec(py, p.indptr).unbind()),
+                columns(p.top),
+                columns(p.targets),
+            ),
+            None => (None, None, (None, None, None), (None, None, None)),
+        };
+        Self::new(
+            py,
+            PyArray1::from_vec(py, token_ids).unbind(),
+            PyArray1::from_vec(py, token_indptr).unbind(),
+            logprobs,
+            logprob_indptr,
+            top_indptr,
+            top_token_ids,
+            top_logprobs,
+            prompt_logprobs,
+            prompt_logprob_indptr,
+            prompt_top.0,
+            prompt_top.1,
+            prompt_top.2,
+            prompt_targets.0,
+            prompt_targets.1,
+            prompt_targets.2,
+        )
+    }
+}
+
 fn borrow<'py, T: Element>(
     array: &Py<PyArray1<T>>,
     py: Python<'py>,

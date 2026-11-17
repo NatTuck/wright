@@ -141,7 +141,7 @@ MODEL_SPECS = {
         gpu="HL-225",
         label="qwen3-8-27b-gaudi2",
         context_length=32_768,
-        max_batch_size=32,
+        max_batch_size=64,
         draft_tokens=2,
         media=False,
     ),
@@ -219,7 +219,7 @@ MODEL_SPECS = {
             world_size=ranks,
             attn_tp=ranks,
             context_length=context,
-            max_batch_size=16,
+            max_batch_size=64,
             draft_tokens=0,
             prefill_chunk_size=4096,
             media=False,
@@ -229,6 +229,47 @@ MODEL_SPECS = {
             ("glm5_3_flash-gaudi2-tp4", 4, 32_768),
             ("glm5_3_flash-gaudi2-256k", 8, 262_144),
         )
+    },
+    # Text only (the vision tower is not supported). The experts and the n-gram table shard over the cards;
+    # contexts stay within the QSA indexer's dense budget until the sparse path is wired.
+    **{
+        name: ModelSpec(
+            name=name,
+            family="qwen4_exp",
+            accelerator="gaudi2",
+            checkpoint=Checkpoint(
+                repo_id="Qwen/Qwen3.8-Flash-Next-FP8",
+                revision="7fb48d708ca6cd8eeed8f4db0433be18af96984f",
+                directory="",
+                required_files=(
+                    "config.json",
+                    "generation_config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "chat_template.jinja",
+                ),
+                patterns=(
+                    "*.json",
+                    "*.jinja",
+                    "*.safetensors",
+                    "merges.txt",
+                    "vocab.json",
+                ),
+            ),
+            model_mount="/models/resin-qwen3-8-flash-next-fp8",
+            model_volume="resin-qwen3-8-flash-next-fp8-models-v1",
+            gpu="HL-225",
+            label=name,
+            world_size=ranks,
+            attn_tp=ranks,
+            context_length=2048,
+            max_batch_size=16,
+            draft_tokens=0,
+            prefill_chunk_size=2048,
+            media=False,
+            recipe="qwen3_8",  # its template renders as Qwen3.8's (it only adds generation markers)
+        )
+        for name, ranks in (("qwen4_exp-gaudi2", 8), ("qwen4_exp-gaudi2-tp4", 4))
     },
     # Text only: no vision tower. 8 cards; DSpark drafting with --draft-tokens 1..5.
     "deepseek_v41-gaudi2": ModelSpec(
@@ -249,7 +290,7 @@ MODEL_SPECS = {
         world_size=8,
         attn_tp=8,
         context_length=131_072,
-        max_batch_size=16,
+        max_batch_size=64,
         draft_tokens=0,
         prefill_chunk_size=2048,
         media=False,
@@ -463,6 +504,35 @@ def warm_engine(engine, recipe, spec: ModelSpec, rank: int = 0) -> None:
             lease.take_result()
 
 
+# the families whose ranks can exchange their steps natively (``--step-transport native``: no Gloo after the start)
+NATIVE_RANK_FAMILIES = ("qwen3_5", "deepseek_v41", "glm5_3_flash")
+
+
+def kv_cache_types(spec: ModelSpec) -> tuple[str, ...]:
+    """The types that a model's KV cache pages can have (``--cache-type-k``, ``--cache-type-v``), its default
+    first: bf16 or fp8 for the K and the V pages of Qwen3.5/3.8; fp8 only for the latent caches of
+    DeepSeek-V4.1-Flash, GLM-5.3-Flash and Mistral-Large-4; bf16 only for Qwen3.8-Flash-Next."""
+    if spec.family == "qwen3_5":
+        return ("bf16", "fp8")
+    if spec.family == "qwen4_exp":
+        return ("bf16",)
+    return ("fp8",)
+
+
+def check_cache_types(
+    spec: ModelSpec, cache_types: tuple[str | None, str | None] | None
+) -> tuple[str, str]:
+    """``cache_types`` (K, V; None: the model's default) as the model's types, or a ValueError."""
+    kinds = kv_cache_types(spec)
+    k, v = cache_types or (None, None)
+    for flag, kind in (("--cache-type-k", k), ("--cache-type-v", v)):
+        if kind is not None and kind not in kinds:
+            raise ValueError(
+                f"{spec.name} keeps its KV cache as {' or '.join(kinds)}: {flag} {kind} is not one of them"
+            )
+    return (k or kinds[0], v or kinds[0])
+
+
 def create_runner(
     model: str | ModelSpec,
     checkpoint: str | Path | None = None,
@@ -476,8 +546,15 @@ def create_runner(
     gpu_memory_utilization: float | None = None,
     assistant_checkpoint: str | Path | None = None,
     num_layers: int | None = None,
+    defer_cache: bool = False,
+    native_ranks=None,
+    cache_types: tuple[str | None, str | None] | None = None,
 ):
-    """Construct one runner with model-specific cache geometry and draft support."""
+    """Construct one runner with model-specific cache geometry and draft support.
+    ``defer_cache``: load the weights only, for a card that several models share (the runner's
+    ``attach`` gives it the shared cache arena). ``native_ranks``: a Qwen3.5/3.8 rank's
+    ``resin._resin.GaudiRanks`` (``--step-transport native``), in place of ``groups``.
+    ``cache_types``: the types of the K and V cache pages (``kv_cache_types``; None: the model's)."""
     spec = get_model(model)
     checkpoint = spec.path if checkpoint is None else Path(checkpoint)
     return _create_gaudi_runner(
@@ -496,6 +573,9 @@ def create_runner(
             else Path(assistant_checkpoint)
         ),
         num_layers=num_layers,
+        defer_cache=defer_cache,
+        native_ranks=native_ranks,
+        cache_types=check_cache_types(spec, cache_types),
     )
 
 
@@ -512,12 +592,21 @@ def _create_gaudi_runner(
     gpu_memory_utilization: float | None,
     assistant: Path | None = None,
     num_layers: int | None = None,
+    defer_cache: bool = False,
+    native_ranks=None,
+    cache_types: tuple[str, str] = ("bf16", "bf16"),
 ):
-    """One Gaudi card per rank, selected by ``hpu:N`` (its accel index) or the first free one."""
+    """One Gaudi card per rank, selected by ``hpu:N`` (its accel index) or the first free one.
+    ``cache_types``: checked by ``check_cache_types``; only Qwen3.5/3.8 has a choice."""
+    if defer_cache and not gaudi_defers_cache(spec):
+        raise ValueError(f"{spec.name} does not share a card with other models yet")
+    if native_ranks is not None and spec.family not in NATIVE_RANK_FAMILIES:
+        raise ValueError(f"{spec.name} has no native rank dispatch")
     if spec.family == "glm5_3_flash":
         from resin_models_gaudi.glm5_3_flash.runner import (
             PREFILL_CHUNK_SIZES,
             Glm53FlashGaudiRunner,
+            lookahead_tokens,
         )
 
         # The runner keeps its compiled prefill widths. The Engine takes the smaller chunk.
@@ -525,16 +614,21 @@ def _create_gaudi_runner(
             raise ValueError(
                 f"{spec.name} prefills in chunks of {', '.join(map(str, PREFILL_CHUNK_SIZES))} tokens"
             )
-        # a speculative step near the end of a context writes 2K - 1 positions past it
-        lookahead = 2 * draft_tokens - 1 if draft_tokens else 0
+        # a speculative step near the end of a context writes past it: the DFlash drafter's K
+        # positions, or an MTP step's 2K - 1
+        drafter = None if draft_tokens == 0 else assistant
+        lookahead = lookahead_tokens(draft_tokens, drafter is not None)
         return Glm53FlashGaudiRunner(
             str(checkpoint),
             groups=groups,
+            native_ranks=native_ranks,
             card=_gaudi_card(spec, device),
             max_batch_size=max_batch_size,
             max_seq_len=context_length + lookahead,
             num_layers=num_layers,
             mtp=draft_tokens,
+            drafter=drafter,
+            defer_cache=defer_cache,
         )
     if spec.family == "deepseek_v41":
         from resin_models_gaudi.deepseek_v41.runner import (
@@ -549,11 +643,34 @@ def _create_gaudi_runner(
         return DeepSeekV41GaudiRunner(
             str(checkpoint),
             groups=groups,
+            native_ranks=native_ranks,
             card=_gaudi_card(spec, device),
             max_batch_size=max_batch_size,
             max_seq_len=context_length + draft_tokens,
             num_layers=num_layers,
             draft_tokens=draft_tokens,
+            defer_cache=defer_cache,
+        )
+    if spec.family == "qwen4_exp":
+        from resin_models_gaudi.qwen4_exp.runner import (
+            PREFILL_CHUNK_SIZE as FNEXT_CHUNK,
+        )
+        from resin_models_gaudi.qwen4_exp.runner import Qwen4ExpGaudiRunner
+
+        if prefill_chunk_size != FNEXT_CHUNK:
+            raise ValueError(f"{spec.name} prefills in {FNEXT_CHUNK}-token chunks")
+        if draft_tokens:
+            raise ValueError(f"{spec.name} has no speculative decoding yet")
+        return Qwen4ExpGaudiRunner(
+            checkpoint,
+            groups=groups,
+            card=_gaudi_card(spec, device),
+            max_batch_size=max_batch_size,
+            max_seq_len=context_length,
+            memory_utilization=spec.gpu_memory_utilization
+            if gpu_memory_utilization is None
+            else gpu_memory_utilization,
+            defer_cache=defer_cache,
         )
     if spec.family == "mistral_large4":
         return _create_mistral_large4_runner(
@@ -571,10 +688,9 @@ def _create_gaudi_runner(
     from resin_models_gaudi.qwen3_5.runner import (
         PREFILL_CHUNK_SIZES,
         Qwen3_5GaudiRunner,
+        lookahead_tokens,
     )
 
-    if groups is not None and groups.topology.world_size != 1:
-        raise ValueError(f"{spec.name} currently runs on one Gaudi card")
     # The runner keeps its compiled prefill widths. The Engine takes the smaller chunk.
     if prefill_chunk_size not in PREFILL_CHUNK_SIZES:
         raise ValueError(
@@ -588,8 +704,10 @@ def _create_gaudi_runner(
                 f"{spec.name} devices are 'hpu' or 'hpu:N' (got {device!r})"
             )
         card = int(index)
-    # a speculative step near the end of a context writes 2K - 1 positions past it
-    lookahead = 2 * draft_tokens - 1 if draft_tokens else 0
+    # a speculative step near the end of a context writes past it: the MTP chain's reach, or
+    # the verified columns with the DFlash 2 drafter (``assistant``)
+    drafter = assistant if draft_tokens else None
+    lookahead = lookahead_tokens(draft_tokens, drafter is not None)
     return Qwen3_5GaudiRunner(
         checkpoint,
         card=card,
@@ -598,8 +716,19 @@ def _create_gaudi_runner(
         memory_utilization=spec.gpu_memory_utilization
         if gpu_memory_utilization is None
         else gpu_memory_utilization,
+        drafter=drafter,
         mtp=draft_tokens,
+        defer_cache=defer_cache,
+        groups=groups,
+        native_ranks=native_ranks,
+        cache_types=cache_types,
     )
+
+
+def gaudi_defers_cache(spec: ModelSpec) -> bool:
+    """Whether this preset's runner can load its weights first and take a cache arena that other
+    models share later (``create_runner(defer_cache=True)``, then the runner's ``attach``)."""
+    return spec.family in ("qwen3_5", "deepseek_v41", "glm5_3_flash", "qwen4_exp")
 
 
 def gaudi_supports_ranks(spec: ModelSpec) -> bool:
@@ -616,6 +745,10 @@ def gaudi_supports_ranks(spec: ModelSpec) -> bool:
         from resin_models_gaudi.deepseek_v41.runner import (
             DeepSeekV41GaudiRunner as runner,
         )
+    elif spec.family == "qwen4_exp":
+        from resin_models_gaudi.qwen4_exp.runner import Qwen4ExpGaudiRunner as runner
+    elif spec.family == "qwen3_5":
+        from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner as runner
     else:
         return False
     return runner.parallelism_capabilities.attn_tp
@@ -634,6 +767,14 @@ def check_gaudi_ranks(spec: ModelSpec, checkpoint: Path, ranks: int) -> None:
 
         raw = json.loads((checkpoint / "config.json").read_text())
         DeepSeekV41Config.from_hugging_face(raw).validate_tensor_parallel(ranks)
+    elif spec.family == "qwen4_exp":
+        from resin_models_gaudi.qwen4_exp.checkpoint import Qwen4ExpCheckpoint
+
+        Qwen4ExpCheckpoint(checkpoint).shard(0, ranks)
+    elif spec.family == "qwen3_5":
+        from resin_models_gaudi.qwen3_5.checkpoint import Qwen35Checkpoint
+
+        Qwen35Checkpoint(checkpoint).shard(0, ranks)
     else:
         from resin.models.mistral_large4.config import MistralLarge4Config
         from resin_models_gaudi.gguf.reader import GgufModel
@@ -646,9 +787,29 @@ def check_gaudi_ranks(spec: ModelSpec, checkpoint: Path, ranks: int) -> None:
         RankSlices.of(cfg, 0, ranks)
 
 
-def check_gaudi_drafts(spec: ModelSpec, checkpoint: Path, draft_tokens: int) -> None:
-    """Raise ValueError if MTP drafts are asked for and the checkpoint has no MTP weights."""
-    if spec.family != "qwen3_5" or not draft_tokens:
+DFLASH_FAMILIES = frozenset({"qwen3_5", "glm5_3_flash"})
+"""Presets whose ``--assistant-checkpoint`` names a DFlash 2 drafter directory (Qwen3.8-27B: or a
+DSpine drafter's)."""
+
+
+def default_draft_tokens(spec: ModelSpec, assistant: str | Path | None = None) -> int:
+    """The preset's draft tokens, or the drafts a block of a DFlash 2 or DSpine drafter makes."""
+    if spec.family in DFLASH_FAMILIES and assistant is not None:
+        from resin_models_gaudi.common.dflash import drafter_draft_tokens
+
+        return drafter_draft_tokens(assistant)
+    return spec.draft_tokens
+
+
+def check_gaudi_drafts(
+    spec: ModelSpec,
+    checkpoint: Path,
+    draft_tokens: int,
+    assistant: str | Path | None = None,
+) -> None:
+    """Raise ValueError if MTP drafts are asked for and the checkpoint has no MTP weights (a
+    DFlash 2 drafter, ``assistant``, needs none)."""
+    if spec.family != "qwen3_5" or not draft_tokens or assistant is not None:
         return
     if (checkpoint / "mtp.safetensors").exists():
         return
@@ -681,15 +842,21 @@ def validate_gaudi_options(
     max_batch_size: int,
     prefill_chunk_size: int,
     draft_tokens: int,
+    assistant: str | Path | None = None,
 ) -> None:
-    """Raise ValueError for a setting that the preset's runner rejects after the card opens."""
+    """Raise ValueError for a setting that the preset's runner rejects after the card opens.
+    ``assistant``: a draft model directory (Qwen3.8-27B and GLM-5.3-Flash: a DFlash 2
+    drafter)."""
     if spec.family == "glm5_3_flash":
         from resin_models_gaudi.glm5_3_flash.runner import (
             MAX_BATCH,
+            MTP_MAX,
             PREFILL_CHUNK_SIZES,
         )
 
-        drafts, chunks = range(4), PREFILL_CHUNK_SIZES
+        drafts, chunks = range(MTP_MAX + 1), PREFILL_CHUNK_SIZES
+        if assistant is not None:  # up to the drafts the drafter's block makes
+            drafts = range(default_draft_tokens(spec, assistant) + 1)
     elif spec.family == "deepseek_v41":
         from resin_models_gaudi.deepseek_v41.runner import MAX_BATCH, PREFILL_CHUNK_SIZE
 
@@ -710,6 +877,8 @@ def validate_gaudi_options(
 
         MAX_BATCH = DECODE_BUCKETS[-1]
         drafts, chunks = range(4), PREFILL_CHUNK_SIZES
+        if assistant is not None:  # up to the drafts the drafter's block makes
+            drafts = range(default_draft_tokens(spec, assistant) + 1)
     if max_batch_size > MAX_BATCH:
         raise ValueError(f"{spec.name} takes a --max-batch-size of {MAX_BATCH} or less")
     if draft_tokens not in drafts:
@@ -798,19 +967,55 @@ class TextOnlyRecipe:
         return self._recipe.reasoning_efforts
 
 
-def model_capabilities(model: str | ModelSpec, recipe):
+@dataclass(frozen=True)
+class SamplingDefaults:
+    """The sampling settings a request takes when it gives none, from a checkpoint's
+    ``generation_config.json`` (those it has). None: the server's own default (temperature 1.0,
+    top_p 1.0, no top_k)."""
+
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+
+    @classmethod
+    def read(cls, checkpoint: str | Path) -> SamplingDefaults:
+        path = Path(checkpoint) / "generation_config.json"
+        if not path.is_file():
+            return cls()
+        config = json.loads(path.read_text())
+
+        def number(name: str):
+            value = config.get(name)
+            return value if type(value) in (int, float) else None
+
+        top_k = number("top_k")
+        return cls(
+            temperature=None if (t := number("temperature")) is None else float(t),
+            top_p=None if (p := number("top_p")) is None else float(p),
+            top_k=None if top_k is None else int(top_k),
+        )
+
+
+def model_capabilities(
+    model: str | ModelSpec, recipe, checkpoint: str | Path | None = None
+):
     """What ``GET /v1/models`` tells about a preset. Every chat recipe of MODEL_SPECS renders
     tools and parses reasoning, and the recipe gives its reasoning_effort levels. A preset
-    without media serves text only."""
+    without media serves text only. The sampling defaults come from the checkpoint's
+    ``generation_config.json`` (``checkpoint``, default the preset's path)."""
     from resin.server import ModelCapabilities
 
     spec = get_model(model)
+    defaults = SamplingDefaults.read(spec.path if checkpoint is None else checkpoint)
     return ModelCapabilities(
         function_calling=True,
         reasoning=True,
         thinking_levels=tuple(recipe.reasoning_efforts) or None,
         input_modalities=("text", "image") if spec.media else ("text",),
         output_modalities=("text",),
+        default_temperature=defaults.temperature,
+        default_top_p=defaults.top_p,
+        default_top_k=defaults.top_k,
     )
 
 

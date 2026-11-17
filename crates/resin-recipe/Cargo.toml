@@ -3,7 +3,7 @@ name = "resin-recipe"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 description = "Model conversation formats and incremental response parsing for Resin"
 
 [dependencies]

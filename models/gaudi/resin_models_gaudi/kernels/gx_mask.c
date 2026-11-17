@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // GLM DSA, a prefill chunk's selection as an additive per-key mask for mla_slot_pm: per query column, a key is
 // kept (0) when its pool is visible (below vis[c]) and kept (mkey(score) >= thr[c]: ix_thr at KS = 512 pools), or
 // it is in the column's tail (positions 4 vis[c] .. klen[c] - 1, which no complete pool covers); else -3e38.

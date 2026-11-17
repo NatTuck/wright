@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // out[i] = sum over s < ns of part[s * n + i] (K-split partial sums of syn_qmm), f32
 // tensors: 0 part | 1 out
 #include "syn_common.h"

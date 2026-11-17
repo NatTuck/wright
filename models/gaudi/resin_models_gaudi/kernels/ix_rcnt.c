@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DSA top-k threshold by radix, the counting half of a pass (DeepSeek-V4.1; ix_rsel completes it): for the
 // keys t_i = lo + i 2^sh (i = 1 .. 15; lo from state), how many of a member's visible entries of the column
 // have mkey(score) >= t_i. The M members of a column split its visible entries in whole vectors. Columns that

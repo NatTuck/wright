@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked gated delta rule for prefill, stage 1b: per (value head h, chunk c):
 //   gates beta = sigmoid(b), g = ssm_a * softplus(a + dt_bias) (log decay <= 0), G = cumsum(g)
 //   inside the chunk; v = conv1d(k=4)+SiLU of the head's v channels. Padded tokens: beta = g = v = 0.

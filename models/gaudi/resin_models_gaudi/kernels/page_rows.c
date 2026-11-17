@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Gather 512-byte rows of a large input tensor (the cache arena) through a runtime row table.
 // The arena is viewed as (128, PR, NB) i32: row r is (., r % PR, r / PR).
 // Rows of -1 are written as zeros.

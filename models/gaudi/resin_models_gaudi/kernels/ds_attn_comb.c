@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 attention over two key sets in one softmax, with the per-head sink: each part gives its normalized
 // output o, max m and sum l (ds_slot_ml); per column c (head h = c % hpg)
 //   M = max(m1, m2, sink[h]),  a_i = l_i exp(m_i - M),  out = (a_1 o_1 + a_2 o_2) / (a_1 + a_2 + exp(sink[h] - M))

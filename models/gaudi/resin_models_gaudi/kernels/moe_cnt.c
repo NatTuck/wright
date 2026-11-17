@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Prefill MoE, pass 1: per token block j (of NW), the number of (token, slot) pairs routed to each
 // local expert: cntm[e, j].
 // tensors: 0 ids (64,T) i32  1 meta i32 [pos0, n_real] | 2 cntm (E, NW) i32

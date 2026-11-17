@@ -253,7 +253,9 @@ pub(crate) fn run(
             if let Some(client) = clients.get(&id) {
                 // Backpressure remains local to one client. Cancel its owner
                 // on the next round instead of delaying every active replica.
-                if client.try_send(event).is_err() {
+                // A progress update is optional: a full queue drops only the update.
+                let optional = matches!(event, GenerationEvent::PromptProgress(_));
+                if client.try_send(event).is_err() && !optional {
                     clients.remove(&id);
                     if !terminal {
                         canceled_next.push(id.clone());

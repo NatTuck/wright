@@ -18,6 +18,7 @@ pub mod engine;
 mod ids;
 pub mod logprobs;
 pub mod metrics;
+pub mod model_share;
 pub mod output;
 pub mod parallelism;
 mod planning;

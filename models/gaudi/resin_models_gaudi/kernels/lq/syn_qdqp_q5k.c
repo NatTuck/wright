@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Q5_K planar -> bf16 for the paged MoE batch_gemm (the paged interface of syn_qdq.c -DPAGED): syn_qdqp_q4k.c with the
 // fifth code bit. Q5_K's planar superblock is Q4_K's (same params, same P4 plane) followed by the P1 plane: 16
 // groups of 256 B, group m holding bit 4 of k = 16 m + 2 t + o at bit t, in the P4 byte lanes. P4 chunk c (k =

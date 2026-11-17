@@ -7,7 +7,7 @@ the all-gathered logits on its own device, so no token broadcast is needed; the 
 output is the one the Engine reads.
 
 Prefill rows run one at a time; decode rows run as one batch of up to 16. Sampling and logprobs run on the device with Resin's
-semantics (``qwen3_5.sampling``), over the softcapped logits.
+semantics (``common.sampling``), over the softcapped logits.
 
 With a draft checkpoint (``dspark``), a decode step of up to ``dspark.MAX_ROWS`` rows drafts 3
 tokens per row from each row's anchor, verifies [anchor, drafts] in one target step and emits the
@@ -32,8 +32,23 @@ from resin.backend.resources import CachePoolBinding
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelismCapabilities
 from resin.models.mistral_large4.config import MistralLarge4Config
+from resin_models_gaudi import ranks
+from resin_models_gaudi.common.sampling import (
+    TOP_MAX,
+    Sampling,
+    plan_params,
+    plan_seeds,
+)
+from resin_models_gaudi.common.scoring import (
+    ScoreRequest,
+    Scores,
+    prompt_columns,
+    score_columns,
+    score_requests,
+)
 from resin_models_gaudi.gguf.reader import GgufModel
-from resin_models_gaudi.mistral_large4 import dspark, parallel
+from resin_models_gaudi.loading.progress import info
+from resin_models_gaudi.mistral_large4 import dspark
 from resin_models_gaudi.mistral_large4.cache import KV_GROUP, PAGE_TOKENS, CacheGeometry
 from resin_models_gaudi.mistral_large4.model import (
     MAX_T,
@@ -42,11 +57,6 @@ from resin_models_gaudi.mistral_large4.model import (
     Row,
     prefill_chunks,
 )
-from resin_models_gaudi.qwen3_5.model import Sampling, ScoreRequest, Scores
-from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner, score_requests
-from resin_models_gaudi.qwen3_5.sampling import TOP_MAX, plan_params, plan_seeds
-from resin_models_gaudi.synapse.progress import info
-from resin_models_gaudi.synapse.runtime import open_device
 
 PREFILL_CHUNK_SIZE = PREFILL_COLUMNS
 MAX_BATCH = 64  # decode rows; batches above MAX_T run as consecutive MAX_T-row steps
@@ -75,20 +85,8 @@ class MistralLarge4GaudiRunner:
         if max_batch_size > MAX_BATCH:
             raise ValueError(f"max_batch_size exceeds {MAX_BATCH}")
         self.groups = groups
-        rank, nranks = 0, 1
-        if groups is not None:
-            topo = groups.topology
-            if topo.cp > 1 or topo.ep > 1 or topo.attn_dp > 1:
-                raise ValueError(
-                    "Mistral-Large-4 on Gaudi supports tensor parallelism only"
-                )
-            rank, nranks = groups.replica.local_rank, groups.replica.size
+        self.device, rank, nranks = ranks.open_rank(groups, card, "Mistral-Large-4")
         self.rank, self.nranks = rank, nranks
-        self.device = open_device(card)
-        if groups is not None and nranks > 1:
-            parallel.hccl_rendezvous(
-                self.device, groups.rank, nranks, groups.replica.handle
-            )
         gguf = GgufModel(checkpoint)
         cfg = MistralLarge4Config.from_gguf(gguf.metadata)
         if num_layers:
@@ -109,19 +107,10 @@ class MistralLarge4GaudiRunner:
 
         def capacity(free: int) -> int:
             """the arena every rank can hold: the smallest free memory over the ranks"""
-            if groups is not None and nranks > 1:
-                import torch
-                import torch.distributed as dist
-
-                box = torch.tensor([free], dtype=torch.int64)
-                dist.all_reduce(box, op=dist.ReduceOp.MIN, group=groups.replica.handle)
-                free = int(box.item())
-            fit = geometry.capacity_for(free, geometry.block_bytes)
-            if parent_capacity is not None:
-                if parent_capacity > fit:
-                    raise ValueError(f"parent_capacity {parent_capacity} exceeds {fit}")
-                return parent_capacity
-            return fit
+            free = ranks.min_over_ranks(free, groups)
+            return ranks.requested_capacity(
+                geometry.capacity_for(free, geometry.block_bytes), parent_capacity
+            )
 
         self.model = Ml4Gaudi(
             self.device,
@@ -137,7 +126,7 @@ class MistralLarge4GaudiRunner:
         )
         gguf.close()
         if groups is not None and nranks > 1:
-            parallel.barrier(groups.replica.handle)
+            ranks.barrier(groups.replica.handle)
         self.vocab_size = cfg.vocab_size
         self.geometry = geometry
         self.cache_layout = geometry.layout(self.model.capacity)
@@ -149,6 +138,7 @@ class MistralLarge4GaudiRunner:
             prefill_chunk_size=prefill_chunk_size,
             continuation_prefill=True,
             cache_write_lookahead_tokens=self.lookahead,
+            draft_tokens=self.speculative_tokens,
             cache_layout=self.cache_layout,
         )
         self.compiles_at_start = self._compiles_seen = self.device.compile_count
@@ -290,12 +280,12 @@ class MistralLarge4GaudiRunner:
             )
         counts = np.ones(len(tok), np.int64)
         columns = (
-            Qwen3_5GaudiRunner._score_columns(params, counts, lp, top_ids, top_lp)
+            score_columns(params, counts, lp, top_ids, top_lp)
             if plan.needs_logprobs
             else {}
         )
         if prompt:
-            columns.update(Qwen3_5GaudiRunner._prompt_columns(plan, prompt_scores))
+            columns.update(prompt_columns(plan, prompt_scores))
         return ForwardOutput(
             token_ids=np.asarray(tok, np.uint32),
             token_indptr=np.arange(len(tok) + 1, dtype=np.uint32),
@@ -400,7 +390,7 @@ class MistralLarge4GaudiRunner:
         def build() -> ForwardOutput:
             tok, lp, top_ids, top_lp = staged.result()
             columns = (
-                Qwen3_5GaudiRunner._score_columns(
+                score_columns(
                     params, np.ones(B, np.int64), lp, top_ids, top_lp
                 )
                 if scores
@@ -474,7 +464,7 @@ class _Verification:
             picked = np.concatenate(
                 [r * (K + 1) + np.arange(counts[r]) for r in range(B)]
             )
-            columns = Qwen3_5GaudiRunner._score_columns(
+            columns = score_columns(
                 self._params, counts, lp[picked], top_ids[picked], top_lp[picked]
             )
         self._output = ForwardOutput(

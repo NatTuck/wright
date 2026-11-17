@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Slot attention, queries: copy each slot's M query columns out of the chunk's per-group Q.
 // Q is (256, W*G) bf16, group g's columns at g*W (column = h % hpg + hpg*t within a group, d in
 // sigma order, as attn_prep writes them); slot s takes columns qcol0 .. qcol0 + M - 1 of its group.

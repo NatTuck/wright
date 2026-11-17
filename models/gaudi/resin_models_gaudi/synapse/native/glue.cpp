@@ -116,11 +116,12 @@ static bool geom_kv_gather(const HabanaKernelParams* p, uint64_t is[5], uint32_t
 }
 
 // state_load, state_store
+// (R rows in members of 16; the kernels stop at R, which need not be a multiple of 16)
 static bool geom_state_load(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
-    is[0] = sz(p, true, 0, 1) / 16; is[1] = sz(p, true, 0, 2); *rank = 2; return true;
+    is[0] = (sz(p, true, 0, 1) + 15) / 16; is[1] = sz(p, true, 0, 2); *rank = 2; return true;
 }
 static bool geom_state_store(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
-    is[0] = sz(p, false, 2, 1) / 16; is[1] = sz(p, false, 2, 2); *rank = 2; return true;
+    is[0] = (sz(p, false, 2, 1) + 15) / 16; is[1] = sz(p, false, 2, 2); *rank = 2; return true;
 }
 
 // slot attention: attn_slot_q, attn_slot_p, attn_slot_acc, attn_acc_init, kv_store
@@ -138,13 +139,17 @@ static bool geom_slot_p1(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_slot_acc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = blocks64(sz(p, false, 4, 1)); is[1] = sz(p, false, 4, 2); *rank = 2; return true;
 }
+// attn_slot_fin: a member per 64 output columns of a group (out (256, W, G))
+static bool geom_slot_fin(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = blocks64(sz(p, true, 0, 1)); is[1] = sz(p, true, 0, 2); *rank = 2; return true;
+}
 // attn_slot_mask, attn_sdpa_acc
 static bool geom_slot_mask(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = blocks64(sz(p, true, 0, 1)); is[1] = sz(p, true, 0, 3); *rank = 2; return true;
 }
+// attn_sdpa_acc: a member per 64 query tokens of the slots, head and group
 static bool geom_sdpa_acc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
-    const uint64_t H = sz(p, false, 0, 2);
-    is[0] = blocks64(sz(p, false, 4, 1) / H); is[1] = H; is[2] = sz(p, false, 4, 2);
+    is[0] = blocks64(sz(p, false, 0, 1)); is[1] = sz(p, false, 0, 2); is[2] = sz(p, false, 4, 2);
     *rank = 3; return true;
 }
 static bool geom_acc_init(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
@@ -159,6 +164,10 @@ static bool geom_slot_out(const HabanaKernelParams* p, uint64_t is[5], uint32_t*
 }
 static bool geom_slot_out1(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = sz(p, true, 0, 1); is[1] = sz(p, true, 0, 2); *rank = 2; return true;
+}
+// ds_slot_ml8: 8 columns per member
+static bool geom_slot_out8(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = (sz(p, true, 0, 1) + 7) / 8; is[1] = sz(p, true, 0, 2); *rank = 2; return true;
 }
 static bool geom_kv_store(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = sz(p, false, 1, 1); *rank = 1; return true;
@@ -241,6 +250,15 @@ static bool geom_tok1(const HabanaKernelParams* p, uint64_t is[5], uint32_t* ran
 }
 static bool geom_blk64(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, true, 0, 0) + 63) / 64; *rank = 1; return true;
+}
+// mhc_coeft, mhc_coefp: one member per token (output 0 dim 0)
+static bool geom_out0_d0(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 0, 0); *rank = 1; return true;
+}
+// mhc_mixc: [row groups of 4, K chunks, token groups of 4] of mixp (T, 24, C)
+static bool geom_mixc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 0, 1) / 4; is[1] = sz(p, true, 0, 2); is[2] = (sz(p, true, 0, 0) + 3) / 4;
+    *rank = 3; return true;
 }
 static bool geom_nw24(const HabanaKernelParams*, uint64_t is[5], uint32_t* rank) {
     is[0] = 24; *rank = 1; return true;
@@ -330,9 +348,11 @@ static bool geom_mx4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank
 static GeomFn geom_glm(const char* n) {
     auto is = [&](const char* pre) { return strncmp(n, pre, strlen(pre)) == 0; };
     if (is("mhc_mixp")) return geom_mixp;               // (prefix: before mhc_mix)
+    if (is("mhc_mixc")) return geom_mixc;
     if (is("mhc_mix")) return geom_mhc_mix;
     if (is("mhc_res")) return geom_mhc_res;
     if (is("mhc_pre") || is("mhc_post")) return geom_tok1;
+    if (is("mhc_coeft") || is("mhc_coefp")) return geom_out0_d0;   // (prefix: before mhc_coef)
     if (is("mhc_coef")) return geom_blk64;
     if (is("kda_ck_in") || is("kda_ck_solve")) return geom_ck_out0;
     if (is("kda_ck_out")) return geom_ck_in0;
@@ -366,6 +386,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_fq4")) return geom_elem64;
     if (is("ds_cstate")) return geom_in0_cols;
     if (is("ds_slot_ml1")) return geom_slot_out1;    // (prefix: before ds_slot_ml)
+    if (is("ds_slot_ml8")) return geom_slot_out8;
     if (is("ds_slot_mld")) return geom_slot_out;
     if (is("ds_slot_ml")) return geom_slot_out;
     if (is("ds_attn_comb")) return geom_sink2;
@@ -380,9 +401,76 @@ static GeomFn geom_glm(const char* n) {
 }
 
 // by kernel family (file name prefix; longer prefixes first)
+// ---- Qwen3.8-Flash-Next (qwen4_exp): hyper connections, PLE, QSA, expert-parallel MoE
+// hc_combine: [NS = 4 streams, T] from xo (NS H, T)
+static bool geom_hc_combine(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 4; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
+}
+// work-list MoE kernels: a fixed number of members (NW in the kernels)
+static bool geom_nw48(const HabanaKernelParams*, uint64_t is[5], uint32_t* rank) {
+    is[0] = 48; *rank = 1; return true;
+}
+// moe_sum_w: [H/64, T] from y (H, T)
+static bool geom_out64(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 0, 0) / 64; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
+}
+// moe_up: [NB, K, T] from its output h (128, NB, K, T)
+static bool geom_moe_up(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 0, 1); is[1] = sz(p, true, 0, 2); is[2] = sz(p, true, 0, 3); *rank = 3; return true;
+}
+// moe_deq_p: [NOB, NIB, P] from W (256, 128, NOB, NIB, E) and the page table pe (input 2)
+static bool geom_moe_deq_p(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, false, 0, 2); is[1] = sz(p, false, 0, 3); is[2] = sz(p, false, 2, 0); *rank = 3; return true;
+}
+// moe_act_g: [N/64] row blocks of h (F, N)
+static bool geom_rows64(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = (sz(p, true, 0, 1) + 63) / 64; *rank = 1; return true;
+}
+// ple_conv: [C/64] channel blocks of xo (C, T); ple_conv_b: [C/64, T]
+static bool geom_ple_conv(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 0, 0) / 64; *rank = 1; return true;
+}
+static bool geom_ple_conv_b(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 0, 0) / 64; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
+}
+// qsa_kb: [NBc] blocks (kbs (128, 4 NBc), output 1); qsa_keys / qsa_keys_pf: [Lc / 1024, T] from K (Lc, T)
+static bool geom_qsa_kb(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 1, 1) / 4; *rank = 1; return true;
+}
+static bool geom_qsa_keys(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = (sz(p, true, 0, 0) + 1023) / 1024; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
+}
+static GeomFn geom_fnext(const char* n) {
+    auto is = [&](const char* pre) { return strncmp(n, pre, strlen(pre)) == 0; };
+    if (is("hc_combine_t")) return geom_tok1;          // (prefix: before hc_combine)
+    if (is("hc_combine")) return geom_hc_combine;
+    if (is("hc_lo") || is("hc_mix")) return geom_elem;
+    if (is("ple_hash")) return geom_one;
+    if (is("ple_cvt") || is("ple_gate")) return geom_out_tokens;
+    if (is("ple_conv_b")) return geom_ple_conv_b;      // (prefix: before ple_conv)
+    if (is("ple_conv")) return geom_ple_conv;
+    if (is("qsa_select") || is("qsa_mask_pk") || is("qsa_mask_pf")) return geom_columns;
+    if (is("qsa_keys")) return geom_qsa_keys;           // qsa_keys and qsa_keys_pf
+    if (is("qsa_kb_b")) return geom_columns;            // [B] rows (prefix: before qsa_kb)
+    if (is("qsa_kb")) return geom_qsa_kb;
+    if (is("qsa_q")) return geom_rows1;
+    if (is("moe_up_w") || is("moe_down_w")) return geom_nw48;
+    if (is("moe_sum_w")) return geom_out64;
+    if (is("moe_deq_p")) return geom_moe_deq_p;
+    if (is("moe_act_g")) return geom_rows64;
+    if (is("moe_ovf")) return geom_out_tokens;
+    if (is("moe_combine_p") || is("moe_down")) return geom_tok1;
+    if (is("moe_up")) return geom_moe_up;
+    return nullptr;
+}
+
 static GeomFn geom_for(const char* n) {
     auto is = [&](const char* pre) { return strncmp(n, pre, strlen(pre)) == 0; };
+    if (is("spec_fix")) return geom_one;
+    if (is("attn_slot_p1") || is("attn_slot_pc1") || is("attn_slot_pd1"))
+        return geom_slot_p1;  // (prefix: before attn_slot_p)
     if (GeomFn g = geom_glm(n)) return g;
+    if (GeomFn g = geom_fnext(n)) return g;
     if (is("lq_qdqp_")) return geom_qdqp;
     if (is("lq_")) return geom_param0;
     if (is("ml4_rope")) return geom_out_d12;
@@ -427,6 +515,7 @@ static GeomFn geom_for(const char* n) {
     if (is("mtp_tok")) return geom_one;
     if (is("page_store")) return geom_page_store;
     if (is("kv_gather")) return geom_kv_gather;
+    if (is("attn_slot_fin")) return geom_slot_fin;
     if (is("attn_slot_q")) return geom_slot_q;
     if (is("attn_slot_p") || is("mla_slot_p")) return geom_slot_p;
     if (is("attn_slot_acc")) return geom_slot_acc;
@@ -436,7 +525,7 @@ static GeomFn geom_for(const char* n) {
     if (is("kv_store")) return geom_kv_store;
     if (is("state_load")) return geom_state_load;
     if (is("state_store")) return geom_state_store;
-    if (is("attn_prep")) return geom_attn_prep;
+    if (is("attn_prep") || is("dfl_prep")) return geom_attn_prep;  // one member per column
     if (is("attn_softmax")) return geom_rows1;
     if (is("attn_kvcat")) return geom_kvcat;
     if (is("attn_dec_p")) return geom_dec_p;
@@ -456,7 +545,7 @@ static void amap(TensorAccessPattern& t, unsigned dim, unsigned axis, int a, int
     t.mapping[dim].start_b = float(first);
     t.mapping[dim].end_b = float(last);
 }
-// kv_gather
+// kv_gather, kv_gather8 (the same (256, C, S) slab)
 static void ap_kv_gather(const HabanaKernelParams*, HabanaKernelInstantiation* inst) {
     TensorAccessPattern& o = inst->outputTensorAccessPattern[0];
     o.allRequired = 0;
@@ -541,7 +630,7 @@ static ApFn ap_for(const char* n) {
     if (strcmp(n, "mla_gather") == 0 || strcmp(n, "mla_gather_list") == 0) return ap_mla_gather;
     if (strcmp(n, "ds_gather_list") == 0) return ap_gather8;
     if (strcmp(n, "attn_slot_q") == 0) return ap_slot_q;
-    if (strcmp(n, "kv_gather") == 0) return ap_kv_gather;
+    if (strcmp(n, "kv_gather") == 0 || strcmp(n, "kv_gather8") == 0) return ap_kv_gather;
     return nullptr;
 }
 

@@ -4,12 +4,16 @@
 //! plan and releases model-local state. Opaque payloads carry frontend metadata.
 
 pub use crate::logprobs::{LogprobView, TokenLogprobs};
-use crate::metrics::{EngineMetricsSnapshot, EngineMetricsState, RequestMetricsState};
+use crate::metrics::{
+    ContinuationOutcome, EngineMetricsSnapshot, EngineMetricsState, RequestMetricsState,
+};
 pub use crate::output::{OwnedTokenRows, TokenRows};
 use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
-use crate::resources::paged_kv::{CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources};
+use crate::resources::paged_kv::{
+    CacheMetrics, CapacityWait, PagedKvBatchView, PagedKvError, PagedKvResources, SharedCachePool,
+};
 use crate::timeshare::{Clock, DecodeShare, TimeShare};
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
@@ -21,7 +25,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -157,6 +161,18 @@ pub struct RunnerConfig {
     pub continuation_prefill: bool,
     pub cache_write_lookahead_tokens: u32,
     pub cache_layout: Option<KvLayout>,
+    /// Decode steps with more rows than this do not speculate: each row writes
+    /// and returns one token. None: any decode step may use the lookahead.
+    pub max_speculative_rows: Option<u32>,
+    /// Let a decode continuation cross cache blocks: the engine leases the next
+    /// step's pages inside the running batch's lease instead of falling back to
+    /// a synchronous step. `Some(n)` also ends a chain when a row reaches a
+    /// multiple of `n` tokens, so the engine can publish its prefixes (it
+    /// publishes only between chains). None keeps continuations within a block.
+    pub continuation_extension: Option<NonZeroU32>,
+    /// Draft tokens a speculative decode step verifies for each row, for the
+    /// step reports' acceptance figures. 0 when the runner does not speculate.
+    pub draft_tokens: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -495,6 +511,35 @@ struct PreparedProgress {
     sampled_tokens: Vec<u32>,
 }
 
+/// One request's share of a committed step, for logging.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepRow {
+    pub request_id: u64,
+    /// The first prompt or generated position this step ran.
+    pub token_start: u32,
+    /// Positions this step ran for the request: prompt tokens in prefill, one in decode.
+    pub scheduled_tokens: u32,
+    /// Generated tokens the step committed: the last prefill chunk samples one.
+    pub sampled_tokens: u32,
+    pub finished: bool,
+}
+
+/// A committed step: what ran, for whom, and how long it took from plan to commit (a
+/// continued step: from the previous commit).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepReport {
+    /// Committed steps so far, from 1.
+    pub step: u64,
+    pub phase: Phase,
+    /// Drafts each decode row verified: 0 for a step that did not speculate.
+    pub draft_tokens: u32,
+    pub elapsed: Duration,
+    pub rows: Vec<StepRow>,
+}
+
+/// Step reports kept when nobody takes them.
+const STEP_REPORT_CAPACITY: usize = 64;
+
 struct Batch<P> {
     rows: Vec<BatchRow<P>>,
     resources: Option<WriterAccessLease>,
@@ -522,6 +567,9 @@ pub struct EngineCore<P> {
     kv_resources: Option<PagedKvResources>,
     poisoned_error: Option<String>,
     closed: bool,
+    report_steps: bool,
+    step_reports: Vec<StepReport>,
+    committed_steps: u64,
 }
 
 impl<P: Clone> EngineCore<P> {
@@ -531,6 +579,27 @@ impl<P: Clone> EngineCore<P> {
         context_length: u32,
         scheduler_config: SchedulerConfig,
         prefix_cache: bool,
+    ) -> Result<Self> {
+        Self::in_pool(
+            runner_config,
+            max_running_requests,
+            context_length,
+            scheduler_config,
+            prefix_cache,
+            None,
+        )
+    }
+
+    /// An Engine whose cache comes from `pool`, which other Engines (other
+    /// models in the process) may share; `floor` slabs are reserved for it. The
+    /// runner's cache layout must declare the pool's capacity.
+    pub fn in_pool(
+        runner_config: RunnerConfig,
+        max_running_requests: usize,
+        context_length: u32,
+        scheduler_config: SchedulerConfig,
+        prefix_cache: bool,
+        pool: Option<(&SharedCachePool, u32)>,
     ) -> Result<Self> {
         let max_running_requests = NonZeroUsize::new(max_running_requests)
             .ok_or_else(|| Error::invalid("max_running_requests must be positive"))?;
@@ -543,20 +612,36 @@ impl<P: Clone> EngineCore<P> {
                 "schedule_conservativeness must be finite and non-negative",
             ));
         }
+        if let Some(interval) = runner_config.continuation_extension
+            && !runner_config.cache_layout.as_ref().is_some_and(|layout| {
+                layout
+                    .groups()
+                    .iter()
+                    .all(|group| interval.get() % group.block_tokens().get() == 0)
+            })
+        {
+            // A chain ends for publication where it would cross a block.
+            return Err(Error::invalid(
+                "continuation_extension requires cache_layout and a multiple of every block size",
+            ));
+        }
         if runner_config.cache_write_lookahead_tokens > 0 && runner_config.cache_layout.is_none() {
             return Err(Error::invalid(
                 "cache_write_lookahead_tokens requires cache_layout",
             ));
         }
+        if pool.is_some() && runner_config.cache_layout.is_none() {
+            return Err(Error::invalid("a shared cache pool requires cache_layout"));
+        }
         let kv_resources = runner_config
             .cache_layout
             .as_ref()
-            .map(|layout| {
-                if prefix_cache {
-                    PagedKvResources::with_prefix_cache(layout.clone())
-                } else {
-                    PagedKvResources::new(layout.clone())
+            .map(|layout| match pool {
+                Some((pool, floor)) => {
+                    PagedKvResources::join(pool, layout.clone(), prefix_cache, floor)
                 }
+                None if prefix_cache => PagedKvResources::with_prefix_cache(layout.clone()),
+                None => PagedKvResources::new(layout.clone()),
             })
             .transpose()?;
         if let Some(limit) = kv_resources
@@ -576,6 +661,9 @@ impl<P: Clone> EngineCore<P> {
             metrics: None,
             in_flight: None,
             continuation: None,
+            report_steps: false,
+            step_reports: Vec::new(),
+            committed_steps: 0,
             quarantined: None,
             runner_config,
             scheduler: Scheduler::new(max_running_requests),
@@ -759,6 +847,10 @@ impl<P: Clone> EngineCore<P> {
                     limit.min(self.scheduler_config.prefill_chunk_size)
                 }),
             checkpoint_alignment: self.prefix_alignment().and_then(NonZeroU32::new),
+            replay_suffix_tokens: self
+                .kv_resources
+                .as_ref()
+                .map_or(0, PagedKvResources::replay_suffix_tokens),
         }
     }
 
@@ -998,6 +1090,30 @@ impl<P: Clone> EngineCore<P> {
         self.continuation.is_some() && self.queue_allows_continuation()
     }
 
+    /// The runner config's `max_speculative_rows`: decode steps with more rows
+    /// lease no write lookahead.
+    pub fn max_speculative_rows(&self) -> Option<u32> {
+        self.runner_config.max_speculative_rows
+    }
+
+    /// Change `max_speculative_rows` between steps, for a runner that turns its
+    /// drafts off (`Some(0)`: no decode step leases a lookahead) or on again.
+    /// The next decode step leases and reports by the new limit. A request
+    /// keeps the pages that an earlier step leased past its position.
+    /// Refused while a step is in flight or a continuation is retained: their
+    /// plans hold the old lease.
+    pub fn set_max_speculative_rows(&mut self, rows: Option<u32>) -> Result<()> {
+        self.raise_if_open()?;
+        self.require_completed_step()?;
+        if self.continuation.is_some() {
+            return Err(Error::internal(
+                "Engine must drop its retained continuation first",
+            ));
+        }
+        self.runner_config.max_speculative_rows = rows;
+        Ok(())
+    }
+
     /// Harvest an enqueued result using the same atomic commit as synchronous execution.
     pub fn complete_step_with<E>(
         &mut self,
@@ -1031,12 +1147,29 @@ impl<P: Clone> EngineCore<P> {
         self.complete_batch(runner, batch, output, make_event, None)
     }
 
+    /// The cache write lookahead of one decode step of `rows` rows (the leased
+    /// positions past its tokens): none past `max_speculative_rows`.
+    fn decode_lookahead(&self, rows: usize) -> u32 {
+        match self.runner_config.max_speculative_rows {
+            Some(limit) if rows as u64 > u64::from(limit) => 0,
+            _ => self.runner_config.cache_write_lookahead_tokens,
+        }
+    }
+
+    /// The most tokens one decode step of `rows` rows may write and return per row.
+    fn decode_step_tokens(&self, rows: usize) -> u64 {
+        u64::from(self.decode_lookahead(rows)) + 1
+    }
+
     /// Retain a decode view only when another maximum-sized step cannot
-    /// allocate, rotate, replace, or publish any of its leased pages. Stops
-    /// complete logically while physical retirement waits for the next step.
-    /// The caller separately checks that its device runtime supports feedback.
+    /// allocate, rotate, replace, or publish any of its leased pages, or (with
+    /// `continuation_extension`) when the pages it needs can be leased now,
+    /// inside the running batch's lease. Stops complete logically while
+    /// physical retirement waits for the next step. The caller separately
+    /// checks that its device runtime supports feedback.
     pub fn retain_continuation(&mut self, plan: &ExecutionPlan<P>) -> bool {
-        let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
+        let maximum = self.decode_step_tokens(plan.sequence_ids.len());
+        let lookahead = u64::from(self.decode_lookahead(plan.sequence_ids.len()));
         if self.in_flight.is_none() {
             return false;
         }
@@ -1044,8 +1177,7 @@ impl<P: Clone> EngineCore<P> {
         let Some(batch) = &self.in_flight else {
             return false;
         };
-        let allowed = queue_allows
-            && batch.rows.len() == plan.sequence_ids.len()
+        let rows_allow = batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
                 !row.terminal
                     && row
@@ -1055,25 +1187,124 @@ impl<P: Clone> EngineCore<P> {
                         > 2 * maximum
                     && u64::from(row.scheduled.token_start()) + 2 * maximum
                         <= u64::from(self.context_length.get())
-            })
-            && self
-                .runner_config
-                .cache_layout
-                .as_ref()
-                .is_some_and(|layout| {
-                    layout.groups().iter().all(|group| {
-                        plan.context_lengths.iter().all(|&start| {
-                            let block = u64::from(group.block_tokens().get());
-                            u64::from(start) / block == (u64::from(start) + 2 * maximum - 1) / block
-                        })
+            });
+        let blocks_allow = self
+            .runner_config
+            .cache_layout
+            .as_ref()
+            .is_some_and(|layout| {
+                // The next step starts at most `maximum` tokens later and
+                // leases its lookahead past its token: all in this block.
+                layout.groups().iter().all(|group| {
+                    plan.context_lengths.iter().all(|&start| {
+                        let block = u64::from(group.block_tokens().get());
+                        u64::from(start) / block == (u64::from(start) + maximum + lookahead) / block
                     })
-                });
+                })
+            });
+        let mut extended = None;
+        let outcome = if !queue_allows {
+            ContinuationOutcome::Queue
+        } else if !rows_allow {
+            ContinuationOutcome::Row
+        } else if blocks_allow {
+            ContinuationOutcome::Retained
+        } else {
+            match self.extend_continuation(plan, maximum, lookahead) {
+                Ok(Some(template)) => {
+                    extended = Some(template);
+                    ContinuationOutcome::Extended
+                }
+                Ok(None) => ContinuationOutcome::Block,
+                Err(outcome) => outcome,
+            }
+        };
+        if let Some(metrics) = &mut self.metrics {
+            metrics.continuation(outcome);
+        }
+        if let Some(template) = extended {
+            self.continuation = Some(template);
+            return true;
+        }
+        let allowed = outcome == ContinuationOutcome::Retained;
         self.continuation = allowed.then(|| plan.clone());
         allowed
     }
 
+    /// The template for a continuation whose next step crosses a cache block:
+    /// `plan` with tables that cover the next step, its pages leased inside the
+    /// running batch's lease. None falls back (a synchronous next step);
+    /// `Err(Publish)` ends the chain so the engine can publish prefixes.
+    fn extend_continuation(
+        &mut self,
+        plan: &ExecutionPlan<P>,
+        maximum: u64,
+        lookahead: u64,
+    ) -> std::result::Result<Option<ExecutionPlan<P>>, ContinuationOutcome> {
+        let Some(interval) = self.runner_config.continuation_extension else {
+            return Ok(None);
+        };
+        let Some(layout) = self.runner_config.cache_layout.as_ref() else {
+            return Ok(None);
+        };
+        // A ring holds a step's read window plus its writes: the next step may
+        // start `maximum - 1` tokens before its conservative position.
+        let span = maximum + lookahead;
+        if layout.groups().iter().any(|group| {
+            group
+                .max_write_tokens()
+                .is_some_and(|tokens| span > u64::from(tokens.get()))
+        }) {
+            return Ok(None);
+        }
+        let interval = u64::from(interval.get());
+        if self
+            .kv_resources
+            .as_ref()
+            .is_some_and(PagedKvResources::prefix_cache_enabled)
+            && plan.context_lengths.iter().any(|&start| {
+                u64::from(start) / interval != (u64::from(start) + maximum) / interval
+            })
+        {
+            return Err(ContinuationOutcome::Publish);
+        }
+        let mut next_leased = Vec::with_capacity(plan.context_lengths.len());
+        for &start in &plan.context_lengths {
+            let Ok(leased) = u32::try_from(u64::from(start) + span + 1) else {
+                return Ok(None);
+            };
+            next_leased.push(leased);
+        }
+        let mut template = plan.clone();
+        let (Some(resources), Some(batch)) = (self.kv_resources.as_mut(), self.in_flight.as_mut())
+        else {
+            return Ok(None);
+        };
+        let Some(lease) = batch.resources.as_mut() else {
+            return Ok(None);
+        };
+        let mut requests = Vec::with_capacity(batch.rows.len());
+        for row in &mut batch.rows {
+            let Some(cache) = row.request.cache.as_mut() else {
+                return Ok(None);
+            };
+            requests.push(cache);
+        }
+        match resources.extend_continuation(
+            &mut requests,
+            lease,
+            &mut template.cache_groups,
+            &next_leased,
+        ) {
+            Ok(true) => Ok(Some(template)),
+            Ok(false) | Err(_) => Ok(None),
+        }
+    }
+
     /// A conservative host plan reserves the longest possible previous output;
     /// the runtime substitutes exact GPU token/position feedback before launch.
+    /// The block tables are the template's: those of the previous step, or of
+    /// the next step when it crosses a block (`extend_continuation`).
     pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
         self.raise_if_open()?;
         if self.continuation.is_none() || !self.observe_continuation() {
@@ -1088,7 +1319,8 @@ impl<P: Clone> EngineCore<P> {
             .next_batch_id
             .checked_add(1)
             .ok_or_else(|| Error::internal("batch id space is exhausted"))?;
-        let maximum = self.runner_config.cache_write_lookahead_tokens + 1;
+        let maximum = u32::try_from(self.decode_step_tokens(plan.sequence_ids.len()))
+            .expect("decode step tokens fit the lookahead's u32");
         for context in &mut plan.context_lengths {
             *context += maximum;
         }
@@ -1099,12 +1331,19 @@ impl<P: Clone> EngineCore<P> {
                 .expect("continuation keeps resources")
                 .groups(),
         ) {
-            for (offset, &position) in group
-                .append_block_offsets
-                .iter_mut()
-                .zip(&plan.context_lengths)
-            {
-                *offset = position % layout.block_tokens().get();
+            // One append a row, at its conservative position, in the block the
+            // template table holds for it (a new block when the chain crossed).
+            let block = layout.block_tokens().get();
+            for (row, &position) in plan.context_lengths.iter().enumerate() {
+                let column = (position / block)
+                    .checked_sub(group.block_table_start_indices[row])
+                    .map(|column| group.block_indptr[row] + column)
+                    .filter(|&index| index < group.block_indptr[row + 1])
+                    .ok_or_else(|| Error::internal("continuation block table misses its append"))?
+                    as usize;
+                group.append_slab_ids[row] = group.block_slab_ids[column];
+                group.append_slotnums[row] = group.block_slotnums[column];
+                group.append_block_offsets[row] = position % block;
             }
         }
         self.timeshare.launched(Phase::Decode, None);
@@ -1278,15 +1517,12 @@ impl<P: Clone> EngineCore<P> {
             .next_batch_id
             .checked_add(1)
             .ok_or_else(|| Error::internal("batch id space is exhausted"))?;
+        let lookahead = self.decode_lookahead(scheduled_rows.len());
         for row in &scheduled_rows {
             let end = row
                 .token_end()
                 .ok_or_else(|| Error::invalid("scheduled token range overflows u32"))?;
-            if row.phase == Phase::Decode
-                && end
-                    .checked_add(self.runner_config.cache_write_lookahead_tokens)
-                    .is_none()
-            {
+            if row.phase == Phase::Decode && end.checked_add(lookahead).is_none() {
                 return Err(Error::invalid("decode cache write lookahead overflows u32"));
             }
         }
@@ -1298,7 +1534,7 @@ impl<P: Clone> EngineCore<P> {
                 let scheduled_end = row.token_end().expect("validated scheduled range");
                 let context = if row.phase == Phase::Decode {
                     scheduled_end
-                        .checked_add(self.runner_config.cache_write_lookahead_tokens)
+                        .checked_add(lookahead)
                         .expect("validated decode lookahead")
                 } else {
                     scheduled_end
@@ -1317,11 +1553,55 @@ impl<P: Clone> EngineCore<P> {
             None
         };
         if let Some(error) = growth_error {
+            let batch = scheduled
+                .iter()
+                .map(|request| request.id)
+                .collect::<Vec<_>>();
             self.scheduler.restore_rejected(scheduled);
-            if matches!(error, CachePoolError::InsufficientCapacity { .. })
-                && self.retract_one(runner)?
-            {
-                return self.prepare_batch(runner, phase);
+            // The slabs come back from another process's pool: a later step takes them, with nothing retracted,
+            // unless every side waits for the others (then this side gives back a victim's slabs).
+            if matches!(error, CachePoolError::LeasePending) {
+                let decision = self
+                    .kv_resources
+                    .as_ref()
+                    .map(PagedKvResources::capacity_wait);
+                if decision == Some(CapacityWait::Yield) {
+                    self.give_way(runner)?;
+                    return Ok(None);
+                }
+                // The other side has not given for a while (a live block of its can hold the slab until its
+                // request ends): run on in this side's slabs, retracting a request of its own as with a pool of
+                // its own. Each try retracts one, so the tries end.
+                if self
+                    .kv_resources
+                    .as_ref()
+                    .is_some_and(PagedKvResources::out_of_patience)
+                    && self.retract_one(runner)?
+                {
+                    return self.prepare_batch(runner, phase);
+                }
+                return Ok(None);
+            }
+            if matches!(error, CachePoolError::InsufficientCapacity { .. }) {
+                // A request outside this batch that has not run gives back its pages before the batch waits or
+                // fails. Each try releases one, so the tries end.
+                if self.retract_one(runner)? || self.release_waiting(&batch)? {
+                    return self.prepare_batch(runner, phase);
+                }
+                // Other Engines of a shared pool hold the slabs: wait for them, or
+                // give this Engine's slabs back when they all wait for each other.
+                match self
+                    .kv_resources
+                    .as_ref()
+                    .map(PagedKvResources::capacity_wait)
+                {
+                    Some(CapacityWait::Wait) => return Ok(None),
+                    Some(CapacityWait::Yield) => {
+                        self.give_way(runner)?;
+                        return Ok(None);
+                    }
+                    Some(CapacityWait::Fail) | None => {}
+                }
             }
             return Err(Error::from(error));
         }
@@ -1338,11 +1618,7 @@ impl<P: Clone> EngineCore<P> {
                             .expect("managed requests keep their cache state"),
                     })
                     .collect::<Vec<_>>();
-                match resources.acquire(
-                    &requests,
-                    &scheduled_rows,
-                    self.runner_config.cache_write_lookahead_tokens,
-                ) {
+                match resources.acquire(&requests, &scheduled_rows, lookahead) {
                     Ok(acquired) => Some(acquired),
                     Err(error) => {
                         self.scheduler.restore_rejected(scheduled);
@@ -1385,7 +1661,7 @@ impl<P: Clone> EngineCore<P> {
             }
         };
         let batch = Batch {
-            prepared_at: self.metrics.as_ref().map(|_| Instant::now()),
+            prepared_at: Some(Instant::now()),
             launch_share,
             rows: scheduled
                 .into_iter()
@@ -1607,12 +1883,14 @@ impl<P: Clone> EngineCore<P> {
 
         // Logical progress becomes visible only after every fallible physical
         // cleanup step has completed.
-        let committed_at = self.metrics.as_ref().map(|_| Instant::now());
+        let committed_at = Instant::now();
+        let prepared_at = batch.prepared_at.expect("a prepared batch has a timestamp");
+        self.committed_steps += 1;
+        if self.report_steps {
+            self.report_step(&batch, &prepared_progress, &retired, committed_at);
+        }
         if let Some(metrics) = &mut self.metrics {
-            let now = committed_at.expect("metrics-enabled commit has a timestamp");
-            let prepared_at = batch
-                .prepared_at
-                .expect("metrics-enabled batch has a timestamp");
+            let now = committed_at;
             for ((row, progress), &finished) in
                 batch.rows.iter_mut().zip(&prepared_progress).zip(&retired)
             {
@@ -1676,6 +1954,8 @@ impl<P: Clone> EngineCore<P> {
                         .expect("decode continuation has generated tokens");
                 }
             }
+            // The next report times this continuation from this commit.
+            batch.prepared_at = Some(committed_at);
             self.in_flight = Some(batch);
             self.retain_continuation(&template);
         } else {
@@ -1696,12 +1976,66 @@ impl<P: Clone> EngineCore<P> {
         }
         let idle = !self.has_work();
         if let Some(metrics) = &mut self.metrics {
-            metrics.set_idle(
-                idle,
-                committed_at.expect("metrics-enabled commit has a timestamp"),
-            );
+            metrics.set_idle(idle, committed_at);
         }
         Ok(events)
+    }
+
+    /// Keep a [`StepReport`] for every committed step until taken. Without a
+    /// taker the newest `STEP_REPORT_CAPACITY` reports stay.
+    pub fn set_step_reports(&mut self, enabled: bool) {
+        self.report_steps = enabled;
+        if !enabled {
+            self.step_reports.clear();
+        }
+    }
+
+    pub fn take_step_reports(&mut self) -> Vec<StepReport> {
+        std::mem::take(&mut self.step_reports)
+    }
+
+    fn report_step(
+        &mut self,
+        batch: &Batch<P>,
+        progress: &[PreparedProgress],
+        retired: &[bool],
+        committed_at: Instant,
+    ) {
+        let Some(first) = batch.rows.iter().find(|row| !row.terminal) else {
+            return;
+        };
+        let phase = first.scheduled.phase;
+        let rows = batch
+            .rows
+            .iter()
+            .zip(progress)
+            .zip(retired)
+            .filter(|((row, _), _)| !row.terminal)
+            .map(|((row, progress), &finished)| StepRow {
+                request_id: row.request.id,
+                token_start: row.scheduled.token_start(),
+                scheduled_tokens: row.scheduled.token_count().get(),
+                sampled_tokens: progress.sampled_tokens.len() as u32,
+                finished,
+            })
+            .collect();
+        if self.step_reports.len() >= STEP_REPORT_CAPACITY {
+            self.step_reports.remove(0);
+        }
+        self.step_reports.push(StepReport {
+            step: self.committed_steps,
+            phase,
+            draft_tokens: match phase {
+                Phase::Decode if self.decode_lookahead(batch.rows.len()) > 0 => {
+                    self.runner_config.draft_tokens
+                }
+                _ => 0,
+            },
+            elapsed: committed_at.saturating_duration_since(
+                batch.prepared_at.expect("a prepared batch has a timestamp"),
+            ),
+            rows,
+        });
     }
 
     pub fn cancel(&mut self, runner: &mut impl Runner<P>, request: &RequestHandle) -> Result<bool> {
@@ -1864,6 +2198,7 @@ impl<P: Clone> EngineCore<P> {
             return Ok(selected.len());
         }
 
+        let capacity = resources.admission_capacity();
         let mut estimate = resources.admission_estimate();
         let running = self
             .scheduler
@@ -1883,9 +2218,7 @@ impl<P: Clone> EngineCore<P> {
             let parents = estimate
                 .include(request.cache.as_ref(), self.estimated_context(request))
                 .map_err(Error::from)?;
-            if parents > u64::from(resources.parent_capacity())
-                && (running_count != 0 || admitted != 0)
-            {
+            if parents > capacity && (running_count != 0 || admitted != 0) {
                 break;
             }
             admitted += 1;
@@ -1920,18 +2253,124 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn retract_one(&mut self, runner: &mut impl Runner<P>) -> Result<bool> {
+        self.retract_victim(runner, 1)
+    }
+
+    /// Give way to Engines that wait for this one's slabs. Across a slab boundary, the requests with pages in
+    /// this side's edge slab give them back (one running request, every waiting one), and the slab goes if it is
+    /// empty then; a side with no edge slab to give (its floor, or a slab it gave that the boundary has not passed)
+    /// gives nothing. Without a boundary, one running request is retracted, or one waiting request releases its
+    /// pages.
+    fn give_way(&mut self, runner: &mut impl Runner<P>) -> Result<()> {
+        let (boundary, edge) = self
+            .kv_resources
+            .as_ref()
+            .map_or((false, None), |resources| {
+                (resources.has_boundary(), resources.edge_slab())
+            });
+        if boundary {
+            let Some(edge) = edge else {
+                return Ok(());
+            };
+            let in_edge = |request: &Request<P>| {
+                request.cache.as_ref().is_some_and(|pages| {
+                    pages.groups().iter().any(|group| {
+                        group
+                            .pages()
+                            .iter()
+                            .any(|page| page.handle().parent() == edge)
+                    })
+                })
+            };
+            self.retract_where(runner, 0, in_edge)?;
+            while self.release_where(in_edge)? {}
+        } else if !self.retract_victim(runner, 0)? {
+            self.release_waiting(&[])?;
+        }
+        if let Some(resources) = self.kv_resources.as_ref() {
+            resources.serve_boundary()?;
+        }
+        Ok(())
+    }
+
+    /// Give back the pages of a request that has not run yet and is not in `keep`: the prefix that it restored
+    /// when it was submitted, and the growth of a batch that did not start. The latest request in turn order goes
+    /// first. It computes its prompt from the start when it runs. Returns false when no such request holds pages.
+    fn release_waiting(&mut self, keep: &[u64]) -> Result<bool> {
+        self.release_where(|request| !keep.contains(&request.id))
+    }
+
+    /// Release the pages of the latest waiting request that `eligible` accepts (see `release_waiting`).
+    fn release_where(&mut self, eligible: impl Fn(&Request<P>) -> bool) -> Result<bool> {
+        let Some(request_id) = self
+            .scheduler
+            .iter()
+            .filter(|request| {
+                !request.is_running()
+                    && eligible(request)
+                    && request.cache.as_ref().is_some_and(|pages| {
+                        pages.groups().iter().any(|group| !group.pages().is_empty())
+                    })
+            })
+            .max_by_key(|request| request.turn_ordinal)
+            .map(|request| request.id)
+        else {
+            return Ok(false);
+        };
+        let index = self
+            .scheduler
+            .position(|request| request.id == request_id)
+            .expect("selected waiting request remains ready");
+        let mut request = self.scheduler.remove(index);
+        let pages = request
+            .cache
+            .as_mut()
+            .expect("selected waiting request owns managed cache state");
+        if let Err(error) = self
+            .kv_resources
+            .as_mut()
+            .expect("managed cache state keeps its allocator")
+            .reset(pages)
+        {
+            self.scheduler.restore(index, request);
+            let error = Error::from(error);
+            self.poison("native cache reset failed for a waiting request", &error);
+            return Err(error);
+        }
+        request.resident_tokens = 0;
+        request
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cached_tokens = 0;
+        self.scheduler.restore(index, request);
+        Ok(true)
+    }
+
+    /// Retract one running request while more than `keep` run.
+    fn retract_victim(&mut self, runner: &mut impl Runner<P>, keep: usize) -> Result<bool> {
+        self.retract_where(runner, keep, |_| true)
+    }
+
+    /// Retract one running request that `eligible` accepts, while more than `keep` run.
+    fn retract_where(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        keep: usize,
+        eligible: impl Fn(&Request<P>) -> bool,
+    ) -> Result<bool> {
         let running_count = self
             .scheduler
             .iter()
             .filter(|request| request.is_running())
             .count();
-        if running_count <= 1 {
+        if running_count <= keep {
             return Ok(false);
         }
         let Some(request_id) = self
             .scheduler
             .iter()
-            .filter(|request| request.is_running() && request.cache.is_some())
+            .filter(|request| request.is_running() && request.cache.is_some() && eligible(request))
             .min_by_key(|request| (request.generated.len(), Reverse(request.prompt.len())))
             .map(|request| request.id)
         else {
@@ -2175,6 +2614,7 @@ impl<P: Clone> EngineCore<P> {
                 rows.len()
             )));
         }
+        let maximum = self.decode_step_tokens(rows.len());
         for (row, tokens) in rows.iter().zip(token_rows.iter()) {
             if tokens.is_empty() {
                 return Err(Error::internal("runner returned an empty token row"));
@@ -2184,7 +2624,6 @@ impl<P: Clone> EngineCore<P> {
                     "speculative token rows are only supported during decode",
                 ));
             }
-            let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
             if row.request.cache.is_some() && tokens.len() as u64 > maximum {
                 return Err(Error::internal(format!(
                     "runner returned {} decode tokens but leased cache space for at most {maximum}",
@@ -2419,6 +2858,7 @@ mod tests {
             max_batch_tokens: config.max_batch_tokens,
             prefill_chunk_size: config.prefill_chunk_size,
             checkpoint_alignment: None,
+            replay_suffix_tokens: 0,
         }
     }
     #[test]

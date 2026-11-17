@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // ds_xact_lin for prefill pages, one member per page (DeepSeek-V4.1 widths: w = 288 = 256 + a 32-row tail): the
 // page's expert scales are read once, then its rows two at a time up to its first unused row (scale 0; an
 // expert's rows fill its pages from the start). Same values as ds_xact_lin (R = 0).

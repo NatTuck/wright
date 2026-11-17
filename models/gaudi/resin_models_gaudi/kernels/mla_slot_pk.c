@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA slot attention softmax partials with the DSA top-k (Mistral-Large-4): attn_slot_p, where a
 // visible key i of a slot also needs mkey(score[key0 + i, col]) >= thr[col] (the indexer's
 // selection for the column's token: ix_slot_acc scores, ix_thr thresholds; column col = qtok0 +

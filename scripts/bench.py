@@ -29,7 +29,14 @@ import torch.distributed as dist
 
 import resin
 from deploy.gaudi_cli import add_gaudi_arguments, apply_gaudi_arguments
-from deploy.models import MODEL_SPECS, create_runner, get_model, require_checkpoint
+from deploy.models import (
+    MODEL_SPECS,
+    check_cache_types,
+    create_runner,
+    default_draft_tokens,
+    get_model,
+    require_checkpoint,
+)
 from resin import Engine, Parallelism, SchedulerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
@@ -44,18 +51,22 @@ def _synapse_trace(*args, **kwargs):
     return synapse_trace(*args, **kwargs)
 
 
-def _runner(model, checkpoint, *, device, groups, cases, options, context_capacity):
+def _runner(
+    model, checkpoint, *, device, groups, cases, options, context_capacity, native_ranks=None
+):
     return create_runner(
         get_model(model),
         checkpoint,
         device=device,
         groups=groups,
+        native_ranks=native_ranks,
         context_length=context_capacity,
         max_batch_size=max(case.batch_size for case in cases),
         prefill_chunk_size=options["prefill_chunk_size"],
         draft_tokens=options["draft_tokens"],
         gpu_memory_utilization=options["gpu_memory_utilization"],
         assistant_checkpoint=options.get("assistant_checkpoint"),
+        cache_types=options.get("cache_types"),
     )
 
 
@@ -147,6 +158,7 @@ def _cache_preflight(raw, cases, options, groups=None):
             dict(
                 rank=rank,
                 capacity=None if plan is None else asdict(plan),
+                parent_capacity=layout.parent_capacity,
                 cases=requirements,
             )
         ),
@@ -257,6 +269,120 @@ def _text_workloads(raw, spec, checkpoint, options) -> list:
     return workloads
 
 
+# a grid prompt is the grid's context and then the template's closing tokens; the capacity
+# and the cache checks reserve this many for them
+GRID_TAIL_TOKENS = 256
+# the families whose runner switches its drafts at run time (``drafting``)
+SWITCHED_DRAFT_FAMILIES = ("deepseek_v41",)
+
+
+def _grid_texts(raw, spec, checkpoint, options, grid) -> list:
+    """The grid's text workloads: every prompt file with every sampling mode and seed, and the
+    prompt stream of each row (``resin.bench.GridText``). Row r takes passage r mod n of its
+    file (n passages), from a token offset that differs for each r div n."""
+    import numpy as np
+
+    from deploy.models import create_recipe
+    from resin.bench import GridText, grid_rows
+    from resin.recipe import Message, RenderOptions, Role, Text
+
+    recipe = create_recipe(
+        spec,
+        checkpoint,
+        runner=raw,
+        tokenizer_checkpoint=options.get("tokenizer_checkpoint"),
+    )
+    render_options = RenderOptions(**options["render_options"])
+
+    def render(instruction: str, passage: str) -> list[int]:
+        message = Message(Role.USER, [Text(f"{instruction}\n\n{passage}")])
+        return list(recipe.render([message], options=render_options).token_ids)
+
+    longest = max(grid.cells())
+    rows_needed = grid_rows(grid)
+    texts = []
+    for name, path in options["prompt_files"].items():
+        rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
+        first, second = (render(rows[0]["instruction"], p) for p in ("x", "y"))
+        size = 0
+        while size < min(len(first), len(second)) and first[-1 - size] == second[-1 - size]:
+            size += 1
+        tail = tuple(first[len(first) - size :])
+        if not tail or len(tail) > GRID_TAIL_TOKENS:
+            raise ValueError(f"{name}: the template's closing tokens are {len(tail)} tokens")
+        slots = -(-rows_needed // len(rows))  # offsets per passage
+        encoded: dict[int, list[int]] = {}
+        streams: dict[int, np.ndarray] = {}
+
+        def stream(row: int, length: int, rows=rows, encoded=encoded, streams=streams, tail=tail):
+            if row not in streams:
+                index, slot = row % len(rows), row // len(rows)
+                if index not in encoded:
+                    # a passage too short for every slot takes the next passages after it
+                    text, ids, extra = rows[index]["text"], [], 0
+                    while True:
+                        ids = recipe.tokenizer.encode(text)
+                        if len(ids) >= longest + 256 * slots or extra == len(rows) - 1:
+                            break
+                        extra += 1
+                        text += "\n\n" + rows[(index + extra) % len(rows)]["text"]
+                    encoded[index] = ids
+                ids = encoded[index]
+                step = max(1, (len(ids) - longest) // slots)
+                start = slot * step
+                piece = ids[start : start + longest]
+                prompt = render(rows[index]["instruction"], recipe.tokenizer.decode(piece))
+                if tuple(prompt[len(prompt) - len(tail) :]) != tail:
+                    raise ValueError(f"{name} row {row}: the prompt does not end with the closing tokens")
+                body = prompt[: len(prompt) - len(tail)]
+                if len(body) < longest:
+                    raise ValueError(
+                        f"{name} row {row}: passage {index} from token {start} gives "
+                        f"{len(body)} of the {longest} prompt tokens"
+                    )
+                streams[row] = np.asarray(body, dtype=np.uint32)
+            return streams[row][:length]
+
+        from resin.bench import TextWorkload
+
+        def workload(mode: str, seed: int | None) -> TextWorkload:
+            sampled = mode != "greedy"
+            return TextWorkload(
+                name=f"{name}/{mode}",
+                prompts=lambda index, context: [],
+                stop_token_ids=tuple(recipe.stop_token_ids),
+                output_tokens=options["text_output_tokens"],
+                steps=options["text_steps"],
+                temperature=options["temperature"] if sampled else 0.0,
+                top_k=options["top_k"] if sampled else None,
+                top_p=options["top_p"] if sampled else 1.0,
+                seed=seed,
+            )
+
+        for mode in options["text_modes"]:
+            seeds = [None] if mode == "greedy" else options["text_seeds"]
+            for seed in seeds:
+                texts.append(GridText(workload(mode, seed), stream, tail))
+    return texts
+
+
+def draft_name(spec, draft_tokens: int, assistant) -> str:
+    """A draft configuration's name in the results: none, mtpK, dsparkK, dflashK or dspineK."""
+    if not draft_tokens:
+        return "none"
+    if spec.family in ("deepseek_v41", "mistral_large4"):
+        return f"dspark{draft_tokens}"
+    if assistant is None:
+        return f"mtp{draft_tokens}"
+    config = json.loads((Path(assistant) / "config.json").read_text())
+    kind = (
+        "dspine"
+        if (config.get("dflash_config") or {}).get("selected_prefix_code_bridge")
+        else "dflash"
+    )
+    return f"{kind}{draft_tokens}"
+
+
 def _rank(
     rank,
     port,
@@ -304,8 +430,15 @@ def _run_rank(
 
         # The profiler is configured before the device opens and armed per trace.
         enable_profiler(Path(tempfile.mkdtemp(prefix="resin-synapse-profiler-")))
-    groups = None
-    if topology.world_size > 1:
+    groups = native = None
+    if topology.world_size > 1 and options.get("step_transport") == "native":
+        from resin._resin import GaudiRanks
+
+        # the native rank group: HCCL, the capacity and barriers at the start, then each runner call; no Gloo
+        native = GaudiRanks(
+            options["native_path"], options["native_token"], rank, topology.world_size, timeout=3600.0
+        )
+    elif topology.world_size > 1:
         # A Gloo control plane; the runner owns HCCL. Loading takes minutes per rank.
         dist.init_process_group(
             "gloo",
@@ -335,6 +468,7 @@ def _run_rank(
         cases=cases,
         options=options,
         context_capacity=capacity,
+        native_ranks=native,
     )
     # A batch is a cohort per attention replica; never exceed the runner's
     # supported flattened row count when prefill spans several requests.
@@ -367,16 +501,26 @@ def _run_rank(
         "context_capacity": capacity,
         "max_batch_tokens": prefill_budget,
     }
+    if options.get("grid"):
+        metadata["grid"] = {
+            key: options["grid"][key]
+            for key in ("row_contexts", "row_streams", "column_contexts", "column_streams", "reuse")
+        }
     engine_options: dict[str, Any] = dict(
         max_running_requests=max(case.batch_size for case in cases),
         context_length=capacity,
-        prefix_cache=any(case.shared_prefix_tokens for case in cases),
+        # the grid keeps its prompts in the prefix cache
+        prefix_cache=bool(options.get("grid"))
+        or any(case.shared_prefix_tokens for case in cases),
         enable_overlap=options.get("overlap", True),
         scheduler_config=SchedulerConfig(
             max_batch_tokens=prefill_budget,
             prefill_chunk_size=options["prefill_chunk_size"],
         ),
     )
+    if native is not None and rank > 0:
+        raw.serve()  # rank 0's native executor sends every runner call
+        os._exit(0)
     worker = None if groups is None else DistributedWorker(observed, groups)
     if groups is not None and worker is not None and not groups.is_driver:
         worker.serve()
@@ -387,38 +531,55 @@ def _run_rank(
         else DistributedEngine(worker, **engine_options)
     )
     try:
-        # A seeded synthetic prompt avoids tokenization overhead and special
-        # token stops. Every replica has distinct, reproducible input tokens.
-        generator = torch.Generator().manual_seed(41 + rank)
-        prompt = torch.randint(
-            1000, min(30_000, raw.vocab_size), (capacity,), generator=generator
-        ).tolist()
-        run_sweep(
-            engine,
-            cases,
-            runner=observed,
-            prompt_tokens=prompt,
-            workloads=_text_workloads(raw, spec, checkpoint, options),
-            warmup_steps=options["warmup_steps"],
-            measure_steps=options["measure_steps"],
-            gpu_count=topology.world_size,
-            attn_dp=topology.attn_dp,
-            synchronize=synchronize,
-            reduce_step=None if groups is None else distributed_reducer(groups),
-            metadata=metadata,
-            on_result=_result_callback(report_path) if rank == 0 else None,
-            trace_step=(
-                None
-                if options.get("trace_dir") is None
-                else _synapse_trace(
-                    options["trace_dir"],
-                    rank,
-                    metadata,
-                    device=raw.device,
-                    decode_passes=2 + int(overlap),
-                )
-            ),
-        )
+        if options.get("grid"):
+            _run_grid(
+                engine,
+                raw,
+                observed,
+                spec,
+                checkpoint,
+                cases,
+                options,
+                metadata=metadata,
+                report_path=report_path,
+                synchronize=synchronize,
+                reduce_step=None if groups is None else distributed_reducer(groups),
+                gpu_count=topology.world_size,
+                budget=prefill_budget,
+            )
+        else:
+            # A seeded synthetic prompt avoids tokenization overhead and special
+            # token stops. Every replica has distinct, reproducible input tokens.
+            generator = torch.Generator().manual_seed(41 + rank)
+            prompt = torch.randint(
+                1000, min(30_000, raw.vocab_size), (capacity,), generator=generator
+            ).tolist()
+            run_sweep(
+                engine,
+                cases,
+                runner=observed,
+                prompt_tokens=prompt,
+                workloads=_text_workloads(raw, spec, checkpoint, options),
+                warmup_steps=options["warmup_steps"],
+                measure_steps=options["measure_steps"],
+                gpu_count=topology.world_size,
+                attn_dp=topology.attn_dp,
+                synchronize=synchronize,
+                reduce_step=None if groups is None else distributed_reducer(groups),
+                metadata=metadata,
+                on_result=_result_callback(report_path) if rank == 0 else None,
+                trace_step=(
+                    None
+                    if options.get("trace_dir") is None
+                    else _synapse_trace(
+                        options["trace_dir"],
+                        rank,
+                        metadata,
+                        device=raw.device,
+                        decode_passes=2 + int(overlap),
+                    )
+                ),
+            )
     finally:
         # Closing a poisoned domain still tells followers to stop. Preserve the
         # original failure/report if close repeats that same domain error.
@@ -429,8 +590,78 @@ def _run_rank(
             if not failed:
                 raise
     # Every rank exits together, so the runners release their cards together.
-    if groups is not None:
+    if native is not None:
+        raw.close()  # the followers stop serving
+    if groups is not None or native is not None:
         os._exit(0)
+
+
+def _run_grid(
+    engine,
+    raw,
+    observed,
+    spec,
+    checkpoint,
+    cases,
+    options,
+    *,
+    metadata,
+    report_path,
+    synchronize,
+    reduce_step,
+    gpu_count,
+    budget,
+):
+    """The driver's grid (``resin.bench.run_grid``): the cells that the cache checks kept, each
+    draft configuration of ``options["grid"]["drafts"]``, the progress file of each row."""
+    from resin.bench import Chunking, CrossGrid, DraftConfig, run_grid, set_drafting
+
+    settings = options["grid"]
+    grid = CrossGrid(
+        **{
+            key: tuple(settings[key])
+            for key in ("row_contexts", "row_streams", "column_contexts", "column_streams")
+        }
+    )
+    kept = {
+        (case.context_length - GRID_TAIL_TOKENS, case.batch_size)
+        for case in cases
+        if case.phase == "decode"
+    }
+    rows = raw.runner_config.max_speculative_rows
+    drafts = settings["drafts"]
+    assistant = options.get("assistant_checkpoint")
+    configs = [
+        DraftConfig(
+            draft_name(spec, k, assistant), k, rows=rows if len(drafts) > 1 and k else None
+        )
+        for k in drafts
+    ]
+    switch = None
+    if len(configs) > 1:
+        if not hasattr(raw, "drafting"):
+            raise ValueError(f"{spec.name}'s runner cannot switch its drafts at run time")
+        switch = lambda config: set_drafting(  # noqa: E731
+            engine, raw, config.draft_tokens > 0, rows
+        )
+    run_grid(
+        engine,
+        grid,
+        _grid_texts(raw, spec, checkpoint, options, grid),
+        runner=observed,
+        chunking=Chunking.of(raw, options["prefill_chunk_size"], budget),
+        configs=configs,
+        switch=switch,
+        fits=lambda context, streams: (context, streams) in kept,
+        reuse=settings["reuse"],
+        phases=options.get("phases", ("prefill", "decode")),
+        warmup_steps=options["warmup_steps"],
+        gpu_count=gpu_count,
+        synchronize=synchronize,
+        reduce_step=reduce_step,
+        metadata=metadata,
+        on_result=_result_callback(report_path),
+    )
 
 
 def _validate_configuration(model, cases, topology, options):
@@ -454,6 +685,7 @@ def _validate_configuration(model, cases, topology, options):
         raise ValueError("accepted_drafts must be an integer or None")
     if not 0 < options["gpu_memory_utilization"] < 1:
         raise ValueError("gpu_memory_utilization must be between zero and one")
+    check_cache_types(spec, options.get("cache_types"))
     if topology.world_size != spec.world_size:
         raise ValueError(f"{model} runs on {spec.world_size} Gaudi cards")
     if (
@@ -494,16 +726,26 @@ def run_benchmark(
     assistant_checkpoint: str | Path | None = None,
     progress_path: str | Path | None = None,
     text: dict | None = None,
+    step_transport: Literal["gloo", "native"] = "gloo",
+    cache_types: tuple[str | None, str | None] | None = None,
+    grid: dict | None = None,
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep.
 
     ``progress_path`` optionally retains a JSON array of completed cases even
     if a later case or worker fails. It must be a new file. Updates happen
     outside timing; successful results also include worker NUMA placement.
+    ``cache_types``: the types of the K and V cache pages (None: the model's); the results' metadata names
+    them.
+    ``grid``: measure ``resin.bench.run_grid``'s cross grid in place of ``cases`` (these then only size the
+    runner and check the cache): the ``CrossGrid`` lists, ``reuse``, and ``drafts``, the draft tokens of each
+    configuration (0,K: off and on, one load).
     """
     spec = get_model(model)
+    cache_types = check_cache_types(spec, cache_types)
     topology = parallelism or Parallelism()
-    draft_tokens = spec.draft_tokens if draft_tokens is None else draft_tokens
+    if draft_tokens is None:
+        draft_tokens = default_draft_tokens(spec, assistant_checkpoint)
     options = dict(
         draft_tokens=draft_tokens,
         accepted_drafts=accepted_drafts,
@@ -511,10 +753,13 @@ def run_benchmark(
         measure_steps=measure_steps,
         prefill_chunk_size=prefill_chunk_size,
         gpu_memory_utilization=gpu_memory_utilization,
-        metadata=metadata or {},
+        metadata={**(metadata or {}), "cache_types": list(cache_types)},
+        cache_types=cache_types,
         overlap=overlap,
         numa=numa,
         trace_dir=trace_dir,
+        step_transport=step_transport,
+        grid=grid,
         assistant_checkpoint=None
         if assistant_checkpoint is None
         else str(assistant_checkpoint),
@@ -532,6 +777,9 @@ def run_benchmark(
             with output.open("x") as stream:
                 stream.write("[]")
         port = 0
+        # the native rank group's socket (rank 0 listens) and run token
+        options["native_path"] = str(Path(directory) / "ranks")
+        options["native_token"] = os.urandom(16)
         if topology.world_size > 1:
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))
@@ -626,6 +874,22 @@ def _integers(value: str) -> list[int]:
     return list(dict.fromkeys(values))
 
 
+def _integers_or_none(value: str) -> list[int]:
+    return [] if value.strip().lower() == "none" else _integers(value)
+
+
+def _draft_list(value: str) -> list[int]:
+    try:
+        values = [int(part) for part in value.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated integers >= 0"
+        ) from None
+    if not values or any(item < 0 for item in values):
+        raise argparse.ArgumentTypeError("draft tokens must be integers >= 0")
+    return list(dict.fromkeys(values))
+
+
 def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=MODEL_SPECS, required=True)
@@ -681,8 +945,9 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shared-prefix-tokens", type=int, default=0)
     parser.add_argument(
         "--draft-tokens",
-        type=int,
-        help="draft positions; defaults to model configuration",
+        type=_draft_list,
+        help="draft positions; defaults to model configuration. With --grid, 0,K measures "
+        "each cell with the drafts off and on in one load (DeepSeek-V4.1: its DSpark switch)",
     )
     parser.add_argument(
         "--accepted-drafts",
@@ -697,6 +962,12 @@ def argument_parser() -> argparse.ArgumentParser:
         help="execution chunk size, separate from prompt length (default: model preset, at least 4096; subject to kernel limits)",
     )
     parser.add_argument("--gpu-memory-utilization", type=float)
+    for kind in ("k", "v"):
+        parser.add_argument(
+            f"--cache-type-{kind}",
+            choices=("bf16", "fp8"),
+            help=f"type of the {kind.upper()} cache pages (default: the model's)",
+        )
     text = parser.add_argument_group(
         "real text", "decode real passages in place of the synthetic prompt"
     )
@@ -746,10 +1017,46 @@ def argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip points that do not fit the KV cache in place of failing the run",
     )
+    grid = parser.add_argument_group(
+        "grid",
+        "decode a grid of cells on real text, growing the prompts from context to context "
+        "and decoding subsets of them (needs --prompt-file); in place of the phase options",
+    )
+    grid.add_argument(
+        "--grid",
+        choices=("cross",),
+        help="cross: rows (each --grid-row-contexts at each --grid-row-streams) and "
+        "columns (each --grid-column-streams at each --grid-column-contexts)",
+    )
+    for name, default, what in (
+        ("row-contexts", "2048,4096,8192,16384,32768,65536", "the rows' contexts"),
+        ("row-streams", "1,8", "the rows' stream counts"),
+        ("column-contexts", "4096,65536", "the columns' contexts"),
+        ("column-streams", "1,2,4,8,16,32,64", "the columns' stream counts"),
+    ):
+        grid.add_argument(
+            f"--grid-{name}",
+            type=_integers_or_none,
+            help=f"{what} (default: {default}; none for no rows or columns)",
+        )
+    grid.add_argument(
+        "--grid-reuse",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="grow the prompts and decode subsets of them; --no-grid-reuse prefills each "
+        "cell from an empty prefix cache (to check the method)",
+    )
     parser.add_argument(
         "--overlap", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--numa", choices=("auto", "off", "required"), default="auto")
+    parser.add_argument(
+        "--step-transport",
+        choices=("gloo", "native"),
+        default="gloo",
+        help="how a multi-card model's ranks exchange each step: Gloo (the Python DistributedWorker), or native: "
+        "rank 0's native executor sends each runner call to the others (Qwen3.5/3.8, DeepSeek-V4.1 and GLM-5.3-Flash)",
+    )
     parser.add_argument(
         "--trace-dir",
         type=Path,
@@ -794,28 +1101,78 @@ def _configuration(args):
         or args.batch_sizes
         or [1, 2, 4, 8, 16, 32, 64],
     }
-    cases = [
-        asdict(
-            BenchCase(
-                phase=phase,
-                context_length=context,
-                batch_size=batch,
-                shared_prefix_tokens=args.shared_prefix_tokens,
+    drafts = (
+        [default_draft_tokens(spec, args.assistant_checkpoint)]
+        if args.draft_tokens is None
+        else args.draft_tokens
+    )
+    grid = None
+    if args.grid is not None:
+        from resin.bench import CrossGrid
+
+        defaults = CrossGrid()
+        lists = {
+            name: getattr(defaults, name)
+            if getattr(args, f"grid_{name}") is None
+            else tuple(getattr(args, f"grid_{name}"))
+            for name in ("row_contexts", "row_streams", "column_contexts", "column_streams")
+        }
+        CrossGrid(**lists)  # check the lists
+        if not args.prompt_file:
+            raise ValueError("--grid decodes real text: give --prompt-file")
+        if args.trace_dir is not None or args.shared_prefix_tokens:
+            raise ValueError("--grid takes no --trace-dir or --shared-prefix-tokens")
+        if args.accepted_drafts is not None:
+            raise ValueError("--grid measures natural acceptance only")
+        if parallelism.attn_dp != 1:
+            raise ValueError("--grid runs one attention replica")
+        grid = dict(lists, reuse=args.grid_reuse, drafts=drafts)
+        cells = CrossGrid(**lists).cells()
+        # the cache checks and the capacity: each cell's prompts with their closing tokens
+        cases = [
+            asdict(BenchCase(phase="decode", context_length=c + GRID_TAIL_TOKENS, batch_size=n))
+            for c, streams in cells.items()
+            for n in streams
+        ]
+        if "prefill" in phases:
+            cases += [
+                asdict(BenchCase(phase="prefill", context_length=c + GRID_TAIL_TOKENS, batch_size=1))
+                for c in cells
+            ]
+    else:
+        cases = [
+            asdict(
+                BenchCase(
+                    phase=phase,
+                    context_length=context,
+                    batch_size=batch,
+                    shared_prefix_tokens=args.shared_prefix_tokens,
+                )
             )
-        )
-        for phase in dict.fromkeys(phases)
-        for context in contexts[phase]
-        for batch in batches[phase]
-    ]
+            for phase in dict.fromkeys(phases)
+            for context in contexts[phase]
+            for batch in batches[phase]
+        ]
+    if len(drafts) > 1:
+        if grid is None or len(drafts) != 2 or 0 not in drafts:
+            raise ValueError(
+                "several --draft-tokens values: 0,K with --grid only (drafts off and on)"
+            )
+        if spec.family not in SWITCHED_DRAFT_FAMILIES:
+            raise ValueError(
+                f"--draft-tokens 0,K: {spec.name} cannot switch its drafts at run time "
+                "(one load for each draft configuration)"
+            )
+        if parallelism.world_size > 1 and args.step_transport != "native":
+            raise ValueError("--draft-tokens 0,K on several cards needs --step-transport native")
     chunk = (
         spec.prefill_chunk_size
         if args.prefill_chunk_size is None
         else args.prefill_chunk_size
     )
     options = dict(
-        draft_tokens=spec.draft_tokens
-        if args.draft_tokens is None
-        else args.draft_tokens,
+        draft_tokens=max(drafts),
+        grid=grid,
         accepted_drafts=args.accepted_drafts,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
@@ -825,6 +1182,8 @@ def _configuration(args):
         else args.gpu_memory_utilization,
         overlap=args.overlap,
         numa=args.numa,
+        step_transport=args.step_transport,
+        cache_types=(args.cache_type_k, args.cache_type_v),
         text=dict(
             tokenizer_checkpoint=None
             if args.tokenizer_checkpoint is None
@@ -838,7 +1197,8 @@ def _configuration(args):
             text_steps=args.text_steps,
             text_output_tokens=args.text_output_tokens,
             render_options=args.render_options,
-            skip_unfit=args.skip_unfit,
+            skip_unfit=args.skip_unfit or grid is not None,
+            phases=phases,
         ),
     )
     _validate_configuration(spec.name, cases, parallelism, options)

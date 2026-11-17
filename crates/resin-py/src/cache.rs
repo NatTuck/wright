@@ -10,6 +10,148 @@ use pyo3::types::PyTuple;
 use resin_core::resources::kv::{
     KvGroupFamily, KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError, KvRetention,
 };
+use resin_core::resources::paged_kv::{SharedCachePool, SlabScrub, WeakCachePool};
+
+/// A pool of equal-sized cache slabs that several Engines share: one Engine
+/// for each model that the process serves.
+///
+/// Give it to each Engine (`Engine(..., cache_pool=pool)`). Every runner's
+/// `CacheLayout` must declare `parent_capacity` slabs, and all of them address
+/// one device arena. A slab belongs to one Engine while it holds that Engine's
+/// blocks and returns to the pool when it is free. When an Engine needs a slab
+/// and none is free, the least recently used cached prefix of any Engine goes
+/// first; no Engine evicts another Engine's live requests. An Engine whose
+/// growth finds no slab waits while other Engines' live requests hold them.
+/// `cache_floor` reserves slabs for an Engine.
+///
+/// With `boundary` (a side of a `SlabTable`), the pool shares the arena with pools in other processes: it places
+/// blocks only in its side of the table's boundary slab, and when the other side wants slabs it gives its edge
+/// slab (after evicting the prefixes in it), so the boundary moves. A thread of its own does that work between
+/// steps. `scrub(slabs)` (a list of slab ids), if given, clears those slabs on the device and returns when they
+/// are clear: the pool calls it for every slab that it gains or gives, before the slab is used on either side.
+#[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
+pub(crate) struct CachePool {
+    pub(crate) inner: SharedCachePool,
+}
+
+#[pymethods]
+impl CachePool {
+    #[new]
+    #[pyo3(signature = (parent_capacity, *, boundary = None, scrub = None))]
+    fn new(
+        parent_capacity: u32,
+        boundary: Option<PyRef<'_, BoundarySide>>,
+        scrub: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let error = |error: resin_core::resources::paged::CachePoolError| {
+            PyValueError::new_err(error.to_string())
+        };
+        let inner = match boundary {
+            None if scrub.is_some() => {
+                return Err(PyValueError::new_err(
+                    "scrub clears the slabs of a boundary",
+                ));
+            }
+            None => SharedCachePool::new(parent_capacity).map_err(error)?,
+            Some(side) => {
+                let scrub =
+                    scrub.map(|callback| Arc::new(PythonScrub(callback)) as Arc<dyn SlabScrub>);
+                let pool =
+                    SharedCachePool::with_boundary(parent_capacity, side.boundary.clone(), scrub)
+                        .map_err(error)?;
+                serve_boundary(pool.downgrade())?;
+                pool
+            }
+        };
+        Ok(Self { inner })
+    }
+
+    /// Slabs the pool holds: all of them, or with a boundary its side's.
+    #[getter]
+    fn held_slabs(&self) -> usize {
+        self.inner.held_slabs()
+    }
+
+    /// Physical slabs, without the null slab.
+    #[getter]
+    fn parent_capacity(&self) -> u32 {
+        self.inner.parent_capacity()
+    }
+
+    /// The pool identity that every Engine's `ResourceBinding` carries.
+    #[getter]
+    fn pool_id(&self) -> u64 {
+        self.inner.id()
+    }
+
+    #[getter]
+    fn free_slabs(&self) -> usize {
+        self.inner.free_parent_count()
+    }
+
+    /// The Engines that joined, in order.
+    #[getter]
+    fn engines(&self) -> usize {
+        self.inner.engines()
+    }
+
+    /// Slabs that each Engine's blocks occupy (live or cached), in join order.
+    fn bound_slabs(&self) -> Vec<u64> {
+        self.inner.bound_slabs()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CachePool(parent_capacity={}, free_slabs={}, engines={})",
+            self.inner.parent_capacity(),
+            self.inner.free_parent_count(),
+            self.inner.engines()
+        )
+    }
+}
+
+type BoundarySide = crate::slab_table::SlabSide;
+
+/// Serve a pool's boundary every 2 ms until the pool is gone.
+/// A Python callable that clears slabs (`CachePool(scrub=)`).
+struct PythonScrub(Py<PyAny>);
+
+impl std::fmt::Debug for PythonScrub {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PythonScrub")
+    }
+}
+
+impl SlabScrub for PythonScrub {
+    fn scrub(&self, slabs: &[u32]) -> Result<(), String> {
+        Python::attach(|py| {
+            self.0
+                .call1(py, (slabs.to_vec(),))
+                .map(drop)
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+fn serve_boundary(pool: WeakCachePool) -> PyResult<()> {
+    std::thread::Builder::new()
+        .name("resin-slab-boundary".into())
+        .spawn(move || {
+            let mut reported = false;
+            while let Some(pool) = pool.upgrade() {
+                if let Err(error) = pool.serve_boundary()
+                    && !reported
+                {
+                    log::error!("slab boundary: {error}");
+                    reported = true;
+                }
+                drop(pool);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
+}
 
 fn layout_error(error: KvLayoutError) -> PyErr {
     PyValueError::new_err(error.to_string())

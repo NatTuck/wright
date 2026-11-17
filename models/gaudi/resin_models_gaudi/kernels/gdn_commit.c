@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Speculative commit: the accepted tokens of a gdn_verify step, applied to each sequence's arena
 // state. counts[bl] tokens (from the first) of entry bl = (layer, sequence) are replayed from the
 // recorded updates, S = eg_t * S + k_t d_t^T per head, read from ssm_src and stored at ssm_dst;

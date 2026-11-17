@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Routed experts, between the two batch_gemms: per slot the gate | up rows of the first product (f32, by row
 // scale 2^(C-132) and the token's input scale), clamped SwiGLU, then per-slot FP8 quantization (pair order) for the
 // second batch_gemm. Width w = w0 + t: the main rows [gate 0..w0 | up 0..w0] come from y, the tail rows

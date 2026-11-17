@@ -24,6 +24,7 @@ from resin import (
     SamplingParams,
 )
 from resin.backend.distributed import DistributedEngine, DistributedWorker
+from resin.backend.step_transport import create_step_transport
 from resin.backend.topology import ParallelGroups
 from resin.recipe import InklingMedia
 
@@ -102,7 +103,7 @@ class _MediaRunner:
             self.released.append(sequence_id)
 
 
-def _transport_process(rank, rendezvous, directory):
+def _transport_process(rank, rendezvous, directory, mode):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -115,7 +116,8 @@ def _transport_process(rank, rendezvous, directory):
         Parallelism(world_size=2, attn_tp=2), device_backend="gloo"
     )
     runner = _MediaRunner()
-    worker = DistributedWorker(runner, groups)
+    transport = create_step_transport(groups, mode, timeout=25)
+    worker = DistributedWorker(runner, groups, transport=transport)
     encodings = []
     large_broadcasts = []
     original_encode = native._media_to_buffers
@@ -207,10 +209,11 @@ def _transport_process(rank, rendezvous, directory):
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(), reason="Gloo is required"
 )
-def test_gloo_registers_media_once_and_reuses_it_until_release(tmp_path):
+@pytest.mark.parametrize("mode", ["gloo", "socket"])
+def test_registers_media_once_and_reuses_it_until_release(tmp_path, mode):
     processes = mp.start_processes(
         _transport_process,
-        args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path)),
+        args=(f"file://{tmp_path / 'rendezvous'}", str(tmp_path), mode),
         nprocs=2,
         join=False,
         start_method="spawn",
@@ -247,6 +250,6 @@ def test_gloo_registers_media_once_and_reuses_it_until_release(tmp_path):
     assert (driver["encodings"], follower["encodings"]) == (3, 0)
     # Repeated prefill/decode vectors are small. Pixels cross ranks once for
     # each admitted request, including after a prior request used the same media.
-    assert (
-        driver["large_broadcasts"] == follower["large_broadcasts"] == [PIXEL_BYTES] * 3
-    )
+    # The socket transport sends no Gloo broadcasts after setup.
+    pixels = [PIXEL_BYTES] * 3 if mode == "gloo" else []
+    assert driver["large_broadcasts"] == follower["large_broadcasts"] == pixels

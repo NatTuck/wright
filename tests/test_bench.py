@@ -56,6 +56,11 @@ class Runner:
         return forward_output([0] * plan.num_sequences)
 
 
+def without_host(records):
+    """The records without their host load, which differs from run to run."""
+    return [{key: value for key, value in r.items() if key != "host"} for r in records]
+
+
 def test_distributed_benchmark_forwards_preparation_without_rebuilding_it():
     prepared, context = object(), object()
     output = forward_output([3])
@@ -277,7 +282,7 @@ def test_decode_trace_uses_live_full_cohort_without_changing_measurements(
         return records
 
     baseline, profiled = run(False), run(True)
-    assert baseline == profiled
+    assert without_host(baseline) == without_host(profiled)
     record = profiled[0]
     assert record["step_seconds"] == [1, 1]
     assert record["graph_counts"]["decode.replay_count"] == 2
@@ -328,7 +333,7 @@ def test_prefill_trace_runs_two_fresh_complete_cohorts_outside_measurements(
         assert not engine.has_work()
         return records
 
-    assert run(False) == run(True)
+    assert without_host(run(False)) == without_host(run(True))
     assert len(traces) == 2
 
 

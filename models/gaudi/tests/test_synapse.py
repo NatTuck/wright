@@ -164,3 +164,125 @@ def test_parallel_compiles_match_serial(device, tmp_path):
         device.free(x_dev)
         device.free(y_dev)
     device.free(w_dev)
+
+
+@pytest.fixture(scope="module")
+def other_context(device):
+    """A context on a queue slot of its own, made once for the module."""
+    return device.context()
+
+
+def test_a_context_has_its_own_queue_slot(device, other_context):
+    assert other_context.id != 0
+    assert other_context.affinity and device.default_context.affinity
+    assert other_context.affinity & device.default_context.affinity == 0
+    with other_context.use():
+        assert device.current_context() == other_context
+    assert device.current_context() == device.default_context
+
+
+def _gemm(device, name: str):
+    import struct
+
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import BF16, F32
+
+    K, N, T = 512, 1024, 64
+    graph = Graph(device, name)
+    x = graph.input("x", (K, T), BF16)
+    w = graph.input("w", (N, K), BF16)
+    h = graph.tensor((N, T), BF16)
+    graph.node("gemm", [x, w], [h], struct.pack("??", False, False))
+    y = graph.input("y", (N, T), F32)
+    graph.node("cast_bf16_to_f32", [h], [y])
+    return graph, (K, N, T)
+
+
+def test_two_threads_issue_on_their_own_contexts(device, other_context, tmp_path):
+    """Each thread uploads (through its context's staging buffers), launches and reads back at once, many
+    times; every result is its own."""
+    import threading
+
+    from resin_models_gaudi.synapse.graph import RecipeCache
+
+    graph, (K, N, T) = _gemm(device, "test_contexts_gemm")
+    with other_context.use():
+        recipe_other = RecipeCache(device, tmp_path).compile(graph)
+    graph, _ = _gemm(device, "test_contexts_gemm")
+    recipe_default = RecipeCache(device, tmp_path).compile(graph)
+    assert recipe_default.from_cache  # a recipe does not depend on its context
+    rng = np.random.default_rng(5)
+    w = bf16_round(rng.standard_normal((K, N), np.float32) / 16)
+    w_bits = (w.view(np.uint32) >> 16).astype(np.uint16)
+    w_dev = device.malloc(w.size * 2)
+    device.h2d(w_dev, w_bits)
+    big = rng.standard_normal(48 << 20 >> 2, np.float32)  # 48 MiB: both halves of the staging buffer
+    barrier = threading.Barrier(2)
+    failures: list[BaseException] = []
+
+    def run(context, recipe, seed: int) -> None:
+        try:
+            with context.use():
+                local = np.random.default_rng(seed)
+                x_dev, y_dev = device.malloc(K * T * 2), device.malloc(N * T * 4)
+                big_dev = device.malloc(big.nbytes)
+                recipe.bind_all({"x": x_dev, "w": w_dev, "y": y_dev})
+                barrier.wait()
+                for round in range(40):
+                    x = bf16_round(local.standard_normal((T, K), np.float32))
+                    device.h2d_nb(x_dev, (x.view(np.uint32) >> 16).astype(np.uint16))
+                    recipe.launch()
+                    out = device.d2h(y_dev, (T, N), np.float32)
+                    np.testing.assert_allclose(out, bf16_round(x @ w), rtol=2e-2, atol=2e-2)
+                    if round % 10 == 0:
+                        device.h2d(big_dev, big * seed)
+                        assert np.array_equal(device.d2h(big_dev, big.shape, np.float32), big * seed)
+                for address in (x_dev, y_dev, big_dev):
+                    device.free(address)
+        except BaseException as error:  # noqa: BLE001 - reported by the main thread
+            failures.append(error)
+            barrier.abort()
+
+    threads = [
+        threading.Thread(target=run, args=(device.default_context, recipe_default, 1)),
+        threading.Thread(target=run, args=(other_context, recipe_other, 2)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    device.free(w_dev)
+    assert not failures, failures
+
+
+def test_a_context_waits_on_the_device_for_another_contexts_event(device, other_context, tmp_path):
+    """The default context writes a buffer after a long run of launches; the other context copies it out after a
+    stream wait on the default context's event, with no host wait in between."""
+    from resin_models_gaudi.synapse.graph import RecipeCache
+
+    graph, (K, N, T) = _gemm(device, "test_contexts_gemm")
+    recipe = RecipeCache(device, tmp_path).compile(graph)
+    x_dev, w_dev, y_dev = (device.malloc(n) for n in (K * T * 2, N * K * 2, N * T * 4))
+    device.memset32(x_dev, 0, K * T // 2)
+    device.memset32(w_dev, 0, N * K // 2)
+    recipe.bind_all({"x": x_dev, "w": w_dev, "y": y_dev})
+    words = 1 << 20
+    source, target, copy = (device.malloc(words * 4) for _ in range(3))
+    device.memset32(source, 7, words)
+    device.memset32(target, 1, words)
+    with other_context.use():
+        device.memset32(copy, 0, words)
+    device.sync_all()
+    slot = device.event_slots(1)
+    for _ in range(400):  # a few ms of device work before the write
+        recipe.launch()
+    device.d2d(target, source, words * 4)
+    device.record(slot)
+    with other_context.use():
+        device.stream_wait(slot)
+        device.d2d(copy, target, words * 4)
+        out = device.d2h(copy, words, np.uint32)  # waits for the other context only
+    assert (out == 7).all()
+    device.sync()
+    for address in (x_dev, w_dev, y_dev, source, target, copy):
+        device.free(address)

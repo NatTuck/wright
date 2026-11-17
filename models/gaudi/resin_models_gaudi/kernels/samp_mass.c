@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Sampling, pass 4 of 5 (mass): one member per (vocabulary chunk, row) sums the tempered weights
 // of its kept tokens (key >= theta), from samp_scan's per-token keys and weights rescaled to the
 // row maximum: exp((m_c - m) / T) * sum wt. 0 for greedy rows.

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // GLM DSA indexer, per token: k = LayerNorm(k_raw) w + b (128), packed with the pooling gate logits:
 //   kg[0:128] = k, kg[128:256] = gate logits (the 4:1 pool softmax adds ape[slot] later)
 //   wts[h] = weights_proj(h)_h * NH^-0.5 * DI^-0.5   (the per-head score weights, relu scale folded in)

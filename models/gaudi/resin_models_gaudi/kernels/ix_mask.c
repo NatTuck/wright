@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // A prefill chunk's DSA selection for this rank's columns as bits (Mistral-Large-4):
 // bit j of lane i of a column's word vector b says that key
 // 2048 b + 64 j + i is visible (below vis[c]) and kept (mkey(score) >= thr[c]: ix_thr). ix_unmask

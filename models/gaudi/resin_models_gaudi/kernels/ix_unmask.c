@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // The ranks' gathered DSA bits (ix_mask) as mla_slot_pm's additive mask: per column and key, 0 when
 // kept, else -3e38, for the 2048-key blocks the column can see.
 // tensors: 0 bits (K / 32, T) i32  1 vis (T) i32 | 2 mask (K, T) f32

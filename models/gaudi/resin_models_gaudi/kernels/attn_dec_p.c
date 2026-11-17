@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Split-K flash decode, pass 1 (one node for all KV groups). For key chunk c (CH keys) and
 // score row r (= group j = r / hpg, head h = r % hpg):
 //   m[c,r] = max_k s*scale,  P[:, h, c, j] = exp(s*scale - m[c,r]) (bf16, sigma packed per 128

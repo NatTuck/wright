@@ -1,42 +1,23 @@
-// Thin C API over Synapse (graph compiler + runtime) for Gaudi2, called from Python
-// through ctypes. Resin plans every step on the host.
+// Thin C API over Synapse (runtime) for Gaudi2, called from Python through ctypes and from resin's native step
+// programs. Resin plans every step on the host. Graph building and compiling are in graph.cpp.
 //
-// One device and one stream per process. Multi-card serving runs one process per card.
-#include <synapse_api.h>
+// One device per process; multi-card serving runs one process per card. Work issues on a context: a stream on
+// its own queue slot, with its own workspace and pinned staging buffers. Each thread issues on its current
+// context (rg_context_use); a thread starts on context 0, which rg_init creates. A process that serves several
+// models gives each model its own context.
+#include "graph.h"
 #include <hccl.h>
 #include <synapse_common_types.hpp>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <mutex>
-#include <string>
-#include <vector>
 #include <unordered_map>
 #include <unistd.h>
 #include <time.h>
 
-#define RG_API extern "C" __attribute__((visibility("default")))
-
-// Per thread: graphs may compile concurrently, and the caller reads the error on its own thread.
-static thread_local char g_err[1024];
-static bool fail(synStatus s, const char* what) {
-    char desc[STATUS_DESCRIPTION_MAX_SIZE] = {0};
-    synStatusGetBriefDescription(s, desc, sizeof(desc));
-    snprintf(g_err, sizeof(g_err), "%s failed: status=%d (%s)", what, int(s), desc);
-    return false;
-}
-#define CHK(call) do { synStatus _s = (call); if (_s != synSuccess) { fail(_s, #call); return -1; } } while (0)
-
-struct Graph {
-    synGraphHandle h = nullptr;
-    std::vector<synTensor> tensors;
-    std::vector<synSectionHandle> sections;
-    std::vector<std::string> names;      // stable storage for tensor names
-    std::vector<bool> persistent;
-    std::vector<synNodeId> nodes;
-};
+thread_local char g_err[1024];
 
 struct Recipe {
     synRecipeHandle h = nullptr;
@@ -46,33 +27,51 @@ struct Recipe {
     std::unordered_map<std::string, int> index;
 };
 
+static const int kRing = 32;              // pinned slots for small non-blocking uploads (rg_h2d_nb)
+static const size_t kSlot = 64 << 10;
+static const size_t kStage = 64ull << 20; // pinned staging buffer of rg_h2d and rg_d2h
+
+struct Context {
+    synStreamHandle stream = nullptr;
+    uint64_t affinity = 0;                // the stream's queue slot (a mask)
+    uint64_t ws = 0, ws_size = 0;         // workspace of the recipes launched on this context
+    void* stage = nullptr;
+    synEventHandle h2d_ev[2] = {nullptr, nullptr};  // rg_h2d staging halves
+    char* ring = nullptr;
+    synEventHandle ring_ev[kRing] = {};
+    bool ring_used[kRing] = {};
+    int ring_i = 0;
+    hcclComm_t comm = nullptr;            // this context's communicator (rg_ccl_init), else the process default
+};
+
 static synDeviceId g_dev;
-static synStreamHandle g_stream = nullptr;
 static bool g_init = false;
 static int g_card = -1;
 static unsigned g_module = 0;
-static std::vector<Graph*> g_graphs;
-static std::vector<Recipe*> g_recipes;
-static void* g_stage = nullptr;           // pinned staging buffer
-static size_t g_stage_size = 0;
-// ring of pinned slots for small non-blocking uploads (rg_h2d_nb)
-static const int kRing = 32;
-static const size_t kSlot = 64 << 10;
-static char* g_ring = nullptr;
-static synEventHandle g_ring_ev[kRing] = {};
-static bool g_ring_used[kRing] = {};
-static int g_ring_i = 0;
-static synEventHandle g_h2d_ev[2] = {nullptr, nullptr};  // rg_h2d staging halves
+static const int kContexts = 8;
+static std::atomic<Context*> g_contexts[kContexts] = {};
+static int g_context_count = 0;
+static thread_local int t_context = 0;
+// Fixed storage: recipes load on some threads while others launch.
+static const int kRecipes = 1 << 16;
+static Recipe* g_recipes[kRecipes] = {};
+static int g_recipe_count = 0;
 static const int kEvents = 64;
 static synEventHandle g_ev[kEvents] = {};       // rg_event_* slots
-// Workspace shared by all recipes.
-static uint64_t g_ws = 0, g_ws_size = 0;
-// Graph compilations in this process (deserialized recipes do not count).
-static std::atomic<uint64_t> g_compiles{0};
-// Guards the graph and recipe tables and the shared workspace.
+static int g_ev_context[kEvents] = {};          // the context that recorded each slot last
+static bool g_ev_timed[kEvents] = {};           // slots whose events collect device time
+// Guards the recipe and context tables and the workspaces.
 static std::mutex g_mu;
 // Device allocations: the address rg_malloc returned -> the raw address.
 static std::unordered_map<uint64_t, uint64_t> g_alloc;
+static std::mutex g_alloc_mu;
+
+static Context* current() {
+    Context* c = g_contexts[t_context].load(std::memory_order_relaxed);
+    if (!c) snprintf(g_err, sizeof(g_err), "no Gaudi device is open");
+    return c;
+}
+#define CTX(c) Context* c = current(); if (!c) return -1
 
 RG_API const char* rg_last_error() { return g_err; }
 
@@ -86,6 +85,29 @@ static std::string read_sys(int card, const char* f) {
     std::string s(buf);
     while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
     return s;
+}
+
+// A new stream on queue slot `affinity` (0: the slot Synapse picks).
+static Context* new_context(uint64_t affinity) {
+    auto* c = new Context();
+    synStatus s = synStreamCreateGeneric(&c->stream, g_dev, 0);
+    if (s != synSuccess) { delete c; fail(s, "synStreamCreateGeneric"); return nullptr; }
+    const char* what = "synStreamSetAffinity";
+    if (affinity) s = synStreamSetAffinity(g_dev, c->stream, affinity);
+    if (s == synSuccess) { what = "synStreamGetAffinity"; s = synStreamGetAffinity(g_dev, c->stream, &c->affinity); }
+    if (s != synSuccess) { synStreamDestroy(c->stream); delete c; fail(s, what); return nullptr; }
+    return c;
+}
+
+static void destroy_context(Context* c) {
+    synStreamSynchronize(c->stream);
+    if (c->ws) synDeviceFree(g_dev, c->ws, 0);
+    if (c->stage) synHostFree(g_dev, c->stage, 0);
+    if (c->ring) synHostFree(g_dev, c->ring, 0);
+    for (auto& e : c->h2d_ev) if (e) synEventDestroy(e);
+    for (auto& e : c->ring_ev) if (e) synEventDestroy(e);
+    synStreamDestroy(c->stream);
+    delete c;
 }
 
 // Acquire accel `card` (its /sys/class/accel index). A busy card returns -1.
@@ -104,13 +126,14 @@ RG_API int rg_init(int card) {
         return -1;
     }
     g_module = module;
-    int chosen = card;
-    CHK(synStreamCreateGeneric(&g_stream, g_dev, 0));
-    g_stage_size = 64ull << 20;
-    CHK(synHostMalloc(g_dev, g_stage_size, 0, &g_stage));
-    g_card = chosen;
+    Context* c = new_context(0);
+    if (!c) return -1;
+    CHK(synHostMalloc(g_dev, kStage, 0, &c->stage));
+    g_contexts[0].store(c);
+    g_context_count = 1;
+    g_card = card;
     g_init = true;
-    return chosen;
+    return card;
 }
 
 RG_API int rg_module_id() { return g_init ? int(g_module) : -1; }
@@ -120,32 +143,67 @@ RG_API int rg_driver_version(char* out, int size) {
     return 0;
 }
 
-RG_API int rg_sync() { CHK(synStreamSynchronize(g_stream)); return 0; }
+// ---------------------------------------------------------------- contexts
+// A new context on queue slot `affinity` (a mask; 0: the lowest slot that no context uses). Returns its id.
+RG_API int rg_context_create(uint64_t affinity) {
+    if (!g_init) { snprintf(g_err, sizeof(g_err), "no Gaudi device is open"); return -1; }
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_context_count == kContexts) { snprintf(g_err, sizeof(g_err), "context: all %d are in use", kContexts); return -1; }
+    if (!affinity) {
+        uint64_t range = 0, used = 0;
+        CHK(synDeviceGetAffinityMaskRange(g_dev, &range));
+        for (int i = 0; i < g_context_count; i++) used |= g_contexts[i].load()->affinity;
+        const uint64_t free = range & ~used;
+        if (!free) {
+            snprintf(g_err, sizeof(g_err), "context: every queue slot (mask %#lx) has a stream", (unsigned long)range);
+            return -1;
+        }
+        affinity = free & (~free + 1);
+    }
+    Context* c = new_context(affinity);
+    if (!c) return -1;
+    g_contexts[g_context_count].store(c);
+    return g_context_count++;
+}
+
+// Make context `id` this thread's current context; returns the one it replaces, or -1.
+RG_API int rg_context_use(int id) {
+    if (id < 0 || id >= kContexts || !g_contexts[id].load()) { snprintf(g_err, sizeof(g_err), "context: no context %d", id); return -1; }
+    const int previous = t_context;
+    t_context = id;
+    return previous;
+}
+
+RG_API int rg_context_current() { return t_context; }
+
+// The queue slot (mask) of context `id`, or 0.
+RG_API uint64_t rg_context_affinity(int id) {
+    if (id < 0 || id >= kContexts) return 0;
+    Context* c = g_contexts[id].load();
+    return c ? c->affinity : 0;
+}
+
+// Wait for the current context's work.
+RG_API int rg_sync() { CTX(c); CHK(synStreamSynchronize(c->stream)); return 0; }
+
+// Wait for the work of every context.
+RG_API int rg_sync_all() {
+    for (auto& slot : g_contexts) if (Context* c = slot.load()) CHK(synStreamSynchronize(c->stream));
+    return 0;
+}
 
 RG_API int rg_shutdown() {
     if (!g_init) return 0;
-    synStreamSynchronize(g_stream);
-    for (auto* r : g_recipes) if (r) { synRecipeDestroy(r->h); delete r; }
-    g_recipes.clear();
-    if (g_ws) synDeviceFree(g_dev, g_ws, 0);
-    g_ws = g_ws_size = 0;
-    for (auto* g : g_graphs) if (g) {
-        for (auto t : g->tensors) synTensorDestroy(t);
-        for (auto s : g->sections) synSectionDestroy(s);
-        synGraphDestroy(g->h);
-        delete g;
-    }
-    g_graphs.clear();
+    rg_sync_all();
+    for (int i = 0; i < g_recipe_count; i++) { synRecipeDestroy(g_recipes[i]->h); delete g_recipes[i]; g_recipes[i] = nullptr; }
+    g_recipe_count = 0;
+    rg_destroy_graphs();
     for (auto& kv : g_alloc) synDeviceFree(g_dev, kv.second, 0);
     g_alloc.clear();
-    if (g_stage) { synHostFree(g_dev, g_stage, 0); g_stage = nullptr; }
-    if (g_ring) { synHostFree(g_dev, g_ring, 0); g_ring = nullptr; for (auto& u : g_ring_used) u = false; }
-    // events are created lazily per device
-    for (auto& e : g_h2d_ev) { if (e) synEventDestroy(e); e = nullptr; }
-    for (auto& e : g_ring_ev) { if (e) synEventDestroy(e); e = nullptr; }
     for (auto& e : g_ev) { if (e) synEventDestroy(e); e = nullptr; }
-    g_ring_i = 0;
-    synStreamDestroy(g_stream);
+    for (auto& t : g_ev_timed) t = false;
+    for (auto& slot : g_contexts) if (Context* c = slot.exchange(nullptr)) destroy_context(c);
+    g_context_count = 0;
     synDeviceRelease(g_dev);
     synDestroy();
     g_card = -1;
@@ -159,14 +217,20 @@ RG_API uint64_t rg_malloc(uint64_t bytes) {
     synStatus s = synDeviceMalloc(g_dev, (bytes ? bytes : 256) + 128, 0, 0, &raw);
     if (s != synSuccess) { fail(s, "synDeviceMalloc"); return 0; }
     const uint64_t aligned = (raw + 127) & ~uint64_t(127);
+    std::lock_guard<std::mutex> lock(g_alloc_mu);
     g_alloc[aligned] = raw;
     return aligned;
 }
 RG_API int rg_free(uint64_t addr) {
-    auto it = g_alloc.find(addr);
-    if (it == g_alloc.end()) { snprintf(g_err, sizeof(g_err), "free: %#lx was not allocated here", (unsigned long)addr); return -1; }
-    CHK(synDeviceFree(g_dev, it->second, 0));
-    g_alloc.erase(it);
+    uint64_t raw;
+    {
+        std::lock_guard<std::mutex> lock(g_alloc_mu);
+        auto it = g_alloc.find(addr);
+        if (it == g_alloc.end()) { snprintf(g_err, sizeof(g_err), "free: %#lx was not allocated here", (unsigned long)addr); return -1; }
+        raw = it->second;
+        g_alloc.erase(it);
+    }
+    CHK(synDeviceFree(g_dev, raw, 0));
     return 0;
 }
 
@@ -183,84 +247,113 @@ RG_API void* rg_host_malloc(uint64_t bytes) {
 }
 RG_API int rg_host_free(void* p) { CHK(synHostFree(g_dev, p, 0)); return 0; }
 
+static int stage(Context* c) {
+    if (!c->stage) CHK(synHostMalloc(g_dev, kStage, 0, &c->stage));
+    return 0;
+}
+
 // Synchronous host->device copy.
 RG_API int rg_h2d(uint64_t dst, const void* src, uint64_t bytes) {
+    CTX(c);
+    if (stage(c)) return -1;
     const char* s = (const char*)src;
-    const size_t half = g_stage_size / 2;
-    if (!g_h2d_ev[0]) for (auto& e : g_h2d_ev) CHK(synEventCreate(&e, g_dev, 0));
+    const size_t half = kStage / 2;
+    if (!c->h2d_ev[0]) for (auto& e : c->h2d_ev) CHK(synEventCreate(&e, g_dev, 0));
     bool pending[2] = {false, false};
     for (int b = 0; bytes; b ^= 1) {
         size_t n = bytes < half ? bytes : half;
-        char* buf = (char*)g_stage + b * half;
-        if (pending[b]) CHK(synEventSynchronize(g_h2d_ev[b]));
+        char* buf = (char*)c->stage + b * half;
+        if (pending[b]) CHK(synEventSynchronize(c->h2d_ev[b]));
         memcpy(buf, s, n);
-        CHK(synMemCopyAsync(g_stream, (uint64_t)buf, n, dst, HOST_TO_DRAM));
-        CHK(synEventRecord(g_h2d_ev[b], g_stream));
+        CHK(synMemCopyAsync(c->stream, (uint64_t)buf, n, dst, HOST_TO_DRAM));
+        CHK(synEventRecord(c->h2d_ev[b], c->stream));
         pending[b] = true;
         s += n; dst += n; bytes -= n;
     }
-    CHK(synStreamSynchronize(g_stream));
+    CHK(synStreamSynchronize(c->stream));
     return 0;
 }
 // Small non-blocking uploads (per-launch tokens / metadata): a ring of pinned slots.
 RG_API int rg_h2d_nb(uint64_t dst, const void* src, uint64_t bytes) {
     if (bytes > kSlot) return rg_h2d(dst, src, bytes);
-    if (!g_ring) {
-        CHK(synHostMalloc(g_dev, kRing * kSlot, 0, (void**)&g_ring));
-        for (auto& e : g_ring_ev) CHK(synEventCreate(&e, g_dev, 0));
+    CTX(c);
+    if (!c->ring) {
+        CHK(synHostMalloc(g_dev, kRing * kSlot, 0, (void**)&c->ring));
+        for (auto& e : c->ring_ev) CHK(synEventCreate(&e, g_dev, 0));
     }
-    const int i = g_ring_i;
-    g_ring_i = (g_ring_i + 1) % kRing;
-    if (g_ring_used[i]) CHK(synEventSynchronize(g_ring_ev[i]));
-    memcpy(g_ring + i * kSlot, src, bytes);
-    CHK(synMemCopyAsync(g_stream, (uint64_t)(g_ring + i * kSlot), bytes, dst, HOST_TO_DRAM));
-    CHK(synEventRecord(g_ring_ev[i], g_stream));
-    g_ring_used[i] = true;
+    const int i = c->ring_i;
+    c->ring_i = (c->ring_i + 1) % kRing;
+    if (c->ring_used[i]) CHK(synEventSynchronize(c->ring_ev[i]));
+    memcpy(c->ring + i * kSlot, src, bytes);
+    CHK(synMemCopyAsync(c->stream, (uint64_t)(c->ring + i * kSlot), bytes, dst, HOST_TO_DRAM));
+    CHK(synEventRecord(c->ring_ev[i], c->stream));
+    c->ring_used[i] = true;
     return 0;
 }
 
 RG_API int rg_d2h(void* dst, uint64_t src, uint64_t bytes) {
+    CTX(c);
+    if (stage(c)) return -1;
     char* d = (char*)dst;
     while (bytes) {
-        size_t n = bytes < g_stage_size ? bytes : g_stage_size;
-        CHK(synMemCopyAsync(g_stream, src, n, (uint64_t)g_stage, DRAM_TO_HOST));
-        CHK(synStreamSynchronize(g_stream));
-        memcpy(d, g_stage, n);
+        size_t n = bytes < kStage ? bytes : kStage;
+        CHK(synMemCopyAsync(c->stream, src, n, (uint64_t)c->stage, DRAM_TO_HOST));
+        CHK(synStreamSynchronize(c->stream));
+        memcpy(d, c->stage, n);
         d += n; src += n; bytes -= n;
     }
     return 0;
 }
 // Async copies between pinned host memory and device (the caller keeps pinned memory alive).
 RG_API int rg_h2d_async(uint64_t dst, const void* pinned, uint64_t bytes) {
-    CHK(synMemCopyAsync(g_stream, (uint64_t)pinned, bytes, dst, HOST_TO_DRAM)); return 0;
+    CTX(c); CHK(synMemCopyAsync(c->stream, (uint64_t)pinned, bytes, dst, HOST_TO_DRAM)); return 0;
 }
 RG_API int rg_d2h_async(void* pinned, uint64_t src, uint64_t bytes) {
-    CHK(synMemCopyAsync(g_stream, src, bytes, (uint64_t)pinned, DRAM_TO_HOST)); return 0;
+    CTX(c); CHK(synMemCopyAsync(c->stream, src, bytes, (uint64_t)pinned, DRAM_TO_HOST)); return 0;
 }
 RG_API int rg_d2d_async(uint64_t dst, uint64_t src, uint64_t bytes) {
-    CHK(synMemCopyAsync(g_stream, src, bytes, dst, DRAM_TO_DRAM)); return 0;
+    CTX(c); CHK(synMemCopyAsync(c->stream, src, bytes, dst, DRAM_TO_DRAM)); return 0;
 }
 // Batched device-to-device copies.
 RG_API int rg_d2d_multi(const uint64_t* src, const uint64_t* size, const uint64_t* dst, uint64_t n) {
     if (!n) return 0;
-    CHK(synMemCopyAsyncMultiple(g_stream, src, size, dst, DRAM_TO_DRAM, n));
+    CTX(c);
+    CHK(synMemCopyAsyncMultiple(c->stream, src, size, dst, DRAM_TO_DRAM, n));
     return 0;
 }
 
 RG_API int rg_memset32(uint64_t dst, uint32_t value, uint64_t count) {
-    CHK(synMemsetD32Async(dst, value, count, g_stream)); return 0;
+    CTX(c); CHK(synMemsetD32Async(dst, value, count, c->stream)); return 0;
 }
 
 // ---------------------------------------------------------------- events
-// A small pool of reusable stream events (g_ev), for completions that wait on one step only.
+// A small pool of reusable stream events (g_ev), for completions that wait on one step only. A slot records
+// the work issued so far on the current context.
 RG_API int rg_event_record(int slot) {
     if (slot < 0 || slot >= kEvents) { snprintf(g_err, sizeof(g_err), "event: bad slot %d", slot); return -1; }
-    if (!g_ev[slot]) CHK(synEventCreate(&g_ev[slot], g_dev, 0));
-    CHK(synEventRecord(g_ev[slot], g_stream));
+    CTX(c);
+    if (!g_ev[slot]) CHK(synEventCreate(&g_ev[slot], g_dev, g_ev_timed[slot] ? EVENT_COLLECT_TIME : 0));
+    CHK(synEventRecord(g_ev[slot], c->stream));
+    g_ev_context[slot] = t_context;
     return 0;
 }
 RG_API int rg_event_wait(int slot) {
     if (slot < 0 || slot >= kEvents || !g_ev[slot]) { snprintf(g_err, sizeof(g_err), "event: slot %d not recorded", slot); return -1; }
+    CHK(synEventSynchronize(g_ev[slot]));
+    return 0;
+}
+RG_API int64_t rg_now_ns();
+
+// Wait for what slot `slot` recorded: poll it for up to `spin_ns`, then block. Returns 0, or -1 on an error.
+RG_API int rg_event_spin(int slot, int64_t spin_ns) {
+    if (slot < 0 || slot >= kEvents || !g_ev[slot]) { snprintf(g_err, sizeof(g_err), "event: slot %d not recorded", slot); return -1; }
+    const int64_t deadline = rg_now_ns() + spin_ns;
+    for (;;) {
+        synStatus s = synEventQuery(g_ev[slot]);
+        if (s == synSuccess) return 0;
+        if (s != synBusy) { fail(s, "synEventQuery"); return -1; }
+        if (rg_now_ns() >= deadline) break;
+    }
     CHK(synEventSynchronize(g_ev[slot]));
     return 0;
 }
@@ -273,104 +366,62 @@ RG_API int rg_event_query(int slot) {
     fail(s, "synEventQuery");
     return -1;
 }
-
-// ---------------------------------------------------------------- graphs
-RG_API int rg_graph_new() {
-    auto* g = new Graph();
-    synStatus s = synGraphCreate(&g->h, synDeviceGaudi2);
-    if (s != synSuccess) { delete g; fail(s, "synGraphCreate"); return -1; }
-    std::lock_guard<std::mutex> lock(g_mu);
-    g_graphs.push_back(g);
-    return int(g_graphs.size() - 1);
+// Event slot `slot` collects device time for rg_event_elapsed; before its first record.
+RG_API int rg_event_timed(int slot) {
+    if (slot < 0 || slot >= kEvents || g_ev[slot]) { snprintf(g_err, sizeof(g_err), "event: slot %d is in use", slot); return -1; }
+    g_ev_timed[slot] = true;
+    return 0;
 }
-
-static int add_tensor(Graph* g, const char* name, int dtype, int ndims, const uint64_t* sizes,
-                      synSectionHandle sec, uint64_t offset, bool persistent) {
-    // Graph-scoped handles.
-    g->names.emplace_back(name);
-    synTensor t;
-    CHK(synTensorHandleCreate(&t, g->h, DATA_TENSOR, name));
-    synTensorGeometry geo = {};
-    geo.dims = unsigned(ndims);
-    for (int i = 0; i < ndims; i++) geo.sizes[i] = sizes[i];
-    CHK(synTensorSetGeometry(t, &geo, synGeometrySizes));
-    CHK(synTensorSetDeviceDataType(t, synDataType(dtype)));
-    if (sec) CHK(synTensorAssignToSection(t, sec, offset));
-    g->tensors.push_back(t);
-    g->persistent.push_back(persistent);
-    return int(g->tensors.size() - 1);
+// Device nanoseconds from what timed slot `start` recorded to what timed slot `end` recorded; -2 while either is
+// pending or its time is gone, -1 on an error.
+RG_API int64_t rg_event_elapsed(int start, int end) {
+    for (int slot : {start, end})
+        if (slot < 0 || slot >= kEvents || !g_ev[slot] || !g_ev_timed[slot]) {
+            snprintf(g_err, sizeof(g_err), "event: slot %d is not a recorded timed slot", slot);
+            return -1;
+        }
+    uint64_t ns = 0;
+    synStatus s = synEventElapsedTime(&ns, g_ev[start], g_ev[end]);
+    if (s == synBusy || s == synUnavailable) return -2;
+    if (s != synSuccess) { fail(s, "synEventElapsedTime"); return -1; }
+    // An end that reads earlier than its start has no usable time either.
+    return ns > uint64_t(INT64_MAX) ? -2 : int64_t(ns);
 }
-
-// dtype: synDataType value. sizes: FCD-first (sizes[0] is the fastest dim).
-// persistent: the tensor gets its own persistent section and is bound at launch.
-RG_API int rg_tensor(int gi, const char* name, int dtype, int ndims, const uint64_t* sizes, int persistent) {
-    Graph* g = g_graphs[gi];
-    synSectionHandle sec = nullptr;
-    if (persistent) {
-        CHK(synSectionCreate(&sec, 0, g->h));
-        CHK(synSectionSetPersistent(sec, true));
-        g->sections.push_back(sec);
-    }
-    return add_tensor(g, name, dtype, ndims, sizes, sec, 0, persistent != 0);
-}
-
-// A persistent tensor placed at byte `offset` inside the section of tensor `other`.
-RG_API int rg_tensor_in_section(int gi, const char* name, int dtype, int ndims, const uint64_t* sizes,
-                                int other, uint64_t offset) {
-    Graph* g = g_graphs[gi];
-    synSectionHandle sec = nullptr;
-    uint64_t off0 = 0;
-    CHK(synTensorGetSection(g->tensors[other], &sec, &off0));
-    return add_tensor(g, name, dtype, ndims, sizes, sec, offset, true);
-}
-
-// Mark the section of tensor `t` read-modify-write.
-RG_API int rg_section_rmw(int gi, int t) {
-    Graph* g = g_graphs[gi];
-    synSectionHandle sec = nullptr;
-    uint64_t off0 = 0;
-    CHK(synTensorGetSection(g->tensors[t], &sec, &off0));
-    CHK(synSectionSetRMW(sec, true));
+// The current context's later work waits on the device (not on the host) for what event `slot` recorded. A slot
+// that the current context recorded needs no wait.
+RG_API int rg_event_stream_wait(int slot) {
+    if (slot < 0 || slot >= kEvents || !g_ev[slot]) { snprintf(g_err, sizeof(g_err), "event: slot %d not recorded", slot); return -1; }
+    CTX(c);
+    if (g_ev_context[slot] == t_context) return 0;
+    CHK(synStreamWaitEvent(c->stream, g_ev[slot], 0));
     return 0;
 }
 
-RG_API int rg_node(int gi, const char* guid, const char* name,
-                   const int* ins, int nin, const int* outs, int nout,
-                   const void* params, int params_size) {
-    Graph* g = g_graphs[gi];
-    std::vector<synTensor> ti, to;
-    for (int i = 0; i < nin; i++) ti.push_back(ins[i] < 0 ? nullptr : g->tensors[ins[i]]);
-    for (int i = 0; i < nout; i++) to.push_back(g->tensors[outs[i]]);
-    synNodeId id = 0;
-    synStatus s = synNodeCreateWithId(g->h, ti.data(), to.data(), nin, nout, params, params_size, guid, name, &id, nullptr, nullptr);
-    if (s != synSuccess) { fail(s, (std::string("synNodeCreate ") + guid + " " + name).c_str()); return -1; }
-    g->nodes.push_back(id);
-    return int(g->nodes.size() - 1);
-}
-
-// Control dependency: node `blocked` runs after node `blocking` (indices from rg_node).
-RG_API int rg_dep(int gi, int blocking, int blocked) {
-    Graph* g = g_graphs[gi];
-    synNodeId a = g->nodes[blocking], b = g->nodes[blocked];
-    CHK(synNodeDependencySet(g->h, &a, &b, 1, 1));
+// ---------------------------------------------------------------- recipes
+// Grow the workspace of context `c` to `size` bytes; the caller holds g_mu.
+static int grow_workspace(Context* c, uint64_t size) {
+    if (size <= c->ws_size) return 0;
+    CHK(synStreamSynchronize(c->stream));
+    if (c->ws) { CHK(synDeviceFree(g_dev, c->ws, 0)); c->ws = c->ws_size = 0; }
+    CHK(synDeviceMalloc(g_dev, size, 0, 0, &c->ws));
+    c->ws_size = size;
     return 0;
 }
 
-static int finish_recipe(Graph* g, Recipe* r) {
-    std::lock_guard<std::mutex> lock(g_mu);
-    CHK(synWorkspaceGetSize(&r->workspace_size, r->h));
-    if (r->workspace_size > g_ws_size) {
-        CHK(synStreamSynchronize(g_stream));
-        if (g_ws) CHK(synDeviceFree(g_dev, g_ws, 0));
-        CHK(synDeviceMalloc(g_dev, r->workspace_size, 0, 0, &g_ws));
-        g_ws_size = r->workspace_size;
-    }
-    // Persistent tensors of the graph and their launch ids.
-    for (size_t i = 0; i < g->tensors.size(); i++) if (g->persistent[i]) r->names.push_back(g->names[i]);
+// The current context's workspace grows to fit the recipe here, while the model loads, so that the cache sizing
+// that follows sees the memory it takes.
+int rg_register_recipe(synRecipeHandle h, const std::vector<std::string>& persistent) {
+    CTX(c);
+    auto* r = new Recipe();
+    r->h = h;
+    r->names = persistent;
     std::vector<const char*> nm;
     for (auto& n : r->names) nm.push_back(n.c_str());
     std::vector<uint64_t> ids(nm.size());
-    if (!nm.empty()) CHK(synTensorRetrieveIds(r->h, nm.data(), ids.data(), nm.size()));
+    synStatus s = synWorkspaceGetSize(&r->workspace_size, r->h);
+    if (s != synSuccess) { delete r; fail(s, "synWorkspaceGetSize"); return -1; }
+    if (!nm.empty()) s = synTensorRetrieveIds(r->h, nm.data(), ids.data(), nm.size());
+    if (s != synSuccess) { delete r; fail(s, "synTensorRetrieveIds"); return -1; }
     for (size_t i = 0; i < nm.size(); i++) {
         synLaunchTensorInfoExt b;
         memset(&b, 0, sizeof(b));
@@ -380,47 +431,11 @@ static int finish_recipe(Graph* g, Recipe* r) {
         r->binds.push_back(b);
         r->index[r->names[i]] = int(i);
     }
-    g_recipes.push_back(r);
-    return int(g_recipes.size() - 1);
-}
-
-// Compile graph `gi`; with a non-empty `out_path` also serialize the recipe there. Publication
-// into the durable cache is the caller's job.
-RG_API int rg_compile(int gi, const char* name, const char* out_path) {
-    Graph* g;
-    { std::lock_guard<std::mutex> lock(g_mu); g = g_graphs[gi]; }
-    auto* r = new Recipe();
-    synStatus s = synGraphCompile(&r->h, g->h, name, nullptr);
-    if (s != synSuccess) { delete r; fail(s, "synGraphCompile"); return -1; }
-    g_compiles++;
-    if (out_path && out_path[0]) {
-        s = synRecipeSerialize(r->h, out_path);
-        if (s != synSuccess) { synRecipeDestroy(r->h); delete r; fail(s, "synRecipeSerialize"); return -1; }
-    }
-    return finish_recipe(g, r);
-}
-
-// Load a serialized recipe of graph `gi` (the graph supplies the persistent tensor names).
-RG_API int rg_recipe_load(int gi, const char* path) {
-    Graph* g;
-    { std::lock_guard<std::mutex> lock(g_mu); g = g_graphs[gi]; }
-    auto* r = new Recipe();
-    synStatus s = synRecipeDeSerialize(&r->h, path);
-    if (s != synSuccess) { delete r; fail(s, "synRecipeDeSerialize"); return -1; }
-    return finish_recipe(g, r);
-}
-
-RG_API uint64_t rg_compile_count() { return g_compiles.load(); }
-
-RG_API int rg_graph_destroy(int gi) {
-    Graph* g = g_graphs[gi];
-    if (!g) return 0;
-    for (auto t : g->tensors) synTensorDestroy(t);
-    for (auto s : g->sections) synSectionDestroy(s);
-    synGraphDestroy(g->h);
-    delete g;
-    g_graphs[gi] = nullptr;
-    return 0;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_recipe_count == kRecipes) { delete r; snprintf(g_err, sizeof(g_err), "recipes: all %d are in use", kRecipes); return -1; }
+    if (grow_workspace(c, r->workspace_size)) { delete r; return -1; }
+    g_recipes[g_recipe_count] = r;
+    return g_recipe_count++;
 }
 
 RG_API uint64_t rg_recipe_workspace(int ri) { return g_recipes[ri]->workspace_size; }
@@ -439,9 +454,15 @@ RG_API int rg_bind_slots(int ri, const int* slots, const uint64_t* addrs, int n)
 }
 
 RG_API int rg_launch(int ri) {
+    CTX(c);
     Recipe* r = g_recipes[ri];
     for (auto& b : r->binds) if (!b.pTensorAddress) { snprintf(g_err, sizeof(g_err), "launch: %s unbound", b.tensorName); return -1; }
-    CHK(synLaunchWithExternalEventsExt(g_stream, r->binds.data(), r->binds.size(), g_ws, r->h, nullptr, 0, 0));
+    if (r->workspace_size > c->ws_size) {
+        // a recipe that loaded on another context
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (grow_workspace(c, r->workspace_size)) return -1;
+    }
+    CHK(synLaunchWithExternalEventsExt(c->stream, r->binds.data(), r->binds.size(), c->ws, r->h, nullptr, 0, 0));
     return 0;
 }
 
@@ -459,7 +480,7 @@ RG_API int rg_prof_start() {
     return 0;
 }
 RG_API int rg_prof_stop(const char* tsv_path) {
-    CHK(synStreamSynchronize(g_stream));
+    if (rg_sync_all()) return -1;
     CHK(synProfilerStop(synTraceAll, g_dev));
     size_t bytes = 0, entries = 0;
     CHK(synProfilerGetTrace(synTraceAll, g_dev, synTraceFormatTEF, nullptr, &bytes, &entries));
@@ -485,9 +506,17 @@ RG_API int64_t rg_now_ns() {
 }
 
 // ---------------------------------------------------------------- collectives (HCCL)
-// One communicator per process. Ranks exchange the unique id out of band (Resin's Gloo
-// control groups).
-static hcclComm_t g_comm = nullptr;
+// rg_ccl_init makes a communicator for the current context. Collectives issue on the current context with its
+// communicator, or with the first communicator of the process (the default) when the context has none, so a
+// process with one communicator uses it on every context. A second model of the process (a replica that spans
+// cards) makes its own on its own context. Ranks exchange the unique id out of band.
+static hcclComm_t g_comm = nullptr;  // the process default: the first communicator made
+
+static hcclComm_t comm_of(Context* c) {
+    hcclComm_t comm = c->comm ? c->comm : g_comm;
+    if (!comm) snprintf(g_err, sizeof(g_err), "no HCCL communicator on context %d", t_context);
+    return comm;
+}
 
 RG_API int rg_ccl_id_size() { return int(sizeof(hcclUniqueId)); }
 
@@ -500,40 +529,43 @@ RG_API int rg_ccl_unique_id(void* out) {
 }
 
 RG_API int rg_ccl_init(const void* id_bytes, int nranks, int rank) {
+    CTX(c);
+    if (c->comm) { snprintf(g_err, sizeof(g_err), "context %d has a communicator", t_context); return -1; }
     hcclUniqueId id;
     memcpy(&id, id_bytes, sizeof(id));
-    hcclResult_t r = hcclCommInitRank(&g_comm, nranks, id, rank);
+    hcclComm_t comm = nullptr;
+    hcclResult_t r = hcclCommInitRank(&comm, nranks, id, rank);
     if (r != hcclSuccess) { snprintf(g_err, sizeof(g_err), "hcclCommInitRank failed: %d", int(r)); return -1; }
+    c->comm = comm;
+    if (!g_comm) g_comm = comm;
     return 0;
 }
 
 // dtype: 0 = f32, 1 = bf16. In place when send == recv.
 RG_API int rg_ccl_allreduce(uint64_t send, uint64_t recv, uint64_t count, int dtype) {
+    CTX(c);
+    hcclComm_t comm = comm_of(c);
+    if (!comm) return -1;
     hcclResult_t r = hcclAllReduce((const void*)send, (void*)recv, count, dtype ? hcclBfloat16 : hcclFloat32,
-                                   hcclSum, g_comm, g_stream);
+                                   hcclSum, comm, c->stream);
     if (r != hcclSuccess) { snprintf(g_err, sizeof(g_err), "hcclAllReduce failed: %d", int(r)); return -1; }
     return 0;
 }
 
 RG_API int rg_ccl_allgather(uint64_t send, uint64_t recv, uint64_t count, int dtype) {
+    CTX(c);
+    hcclComm_t comm = comm_of(c);
+    if (!comm) return -1;
     hcclResult_t r = hcclAllGather((const void*)send, (void*)recv, count, dtype ? hcclBfloat16 : hcclFloat32,
-                                   g_comm, g_stream);
+                                   comm, c->stream);
     if (r != hcclSuccess) { snprintf(g_err, sizeof(g_err), "hcclAllGather failed: %d", int(r)); return -1; }
     return 0;
 }
 
-// Launch recipes ris[k] in order, each followed by an in-place all-reduce of ar[k] (count[k]
-// values, 0 = none; bit 63 set = bf16).
-static const uint64_t AR_BF16 = 1ull << 63;
-RG_API int rg_launch_segs(int n, const int* ris, const uint64_t* ar, const uint64_t* count) {
-    for (int k = 0; k < n; k++) {
-        if (rg_launch(ris[k])) return -1;
-        if (count[k] && rg_ccl_allreduce(ar[k], ar[k], count[k] & ~AR_BF16, count[k] & AR_BF16 ? 1 : 0)) return -1;
-    }
-    return 0;
-}
-
+// Destroy every communicator of the process.
 RG_API int rg_ccl_destroy() {
-    if (g_comm) { hcclCommDestroy(g_comm); g_comm = nullptr; }
+    for (auto& slot : g_contexts)
+        if (Context* c = slot.load(); c && c->comm) { hcclCommDestroy(c->comm); c->comm = nullptr; }
+    g_comm = nullptr;
     return 0;
 }

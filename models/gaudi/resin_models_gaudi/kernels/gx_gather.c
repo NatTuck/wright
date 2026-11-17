@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // GLM DSA: one index slot's C pool keys into a dense bf16 slab, natural order, from the index pages gx_pool
 // writes in the byte arena (two pool keys per row, 16 rows = 32 pools per 128-token block). Pool keys at or past
 // the slot's klen and pages of -1 are zeros. (mla_gather mode 2 assumes 128 keys per page.)

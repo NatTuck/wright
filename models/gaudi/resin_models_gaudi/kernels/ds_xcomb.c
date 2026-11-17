@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Prefill pages, after the second batch_gemm: out = sh * shs + sum over the token's routes k with a row
 // (bm[k, t] = r >= 0) of y[:, r] * 2^(C-132) [expert ids[k, t]] * hs[r] * route weight.
 // tensors: 0 y (H, S) f32  1 c (H, E) f32  2 hs (1, S) f32  3 ids (64, T) i32  4 bm (64, T) i32  5 wts (64, T) f32

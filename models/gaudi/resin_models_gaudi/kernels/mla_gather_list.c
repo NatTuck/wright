@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA sparse gather (Mistral-Large-4): each column's DSA-listed keys into a dense bf16 slab, as
 // mla_gather mode 0 (dequantized FP8 latent, then the rotary key when D = 576) but key k of slot
 // s is position list[k, s] of column s's sequence: block row blocks[p >> 7, s], plus this

@@ -19,12 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from resin_models_gaudi.qwen3_5.checkpoint import (
-    BLOCK,
-    FP8_MAX,
-    bf16_to_f32,
-    e4m3_encode,
-)
+from resin_models_gaudi.loading.convert import BLOCK, FP8_MAX, bf16_to_f32, e4m3_encode
 
 # The projections that the loader takes as block FP8. The norms and mtp.fc stay in BF16.
 _FP8 = ("_proj.weight",)

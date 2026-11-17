@@ -17,6 +17,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+# the K and V page types: RESIN_GAUDI_CACHE_TYPES=fp8,fp8 runs the tests on an FP8 cache
+CACHE_TYPES = tuple(os.environ.get("RESIN_GAUDI_CACHE_TYPES", "bf16,bf16").split(","))
+
 CHECKPOINT = os.environ.get("RESIN_GAUDI_QWEN35")
 
 pytestmark = pytest.mark.skipif(
@@ -46,6 +49,7 @@ def runner():
             max_batch_size=8,
             max_seq_len=16384,
             parent_capacity=24,
+            cache_types=CACHE_TYPES,
         )
     except SynapseError as error:
         pytest.skip(f"no Gaudi card available: {error}")
@@ -113,14 +117,29 @@ def test_greedy_matches_expected_tokens(engine):
 
 
 def test_batch_equals_alone(engine, text_ids):
+    """A batch decodes as each sequence alone, up to a near tie: batch shapes round differently, so the tokens
+    may part only where alone's top two logprobs are less than 1.0 apart (as test_runner_mtp's margins)."""
+    from resin import SamplingParams
+
     prompts = [
         text_ids[o : o + n]
         for o, n in ((0, 37), (500, 300), (1000, 2100), (9000, 129), (7000, 5000))
     ]
+    params = SamplingParams(
+        max_output_tokens=6, temperature=0.0, logprobs=True, top_logprobs=2
+    )
+    alone, margins = [], []
+    for p in prompts:
+        engine.clear_prefix_cache()
+        events = []
+        alone += generate(engine, [p], params=[params], events=events)
+        tops = [e.logprobs.top_logprobs for e in events if e.logprobs is not None]
+        margins.append([top[0][1] - top[1][1] for top in tops])
     engine.clear_prefix_cache()
-    alone = [generate(engine, [p])[0] for p in prompts]
-    engine.clear_prefix_cache()
-    assert generate(engine, prompts) == alone
+    together = generate(engine, prompts)
+    for got, want, margin in zip(together, alone, margins, strict=True):
+        part = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None)
+        assert part is None or margin[part] < 1.0, (got, want, margin)
 
 
 def test_prefix_hits_equal_fresh(engine, text_ids):

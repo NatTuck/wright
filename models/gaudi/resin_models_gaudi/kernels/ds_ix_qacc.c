@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // ds_ix_slot_acc8 for prefill slots (DeepSeek-V4.1) over bf16 head scores S (each head's product rounded to bf16,
 // as the reference's bf16 einsum), with each member taking 1024 keys (16 vectors) of 8 of the slot's query tokens.
 // A token's 32 head weights (w * scale * sq) are read once per member, then every vector of S is read once.

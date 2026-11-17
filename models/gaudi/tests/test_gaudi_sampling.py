@@ -1,4 +1,4 @@
-"""The device sampler (``qwen3_5.sampling``) against independent NumPy oracles of Resin's
+"""The device sampler (``common.sampling``) against independent NumPy oracles of Resin's
 sampling semantics (ported from tests/test_sampling_fused_cuda.py and
 tests/test_sampling_filters_cuda.py): Philox4x32-10 uniforms, torch.argmax greedy rows, top-k
 and full-distribution top-p with ties kept, inverse-CDF draws in vocabulary order, raw logprobs.
@@ -37,7 +37,7 @@ def device():
 @pytest.fixture(scope="module")
 def run(device, tmp_path_factory):
     """run(logits (R, V) f32, params (R, 8) f32) -> (tokens, logprobs, top ids, top logprobs)"""
-    from resin_models_gaudi.qwen3_5.sampling import PARAMS, TOP_MAX, sampler
+    from resin_models_gaudi.common.sampling import PARAMS, TOP_MAX, sampler
     from resin_models_gaudi.synapse.graph import Graph, RecipeCache
     from resin_models_gaudi.synapse.runtime import F32
 
@@ -158,14 +158,14 @@ def sample_case(rows, vocab, rng):
 
 
 def draw(run, logits, case, ntop=None):
-    from resin_models_gaudi.qwen3_5.sampling import row_params
+    from resin_models_gaudi.common.sampling import row_params
 
     params = row_params(len(logits), logits.shape[1], ntop=ntop, **case)
     return run(logits, params)
 
 
 def test_philox_matches_the_published_vector():
-    from resin_models_gaudi.qwen3_5.sampling import philox_uniform
+    from resin_models_gaudi.common.sampling import philox_uniform
 
     assert philox_word(0, 0) == 0x6627E8D5
     u = philox_uniform(np.array([0, (1 << 62) + 5]), np.array([0, (1 << 40) + 64]))

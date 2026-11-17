@@ -8,12 +8,14 @@ artifact currently on disk.
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import stat
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TypeVar
@@ -227,6 +229,10 @@ class ArtifactCache:
         publication is propagated and never creates a new readiness record.
         Miss accounting includes failed build and publication attempts, which
         matches :meth:`load_or_build`'s historical behavior.
+
+        On a miss, builders of one artifact take turns, across processes and
+        threads, through a lock on a hidden file next to the artifact. A caller
+        that waited for another builder loads what that builder published.
         """
 
         artifact_path, _ = self._artifact_path(artifact)
@@ -235,11 +241,20 @@ class ArtifactCache:
                 self._hits += 1
             return load(artifact_path)
 
-        with self._stats_lock:
-            self._misses += 1
-        result = build()
-        self.publish_from(source, artifact_path, identity=identity)
-        return result
+        # One builder at a time per artifact, across processes and threads. Without this, two processes that
+        # build different bytes can interleave their artifact and record replacements, and leave the bytes of
+        # one with the record of the other: an artifact that no reader accepts. A process that waited here
+        # loads what the builder published instead of building it again.
+        with _exclusive(_lock_path(artifact_path)):
+            if self.validate(artifact_path, identity=identity):
+                with self._stats_lock:
+                    self._hits += 1
+                return load(artifact_path)
+            with self._stats_lock:
+                self._misses += 1
+            result = build()
+            self.publish_from(source, artifact_path, identity=identity)
+            return result
 
     def _artifact_path(self, artifact: str | os.PathLike[str]) -> tuple[Path, Path]:
         candidate = Path(artifact).expanduser()
@@ -260,6 +275,30 @@ class ArtifactCache:
     def _check_identity(identity: str) -> None:
         if not isinstance(identity, str) or not identity:
             raise ValueError("identity must be a non-empty string")
+
+
+def _lock_path(artifact_path: Path) -> Path:
+    """The hidden file whose lock serializes builders of ``artifact_path``."""
+
+    return artifact_path.with_name(f".{artifact_path.name}.lock")
+
+
+@contextmanager
+def _exclusive(path: Path) -> Generator[None]:
+    """Hold an exclusive lock on ``path`` (created if missing) for the block.
+
+    ``flock`` locks belong to one open file description, so each holder opens the
+    file itself: two threads of one process exclude each other as two processes
+    do. The kernel releases the lock when its holder exits.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _fingerprint(path: Path) -> tuple[int, str]:

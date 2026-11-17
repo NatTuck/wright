@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 FP4 rounding in place of a cache store (values, not codes): each group of G consecutive elements of a
 // column gets a scale s from its largest magnitude a, and each element becomes s * e2m1(x / s), the nearest of
 // 0, .5, 1, 1.5, 2, 3, 4, 6 (ties to the even code), clamped to +-6.

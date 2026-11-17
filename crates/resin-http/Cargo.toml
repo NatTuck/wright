@@ -3,10 +3,11 @@ name = "resin-http"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 description = "HTTP protocol adapters for the Resin inference engine"
 
 [dependencies]
+log.workspace = true
 async-stream = "0.3"
 axum = { version = "0.8", features = ["json", "tokio", "http1"] }
 futures-core = "0.3"

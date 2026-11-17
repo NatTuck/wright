@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Speculative verify of batched KDA decode: Tq tokens of each of B sequences (columns b * Tq + t), each
 // sequence's tokens in order from its arena state, which is not written. The math per token is kda_decode's. Each
 // token's recurrent update is recorded instead: the state after token t is S_t = diag(e_t) S_{t-1} + k_t d_t^T per

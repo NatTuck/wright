@@ -16,6 +16,36 @@ pub struct RunnerMetricsSnapshot {
     pub dp_attention_sync_wait_seconds: Option<Histogram>,
 }
 
+/// Outcomes of the engine's decision, after each decode step it enqueues or commits, whether the next step may
+/// continue on device feedback before this one finishes (overlap).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ContinuationCounts {
+    /// The next step continues within the blocks its step leased.
+    pub retained: u64,
+    /// The next step continues across a cache block, leased in place.
+    pub extended: u64,
+    /// A chain ends where a row reaches the publication interval, so that the
+    /// engine can publish its prefixes.
+    pub publish: u64,
+    /// Queued work or time sharing wants the next step to be planned afresh.
+    pub queue: u64,
+    /// A row is terminal, or within two steps of its output budget or the context length.
+    pub row: u64,
+    /// A row's next step would write past the cache block its step leased (or there is no cache layout).
+    pub block: u64,
+}
+
+/// Which branch of the continuation decision applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContinuationOutcome {
+    Retained,
+    Extended,
+    Publish,
+    Queue,
+    Row,
+    Block,
+}
+
 /// Logical request metrics, counted once by the engine owning each request.
 ///
 /// Completed-request counters exclude cancellations. Live counters include all
@@ -33,6 +63,7 @@ pub struct EngineMetricsSnapshot {
     pub prefill_compute_tokens: u64,
     pub prefill_cache_tokens: u64,
     pub decode_tokens: u64,
+    pub continuations: ContinuationCounts,
     pub waiting_requests: usize,
     pub running_requests: usize,
     pub elapsed_seconds: f64,
@@ -71,6 +102,7 @@ impl Default for EngineMetricsSnapshot {
             prefill_compute_tokens: 0,
             prefill_cache_tokens: 0,
             decode_tokens: 0,
+            continuations: ContinuationCounts::default(),
             waiting_requests: 0,
             running_requests: 0,
             elapsed_seconds: 0.0,
@@ -223,6 +255,18 @@ impl EngineMetricsState {
                 );
             }
         }
+    }
+
+    pub(crate) fn continuation(&mut self, outcome: ContinuationOutcome) {
+        let counts = &mut self.values.continuations;
+        *match outcome {
+            ContinuationOutcome::Retained => &mut counts.retained,
+            ContinuationOutcome::Extended => &mut counts.extended,
+            ContinuationOutcome::Publish => &mut counts.publish,
+            ContinuationOutcome::Queue => &mut counts.queue,
+            ContinuationOutcome::Row => &mut counts.row,
+            ContinuationOutcome::Block => &mut counts.block,
+        } += 1;
     }
 
     pub(crate) fn retract(&mut self) {

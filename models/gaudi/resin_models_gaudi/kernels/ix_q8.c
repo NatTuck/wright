@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DSA index queries as FP8 (DeepSeek-V4.1): each 128-dim column as FP8 E4M3 in natural order (as mla_store_i8's
 // index keys) with a power-of-two scale (max |x| / 240 rounded up).
 // tensors: 0 x (128, W) f32 | 1 q (128, W) fp8  2 s (1, W) f32

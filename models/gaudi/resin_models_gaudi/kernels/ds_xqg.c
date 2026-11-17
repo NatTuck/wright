@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Prefill pages: each pooled row r takes token gidx[r]'s per-token FP8 quantization (pair order, as ds_xq):
 // q[:, r] = fp8(x[:, t] / s_t), sx[r] = s_t; rows of no token (gidx >= T) are zero, scale 0: ds_xact skips them.
 // tensors: 0 x (H, T) f32  1 gidx (S,) i32 | 2 q (H, S) fp8  3 sx (1, S) f32.  index space: [S / 4]

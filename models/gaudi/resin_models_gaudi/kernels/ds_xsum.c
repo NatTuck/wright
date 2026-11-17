@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Routed experts, after the second batch_gemm: out = sh * shs + sum_k y[:, t*R+k] * 2^(C-132) * hs * route weight
 // (shs: the shared expert's FP8 activation scale per token; ones for a bf16 shared expert).
 // tensors: 0 y (H, 1, S) f32  1 c (H, E) f32  2 hs (1, S) f32  3 ids (64, T) i32  4 wts (64, T) f32

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Prefill MoE, pass 3: rows for the pairs. Pooled rows r = PS p + i (page p, row i; PS = 2^psh). Token block j
 // continues each expert's running row from po[e] * PS + (pairs of earlier blocks), so the rows of an
 // expert are in token order. gidx[r] = token (unused rows: T, the zero column); bm[k, t] = r, or -1

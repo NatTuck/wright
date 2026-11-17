@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Routed-expert weights, load time: block FP8 (fp8_inc, block scales) -> per-output-row FP8,
 // input-major (M lanes per input row, as x8_copy's slots). Output row m gets
 // c[m] = max_k |w[m, k] bs[m / 128, k / 128]| / 240 and w'[m, k] = fp8(w[m, k] bs / c[m]), natural lane order.

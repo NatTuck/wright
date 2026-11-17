@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA cache store (Mistral-Large-4): a chunk's new key rows into their arena pages.
 // The arena is bytes, viewed as (512, PR, NB) (PR a power of two): row r is
 // (., r & (PR - 1), r >> log2 PR). Per token n:

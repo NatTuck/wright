@@ -21,7 +21,11 @@ from pathlib import Path
 import numpy as np
 
 from resin.models.mistral_large4.config import MistralLarge4Config
+from resin_models_gaudi.common.attention import SlotRow, plan_slots
+from resin_models_gaudi.common.sampling import PARAMS, TOP_MAX
 from resin_models_gaudi.gguf.reader import GgufModel
+from resin_models_gaudi.loading.progress import info, progress
+from resin_models_gaudi.loading.upload import WeightLoader
 from resin_models_gaudi.mistral_large4 import dspark
 from resin_models_gaudi.mistral_large4 import layers as L
 from resin_models_gaudi.mistral_large4.cache import (
@@ -38,10 +42,7 @@ from resin_models_gaudi.mistral_large4.weights import (
     prepare,
     rope_table,
 )
-from resin_models_gaudi.qwen3_5.attention import SlotRow, plan_slots
-from resin_models_gaudi.qwen3_5.sampling import PARAMS, TOP_MAX
 from resin_models_gaudi.synapse.graph import Graph, Recipe, RecipeCache
-from resin_models_gaudi.synapse.progress import info
 from resin_models_gaudi.synapse.runtime import Device
 
 BUCKETS = (1, 2, 4, 8, 16)  # decode batches, short prefill chunks
@@ -148,28 +149,18 @@ class Ml4Gaudi:
         self.max_seq_len = max_seq_len
         self.recipes = recipes or RecipeCache(device)
         t0 = time.time()
-        self.w: dict[str, int] = {}
-        self.kind: dict[str, str] = {}
-        nbytes = 0
-        device.begin_load(gguf.total_bytes // nranks, log=log)
-        for name, array, kind in prepare(gguf, cfg, rank, nranks):
-            a = np.ascontiguousarray(array)
-            address = device.malloc(max(a.nbytes, 256))
-            device.h2d(address, a)
-            self.w[name], self.kind[name] = address, kind
-            nbytes += a.nbytes
+        self.loader = loader = WeightLoader(device, self.recipes)
+        self.w, self.kind = loader.w, loader.kinds  # the graphs pick GEMVs by kind
+        device.begin_load(gguf.total_bytes // nranks)
+        loader.load(prepare(gguf, cfg, rank, nranks))
         if draft is not None:
-            t1, dbytes = time.time(), 0
-            for name, array, kind in dspark.prepare_drafter(draft, cfg, rank, nranks):
-                a = np.ascontiguousarray(array)
-                address = device.malloc(max(a.nbytes, 256))
-                device.h2d(address, a)
-                self.w[name], self.kind[name] = address, kind
-                dbytes += a.nbytes
-            nbytes += dbytes
+            t1, before = time.time(), loader.nbytes
+            loader.load(dspark.prepare_drafter(draft, cfg, rank, nranks))
             log(
-                f"ml4: DSpark drafter {dbytes / 2**30:.2f} GiB in {time.time() - t1:.0f} s"
+                f"ml4: DSpark drafter {(loader.nbytes - before) / 2**30:.2f} GiB in "
+                f"{time.time() - t1:.0f} s"
             )
+        nbytes = loader.nbytes
         device.end_load()
         log(
             f"ml4 rank {rank}/{nranks}: {nbytes / 2**30:.1f} GiB of weights in {time.time() - t0:.0f} s"
@@ -179,7 +170,9 @@ class Ml4Gaudi:
         )  # block-table rows per column (sparse)
         self.rope = rope_table(cfg, lerope_alpha(gguf), positions)
         self._programs: dict[tuple, _Program] = {}
-        self._staging = [Staged(device, _STAGE_EVENT + k) for k in range(2)]
+        # device event slots: the sampler output's staging copies, and the pinned tables' uploads
+        self._stage_event, self._host_event = device.event_slots(2), device.event_slots(2)
+        self._staging = [Staged(device, self._stage_event + k) for k in range(2)]
         self._stage_turn = 0
         self._sample_ops: dict[tuple, _Op] = {}
         self.sparse = True  # sparse decode attention when the indexer runs
@@ -433,6 +426,7 @@ class Ml4Gaudi:
 
     def _hold_workspace(self) -> None:
         """Load the prefill launches' routed experts."""
+        progress.building_graphs()
         graphs: dict[tuple, Graph] = {}
         for T in self.prefill_buckets:
             for i in range(self.cfg.num_hidden_layers):
@@ -445,17 +439,13 @@ class Ml4Gaudi:
             g.destroy()
 
     def _compile(self) -> None:
-        t0 = time.time()
+        progress.building_graphs()
         graphs = self._graphs()
         recipes = self.recipes.compile_many(list(graphs.values()))
         self.r: dict[tuple, Recipe] = dict(zip(graphs.keys(), recipes, strict=True))
         for g in graphs.values():
             g.destroy()
-        cached = sum(r.from_cache for r in recipes)
-        self.log(
-            f"ml4: {len(recipes)} recipes ({cached} cached) in {time.time() - t0:.1f} s, "
-            f"{self.device.memory_info()[0] / 2**30:.2f} GiB free"
-        )
+        self.log(f"ml4: {self.device.memory_info()[0] / 2**30:.2f} GiB free after the recipes")
         self.compiles_at_start = self.device.compile_count
 
     # ------------------------------------------------------------------ programs
@@ -716,7 +706,7 @@ class Ml4Gaudi:
         staged = self._staging[k]
         staged.drain()  # (its previous step's results, if never read)
         self.device.d2h_async(staged.buffer, self.sampled_buf)
-        self.device.record(_STAGE_EVENT + k)
+        self.device.record(self._stage_event + k)
         staged.arm(T, len(params))
         return staged
 
@@ -798,7 +788,7 @@ class Ml4Gaudi:
         k = self._host_turn
         self._host_turn ^= 1
         if self._host_pending[k]:
-            dev.wait(_HOST_EVENT + k)
+            dev.wait(self._host_event + k)
         h = self.host_tables[k]
         h[: tb.HEADER].view(np.int32)[: tb.HEADER // 4] = 0
         if tokens is not None:
@@ -895,7 +885,7 @@ class Ml4Gaudi:
             dev.h2d_async(
                 base + tb.index(0, 0), h[tb.index(0, 0) : tb.index(len(ix_launches), 0)]
             )
-        dev.record(_HOST_EVENT + k)
+        dev.record(self._host_event + k)
         self._host_pending[k] = True
         # ---- launches
         # one launch for a layer's attention (dense: the step needs one slot launch)
@@ -1088,8 +1078,6 @@ _SAMPLED = {
 _SAMPLED_BYTES = 512 + 8 * TOP_MAX * MAX_T
 _SAMPLE_TABLE = 4 * PARAMS * MAX_T + 256
 _SAMPLE_LAST = 4 * PARAMS * MAX_T
-_HOST_EVENT = 60  # device event slots 60, 61: the pinned table copies
-_STAGE_EVENT = 56  # 56, 57: the sampler output staging copies
 
 
 __all__ = ["Ml4Gaudi", "Row", "BUCKETS", "MAX_T", "SLOT_KEYS"]

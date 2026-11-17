@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Store one residual column per sequence into its STATE block's hidden slot (the H f32 values
 // the MTP layer of a continuing prefill reads at its first position).
 // tensors: 0 arena (128, PR, NB) f32  1 x (H, T) f32  2 table (2, R) i32 [column, first row;

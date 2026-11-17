@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MTP input: out = sigma-packed bf16 [enorm(e) | hnorm(out_norm(x))], the (2H, T) operand of the
 // MTP fc (eh_proj) GEMM. x is the main model's final residual (pre final norm), e the embedding
 // of the next token. All norms: v / rms(v) * w.

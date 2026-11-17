@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Mistral-Large-4 DSA indexer scores: acc[j, t] = sum_h w[h, t] * relu(scale * S[j, h T + t]) (S: the head-major
 // q . k GEMM over [cached | own] index keys; w: weights_proj(h) * n_heads^-0.5).
 // tensors: 0 S (Lk, NH * T) f32  1 w (NH, T) f32 | 2 acc (Lk, T) f32

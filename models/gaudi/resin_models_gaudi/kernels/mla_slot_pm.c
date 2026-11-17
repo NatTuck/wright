@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA slot attention softmax partials over a prefill chunk's DSA mask (Mistral-Large-4; mla_slot_pk
 // with its selection computed once per column: ix_mask). A key whose mask is 0 is kept. For each column:
 //   mx = max_kept s * scale,  P[i] = exp2-based exp(s[i] * scale - mx) (bf16, natural key order),

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DeepSeek-V4.1 DSpark Markov step: each row's logits at its block's column i, in vocabulary order, plus the
 // Markov bias: z[r V_r + v, b] = L[v, b block + i, r] + bias[r V_r + v, b] (L: the all-gathered logits of R
 // ranks' vocabulary slices of V_r each).

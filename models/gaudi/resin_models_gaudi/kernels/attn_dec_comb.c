@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Split-K flash decode, pass 2: merge the per-chunk P.V results of attn_dec_p + batch GEMM and
 // the current token's own key/value into the normalized attention output of row r
 // (group j = r / hpg, head h = r % hpg):

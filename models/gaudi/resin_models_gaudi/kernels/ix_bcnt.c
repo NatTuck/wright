@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // DSA kept-key counts per 64-key block (Mistral-Large-4), for ix_list: over column c's visible
 // keys (vis[c]) of the score scratch, the keys whose mkey(score) is above the column's
 // threshold (ix_thr) and the ties (equal to it), packed as strict + 65536 * ties, and per group

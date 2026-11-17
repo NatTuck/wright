@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // GLM mHC coefficients (Manifold-constrained hyper-connections), vectorized across 64 tokens:
 //   mix = (X . fn^T) * r   (r = 1/rms of the token's flattened 4 streams: flat is RMS-normalized first)
 //   pre_s  = sigmoid(mix_s scale0 + base_s) + eps              s = 0..3

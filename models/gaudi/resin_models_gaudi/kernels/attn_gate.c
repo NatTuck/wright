@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Attention epilogue: out = bf16( (o_new + o_past) * sigmoid(gate) ), sigma order, heads
 // concatenated. Head h lives in KV group g = h/hpg: o*_g (256, hpg*T), column = h%hpg + hpg*t,
 // d in sigma order. Gate rows in p are in sigma order.

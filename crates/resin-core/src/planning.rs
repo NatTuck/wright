@@ -8,6 +8,9 @@ pub struct PlanningConfig {
     pub max_batch_tokens: Option<NonZeroU32>,
     pub prefill_chunk_size: NonZeroU32,
     pub checkpoint_alignment: Option<NonZeroU32>,
+    /// The cache layout's `replay_suffix_tokens`: a prefix hit leaves at
+    /// least this many final prefill tokens to compute.
+    pub replay_suffix_tokens: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,14 +87,16 @@ pub fn schedule_ready_prefix(
                 .checked_add(count)
                 .ok_or(PlanningError::TokenRangeOverflow)?;
             // A cached request must replay at least one token to recover its
-            // logits. At prompt end, therefore stop at the final checkpoint
-            // strictly before the input boundary. Intermediate chunks merely
-            // round down to a checkpoint without forcing tiny per-block calls.
-            let checkpoint_limit = if proposed_end == request.prefill_length {
-                proposed_end.saturating_sub(1)
-            } else {
-                proposed_end
-            };
+            // logits, and at least `replay_suffix_tokens` when the layout says
+            // so. A prefix hit therefore ends at or before `restorable`. A
+            // chunk that passes it stops at the final checkpoint at or before
+            // it, so that a later request can restore that checkpoint.
+            // Intermediate chunks merely round down to a checkpoint without
+            // forcing tiny per-block calls.
+            let restorable = request
+                .prefill_length
+                .saturating_sub(config.replay_suffix_tokens.max(1));
+            let checkpoint_limit = proposed_end.min(restorable);
             let checkpoint_end = checkpoint_limit / alignment.get() * alignment.get();
             if checkpoint_end > request.logical_context && checkpoint_end < proposed_end {
                 count = checkpoint_end - request.logical_context;
@@ -163,6 +168,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(3),
                 prefill_chunk_size: NonZeroU32::new(2).unwrap(),
                 checkpoint_alignment: None,
+                replay_suffix_tokens: 0,
             },
         )
         .unwrap();
@@ -181,6 +187,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(4),
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
                 checkpoint_alignment: None,
+                replay_suffix_tokens: 0,
             },
         )
         .unwrap();
@@ -197,6 +204,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(50).unwrap(),
                 checkpoint_alignment: None,
+                replay_suffix_tokens: 0,
             },
         )
         .unwrap();
@@ -211,6 +219,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                replay_suffix_tokens: 0,
             },
         )
         .unwrap();
@@ -223,6 +232,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                replay_suffix_tokens: 0,
             },
         )
         .unwrap();
@@ -235,11 +245,39 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                replay_suffix_tokens: 0,
             },
         )
         .unwrap();
         assert_eq!(exact[0].token_end(), Some(4));
         assert!(!exact[0].sample);
+    }
+
+    #[test]
+    fn replay_prefill_stops_at_the_last_checkpoint_a_hit_may_restore() {
+        let config = PlanningConfig {
+            max_batch_tokens: None,
+            prefill_chunk_size: NonZeroU32::new(2048).unwrap(),
+            checkpoint_alignment: NonZeroU32::new(256),
+            replay_suffix_tokens: 256,
+        };
+        // A hit on 1051 tokens ends at or before 795: the chunk stops at 768, not 1024.
+        let first = schedule_ready_prefix(&[prefill(1051, 0)], config).unwrap();
+        assert_eq!(first[0].token_end(), Some(768));
+        assert!(!first[0].sample);
+        let suffix = schedule_ready_prefix(&[prefill(1051, 768)], config).unwrap();
+        assert_eq!(suffix[0].token_end(), Some(1051));
+        assert!(suffix[0].sample);
+        // An intermediate chunk that passes the restorable end stops there too.
+        let budget = PlanningConfig {
+            prefill_chunk_size: NonZeroU32::new(512).unwrap(),
+            ..config
+        };
+        let middle = schedule_ready_prefix(&[prefill(1051, 512)], budget).unwrap();
+        assert_eq!(middle[0].token_end(), Some(768));
+        // A prompt no longer than the suffix has no restorable checkpoint.
+        let short = schedule_ready_prefix(&[prefill(300, 0)], config).unwrap();
+        assert_eq!(short[0].token_end(), Some(300));
     }
 
     #[test]
@@ -252,6 +290,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(4096),
                 prefill_chunk_size: NonZeroU32::new(4096).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(64),
+                replay_suffix_tokens: 0,
             },
         )
         .unwrap();
@@ -275,6 +314,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
                 checkpoint_alignment: None,
+                replay_suffix_tokens: 0,
             },
         )
         .unwrap();
@@ -298,6 +338,7 @@ mod tests {
                     max_batch_tokens: None,
                     prefill_chunk_size: NonZeroU32::new(4).unwrap(),
                     checkpoint_alignment: None,
+                    replay_suffix_tokens: 0,
                 },
             ),
             Err(PlanningError::MixedPhases)

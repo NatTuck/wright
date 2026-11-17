@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // e4m3 weight bytes -> fp8_inc, load time: the value halves (the block scales double on the host),
 // bytes equal to checkpoint.HALVE: mag >= 16 drops one exponent; below that the subnormals halve
 // rounding to even; 0x7f (NaN) becomes 0. Byte positions are kept.

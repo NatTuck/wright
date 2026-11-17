@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA slot gather (Mistral-Large-4): one slot's C cached keys into a dense bf16 slab, from the
 // pages mla_store writes in the byte arena (512, PR, NB) (PR a power of two). A latent page is
 // 128 FP8 token rows (natural order) and one row of their f32 scales; a rotary page

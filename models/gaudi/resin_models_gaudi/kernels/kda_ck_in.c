@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked KDA (GLM-5.3-Flash linear attention), stage 1, per (head h, chunk c of 64 tokens): the short
 // conv + SiLU of q / k / v, l2-norm of q (x dk^-0.5) and k, the forget gate g = lb sigmoid(exp(A_log)
 // (f + dt_bias)) (per channel, <= 0), beta = sigmoid(b), and the chunk's decay-scaled operands

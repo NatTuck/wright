@@ -89,7 +89,13 @@ continuations. Arrivals, cancellation, close and page boundaries drain before
 changing ownership. Failures after enqueue retain owners in quarantine.
 
 The fast path requires a stable decode cohort, sufficient remaining budget, and
-both write spans inside the same owned blocks in every cache group. Stop tokens,
+both write spans inside the same owned blocks in every cache group. With
+`RunnerConfig.continuation_extension`, a continuation whose next step crosses a
+block leases that block inside the running batch's lease instead: full-context
+groups grow, window rings rotate onto their oldest page (copying on write when
+it is shared), and recurrent groups still drain. Such a chain also ends where a
+row reaches a multiple of `continuation_extension` tokens while the prefix
+cache is on, because prefixes publish only between chains. Stop tokens,
 including EOS, can finish a request while its successor step is in flight: its
 result is published immediately, but its row
 and cache lease remain alive until that step completes. Successor outputs for
@@ -139,7 +145,10 @@ does not scan all cached entries.
 The generic Engine schedules one decode anchor per sequence. A runner with MTP
 or a drafter may draft and verify several tokens, then return the accepted token
 row. `cache_write_lookahead_tokens` reserves enough destinations for the maximum
-verified block. Draft state updates and target verification remain inside the
+verified block. `max_speculative_rows` identifies the decode steps that do not
+speculate: a step with more rows reserves no extra destinations, so its
+overlapped continuation stops only at the last token of a block (or not at all
+with `continuation_extension`). Draft state updates and target verification remain inside the
 model runner and its kernels.
 
 ## Failure boundary

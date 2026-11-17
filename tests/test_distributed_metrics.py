@@ -4,6 +4,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -11,6 +12,7 @@ import torch.multiprocessing as mp
 from resin import Parallelism, RunnerConfig
 from resin.backend.distributed import DistributedWorker
 from resin.backend.metrics import RunnerMetrics
+from resin.backend.step_transport import create_step_transport
 from resin.backend.topology import ParallelGroups
 
 
@@ -55,7 +57,7 @@ class _Runner:
         raise AssertionError("snapshot must not execute the model")
 
 
-def _rank(rank, rendezvous, output):
+def _rank(rank, rendezvous, output, mode):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -68,7 +70,8 @@ def _rank(rank, rendezvous, output):
         Parallelism(world_size=2, attn_tp=2), device_backend="gloo"
     )
     runner = _Runner(rank)
-    worker = DistributedWorker(runner, groups)
+    transport = create_step_transport(groups, mode, timeout=30)
+    worker = DistributedWorker(runner, groups, transport=transport)
     runner.worker = worker
 
     def no_objects(*args, **kwargs):
@@ -103,11 +106,12 @@ def _rank(rank, rendezvous, output):
         dist.destroy_process_group()
 
 
-def test_physical_rank_snapshots_preserve_counters_and_pending_work(tmp_path):
+@pytest.mark.parametrize("mode", ["gloo", "socket"])
+def test_physical_rank_snapshots_preserve_counters_and_pending_work(tmp_path, mode):
     output = tmp_path / "metrics.json"
     mp.spawn(
         _rank,
-        args=(f"file://{tmp_path / 'rendezvous'}", str(output)),
+        args=(f"file://{tmp_path / 'rendezvous'}", str(output), mode),
         nprocs=2,
         join=True,
     )

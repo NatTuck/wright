@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Residual add + RMSNorm.
 //  BF16 build:  xo = x (+ y);  h = bf16(rmsnorm(xo) * w)   (h in sigma order)
 //    tensors: 0 x (H,T) f32  1 y (H,T) f32  2 w (H) f32 | 3 xo (H,T) f32  4 h (H,T) bf16

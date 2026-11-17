@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Block-FP8 weight -> per-row FP8 (load time).
 // Input bytes are e4m3 weights in tau order within each 256-column block (byte s of a block holds
 // source column 64*(s%4) + s/4). The output keeps the byte positions.

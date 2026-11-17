@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Store a chunk's new K and V rows into their cache pages. Token n's
 // row of tensor j (K groups 0..3, then V groups 0..3) goes to arena row rows[j, n]; -1 skips it.
 // K rows are in natural token order; V staging rows are sigma_inv-permuted within 128-token

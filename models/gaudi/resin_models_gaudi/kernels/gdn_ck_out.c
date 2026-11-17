@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked gated delta rule, output stage: o = gamma_t (Q S0)[t] + (P D)[t] (per head h, chunk c,
 // token i; row-major 64 x 128 blocks, dims (128, 64, nv, NC)), then the gated RMSNorm
 //   out[128 h + j, 64 c + i] = rms(o) * w * silu(z)     (0 for padded tokens)

@@ -1,5 +1,6 @@
 """Shared serving/benchmark configuration preserves runner and checkpoint contracts."""
 
+import json
 from dataclasses import replace
 from inspect import signature
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from deploy.models import (
 
 
 @pytest.mark.parametrize("device, card", [(None, None), ("hpu", None), ("hpu:3", 3)])
-def test_gaudi_factory_arguments_match_runner(monkeypatch, device, card):
+def test_gaudi_factory_arguments_match_runner(monkeypatch, tmp_path, device, card):
     module = pytest.importorskip("resin_models_gaudi.qwen3_5.runner")
     spec = get_model("qwen3_5-gaudi2")
     constructor = signature(module.Qwen3_5GaudiRunner.__init__)
@@ -40,11 +41,93 @@ def test_gaudi_factory_arguments_match_runner(monkeypatch, device, card):
     assert args[0] == spec.path
     assert kwargs["card"] == card and kwargs["mtp"] == spec.draft_tokens
     assert kwargs["max_seq_len"] == 8192 + 2 * spec.draft_tokens - 1
-    assert kwargs["max_batch_size"] == 8
+    assert kwargs["max_batch_size"] == 8 and kwargs["drafter"] is None
+    # a DFlash 2 drafter directory: its drafts, and a verify step's lookahead of K
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    (drafter / "config.json").write_text(
+        json.dumps({"dflash_config": {"block_size": 8}})
+    )
+    create_runner(
+        spec,
+        device=device,
+        **{**options, "draft_tokens": 7},
+        assistant_checkpoint=drafter,
+    )
+    args, kwargs = calls[1]
+    assert kwargs["mtp"] == 7 and kwargs["drafter"] == drafter
+    assert kwargs["max_seq_len"] == 8192 + 7
+    create_runner(
+        spec,
+        device=device,
+        **{**options, "draft_tokens": 0},
+        assistant_checkpoint=drafter,
+    )
+    assert calls[2][1]["drafter"] is None  # no drafts: the drafter is not loaded
     with pytest.raises(ValueError, match="hpu"):
         create_runner(spec, device="cuda:0", **options)
     with pytest.raises(ValueError, match="4096"):
         create_runner(spec, device=device, **{**options, "prefill_chunk_size": 8192})
+
+
+@pytest.mark.parametrize("device, card", [("hpu", None), ("hpu:5", 5)])
+def test_glm_factory_arguments_match_runner(monkeypatch, tmp_path, device, card):
+    """GLM-5.3-Flash speculates with its MTP layer (a lookahead of 2K - 1) or a DFlash 2 drafter
+    directory (a lookahead of K); without drafts the drafter is not loaded."""
+    from deploy.models import validate_gaudi_options
+
+    module = pytest.importorskip("resin_models_gaudi.glm5_3_flash.runner")
+    spec = get_model("glm5_3_flash-gaudi2")
+    constructor = signature(module.Glm53FlashGaudiRunner.__init__)
+    calls = []
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            constructor.bind(self, *args, **kwargs)
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(module, "Glm53FlashGaudiRunner", Runner)
+    options = dict(
+        groups=None,
+        context_length=65536,
+        max_batch_size=16,
+        prefill_chunk_size=4096,
+        draft_tokens=3,
+    )
+    create_runner(spec, device=device, **options)
+    args, kwargs = calls[0]
+    assert args[0] == str(spec.path)
+    assert kwargs["card"] == card and kwargs["mtp"] == 3 and kwargs["drafter"] is None
+    assert kwargs["max_seq_len"] == 65536 + 5
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    (drafter / "config.json").write_text(
+        json.dumps({"dflash_config": {"block_size": 8}})
+    )
+    create_runner(
+        spec,
+        device=device,
+        **{**options, "draft_tokens": 7},
+        assistant_checkpoint=drafter,
+    )
+    args, kwargs = calls[1]
+    assert kwargs["mtp"] == 7 and kwargs["drafter"] == drafter
+    assert kwargs["max_seq_len"] == 65536 + 7
+    create_runner(
+        spec,
+        device=device,
+        **{**options, "draft_tokens": 0},
+        assistant_checkpoint=drafter,
+    )
+    assert calls[2][1]["drafter"] is None
+    # the option check: up to 3 MTP drafts, up to the drafter's block with -md
+    settings = dict(max_batch_size=16, prefill_chunk_size=4096)
+    validate_gaudi_options(spec, draft_tokens=3, **settings)
+    with pytest.raises(ValueError, match="--draft-tokens"):
+        validate_gaudi_options(spec, draft_tokens=7, **settings)
+    validate_gaudi_options(spec, draft_tokens=7, assistant=drafter, **settings)
+    with pytest.raises(ValueError, match="--draft-tokens"):
+        validate_gaudi_options(spec, draft_tokens=8, assistant=drafter, **settings)
 
 
 @pytest.mark.parametrize("device, card", [("hpu", None), ("hpu:5", 5)])
@@ -119,6 +202,7 @@ def test_text_only_recipe_refuses_media():
 
 THINKING_LEVELS = {
     "qwen3_5": ("low", "medium", "xhigh"),
+    "qwen4_exp": ("low", "medium", "xhigh"),
     "glm5_3_flash": ("low", "high", "max"),
     "deepseek_v41": ("low", "high", "max"),
     "mistral_large4": ("low", "medium", "high"),
@@ -182,3 +266,17 @@ def test_existing_complete_cache_adoption_never_downloads(monkeypatch, tmp_path,
     (spec.path / weights).write_bytes(b"changed size")
     with pytest.raises(FileNotFoundError, match="incomplete"):
         require_checkpoint(spec)
+
+
+def test_sampling_defaults_come_from_generation_config(tmp_path):
+    from deploy.models import SamplingDefaults
+
+    assert SamplingDefaults.read(tmp_path) == SamplingDefaults()
+    (tmp_path / "generation_config.json").write_text(
+        '{"temperature": 1.0, "top_p": 0.95, "top_k": 20, "do_sample": true}'
+    )
+    assert SamplingDefaults.read(tmp_path) == SamplingDefaults(1.0, 0.95, 20)
+    (tmp_path / "generation_config.json").write_text(
+        '{"temperature": "hot", "top_k": true}'
+    )
+    assert SamplingDefaults.read(tmp_path) == SamplingDefaults()

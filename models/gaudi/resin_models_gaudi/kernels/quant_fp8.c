@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Per-token dynamic FP8 quantization of an f32 activation (natural order) for an FP8 GEMM:
 //   s = max|x_t| / 240;  q = fp8(x / s) in tau order.
 // tensors: 0 x (K,T) f32 | 1 q (K,T) fp8  2 s (1,T) f32.  index space: [T]. K multiple of 256.

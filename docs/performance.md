@@ -1,325 +1,408 @@
 # Performance
 
-These tables have every throughput result of the real-text sweep. The README shows a summary.
+These tables have every throughput result of the Wright 0.3.0 sweep. The README shows a summary. The results of
+Wright 0.1.0 and 0.2.0 are in [`performance-0.2.0.md`](performance-0.2.0.md). They use a different method, so do
+not compare the two sets value for value.
 
 ## Method
 
-[`scripts/sweep.py`](../scripts/sweep.py) starts one server for each setting, and runs
-[llama-benchy](https://github.com/eugr/llama-benchy) at commit `e9be344` against it, for each
-context length and number of requests.
+[`scripts/bench.py`](../scripts/bench.py) loads the model on its cards and runs the Engine without the HTTP
+server. The sweep uses the [cross grid](#the-cross-grid): contexts from 2K to 64K at 1 and at 8 requests, and 1 to
+64 requests at 4K and at 64K context, with one load of the model for each configuration.
 
-- **Text:** English from a public domain book. Each prompt fills the context, less the reply.
-- **Reply:** 256 generated tokens for each request.
-- **Sampling:** The values in the `generation_config.json` of each checkpoint. The Qwen models have
-  thinking off. Mistral-Large-4 and GLM-5.3-Flash use low reasoning. The Qwen3.5 dense checkpoints
-  have no `generation_config.json`. They use temperature 1.0, top-p 0.95, and top-k 20, the values
-  of their model cards and of Qwen3.8-27B.
-- **Cache:** The prefix cache is off, so every prompt goes through prefill.
-- **Runs:** A cell is the mean of 3 runs after 1 warmup run. A cell with 131,072 or more prompt
-  tokens in total (context times requests) runs once, with no warmup. A `¹` marks these cells.
-- **Hardware:** HL-225 cards, Synapse 1.24.1, and the pinned checkpoints.
-- **Dates:** UTC−7.
+- **Text:** passages of English prose and of source code from
+  [`scripts/fetch_bench_corpus.py`](../scripts/fetch_bench_corpus.py). A prompt has as many tokens of its passage
+  as its context.
+- **Decode:** each request generates up to 512 tokens. The benchmark times 512 decode steps after 5 warmup steps.
+  A request that ends starts again with the same prompt and the next seed.
+- **Prefill:** one request, from the chunks of the prompts that grow from one context to the next. Refer to
+  [Prefill](#prefill).
+- **Sampling:** the values in the `generation_config.json` of each checkpoint. The Qwen3.5 dense checkpoints have no
+  `generation_config.json`, so they use temperature 1.0, top-p 0.95, and top-k 20, as Qwen3.8-27B does. The Qwen
+  models have thinking off. GLM-5.3-Flash and DeepSeek-V4.1-Flash use low reasoning.
+- **Cache:** the prefix cache is on, because the grid uses it to reuse the prompts.
+- **Runs:** one run for each text, with seed 1. A cell is valid when its stalls (steps that take more than 10
+  times the median step and more than 0.1 s) take 1% of its time or less. A busy host can make stalls. The sweep
+  measured the cells that were not valid again on a quiet host. A cell that still had stalls has a † mark.
+- **Cards:** the results of one model come from one set of cards, for all its configurations.
+- **Drafts:** the servers select drafts for each step with the default policy (`auto`). With a drafter, the decode
+  rate depends on the text. These tables use one passage for each text, so a drafter can give other values with
+  other passages. For example, DFlash 2 on code at 2K with 1 request gives 166 tok/s here, and it gave 199 tok/s
+  in an earlier sweep that took the median of 3 passages.
+- **Hardware:** HL-225 cards, Synapse 1.24.1, and the pinned checkpoints in
+  [Checkpoints](../README.md#checkpoints). The results are from 2026-11-15, and
+  GLM-5.3-Flash MTP-3 and DFlash 2 from 2026-11-16.
 
 ## How to read the tables
 
-Each cell shows **prefill / decode / peak** in tok/s.
-
-- **Prefill** is the prompt tokens per second. For one request, the time runs to the first token.
-  For more than one request, it is the prompt rate that llama-benchy reports.
-- **Decode** is the total of generated tokens per second for all requests together.
-- **Peak** is the highest total in any one second of the run.
-- **No fit** means that the sweep did not run that cell, because a cell with the same number of
-  tokens or fewer did not fit all its requests in the KV cache at the same time.
-
-llama-benchy sends all requests at the same time. Thus, with more than one request, the decode time
-includes the prefill of the other requests, and at long context most of the time is prefill. The
-sweep does not measure a server that receives requests at different times.
-
-In agentic workloads, each turn adds to a context that the server has already seen. This is
-generally not a problem there: the prefix cache holds the earlier context, so each turn prefills
-little more than the new tokens. The sweep ran before Wright divided the card time between prefill
-and decode. Its results are the same as with `--decode-share 0`. Refer to
-[Prefill stops decode for one chunk](../README.md#prefill-stops-decode-for-one-chunk).
+- The values are tok/s.
+- **Prefill** is the prompt tokens per second of one request, with prose.
+- **Decode** is the total of generated tokens per second for all requests together, in the form
+  **prose / code**.
+- **No fit** means that the requests of that cell do not fit in the KV cache of the cards at the same time.
+- **†** means that the cell had stalls in each run. The value is the rate without the time of the stalls. The note
+  of the model tells more.
 
 ## Make the results
 
-Run one command for each model. Each setting writes its own JSONL file in `--output`, and a stopped
-sweep continues where it stopped. `--report` prints the tables.
+Get the text, then run one command for each configuration. The commands are in [Commands](#commands).
 
 ```bash
-uv run --no-default-groups --group gaudi scripts/sweep.py \
-  --qwen ~/models/Qwen3.8-27B-FP8 --texts english \
-  --only qwen-mtp0,qwen-mtp1,qwen-mtp2 --output bench/sweep
-
-uv run --no-default-groups --group gaudi scripts/sweep.py \
-  --glm ~/models/GLM-5.3-Flash --texts english \
-  --only glm-8cards-mtp0,glm-8cards-mtp1,glm-8cards-mtp2,glm-4cards-mtp0,glm-4cards-mtp1,glm-4cards-mtp2 \
-  --output bench/sweep
-
-uv run --no-default-groups --group gaudi scripts/sweep.py \
-  --mistral ~/models/Mistral-Large-4-1T-A52B-GGUF \
-  --mistral-tokenizer ~/models/Mistral-Large-4-tokenizer \
-  --mistral-drafter ~/models/Mistral-Large-4-drafter \
-  --texts english --contexts 2048,8192,32768 --concurrency 1,4,16 \
-  --only mistral-nodraft --output bench/sweep
-uv run --no-default-groups --group gaudi scripts/sweep.py \
-  --mistral ~/models/Mistral-Large-4-1T-A52B-GGUF \
-  --mistral-tokenizer ~/models/Mistral-Large-4-tokenizer \
-  --mistral-drafter ~/models/Mistral-Large-4-drafter \
-  --texts english --contexts 2048,8192,32768 --concurrency 1,2,4 \
-  --only mistral-dspark3 --output bench/sweep
-
-uv run --no-default-groups --group gaudi scripts/sweep.py \
-  --qwen35 ~/models --texts english --contexts 8192 --concurrency 1,8 \
-  --only qwen35-9b-mtp0 --output bench/sweep
+uv run --no-default-groups --group gaudi scripts/fetch_bench_corpus.py --output bench/corpus
 ```
 
-For the Qwen3.5 dense models, `--qwen35` is the folder that holds `Qwen3.5-9B-FP8` and the other
-sizes. Use `--only qwen35-4b-mtp0`, `qwen35-2b-mtp0`, or `qwen35-0.8b-mtp0` for the other sizes.
-To run the sizes at the same time on different cards, give each command its own `--gpu` and
-`--port`.
+- **Drafts:** use `--draft-tokens 0` for no drafts. For a drafter, add `--assistant-checkpoint` with the drafter
+  directory, and `--draft-tokens 7` for DFlash 2 or `--draft-tokens 15` for DSpine.
+- **Other models:** use `--model glm5_3_flash-gaudi2-tp4` (with `--step-transport native`), `deepseek_v41-gaudi2`
+  or `qwen3_5-9b-gaudi2` (and the other Qwen3.5 sizes). Use the sampling values of the checkpoint. For
+  GLM-5.3-Flash and DeepSeek-V4.1-Flash, use `--render-options '{"reasoning_effort": "low"}'` and no `--top-k`.
+- **Cards:** give each run its own cards with `--gpu`.
 
-The DeepSeek-V4.1-Flash results come from llama-benchy and one server. Start the server, then run
-llama-benchy:
+## The cross grid
+
+`scripts/bench.py --grid cross` measures a grid of decode cells and the prefill of one request at each context
+of the grid, with one load of the model. It reuses the prefilled prompts, so it needs much less prefill than one
+fresh cohort for each cell.
+
+- **Rows:** contexts 2K, 4K, 8K, 16K, 32K and 64K, each at 1 and at 8 streams. Change them with
+  `--grid-row-contexts` and `--grid-row-streams`.
+- **Columns:** 1, 2, 4, 8, 16, 32 and 64 streams, each at 4K and at 64K context. Change them with
+  `--grid-column-streams` and `--grid-column-contexts`. Give `none` for no rows or no columns.
+- **Fit:** the benchmark does not measure a cell whose requests do not fit in the KV cache at the same time.
+- **Text:** the grid needs `--prompt-file`. It runs the whole grid for each prompt file, sampling mode and seed.
+
+### How the grid reuses the prompts
+
+- A prompt of context C has C tokens of its passage (with the instruction), then the closing tokens of the chat
+  template (2 to 9 tokens). Thus the prompts of one sequence at two contexts start with the same tokens.
+- The prefix cache is on. The first 8 sequences (the widest row) grow. At each context, their prefill computes
+  only the tokens that the prefix cache does not hold from the previous context.
+- A cell decodes some of the sequences that have the context of the cell. The other sequences stay in the
+  prefix cache and do not decode. Each request of a cell computes only the closing tokens again. For
+  DeepSeek-V4.1-Flash, it also computes the last 256 prompt tokens again (bounded replay).
+- When a cell needs more sequences than the grid has at that context, the benchmark prefills the new sequences
+  once. The widest cell of each context runs first, so the narrower cells use its sequences.
+- A request that ends gets the same prompt again, with the next seed.
+- `--no-grid-reuse` prefills each cell from an empty prefix cache. Use it to compare the method with fresh
+  prompts.
+
+The decode rate is the committed tokens divided by the time of the measured steps, as for the other results.
+
+### Prefill
+
+The prefill row of each context is the time of one request, from the chunks that the sequences prefilled while
+they grew. The sequences grow one at a time, so each chunk is the only work of its step. Each chunk of the prompt
+gets the median of its times over the sequences that grow (8 with the default rows), and the row is the sum of
+these medians. Thus one slow step does not change the rows of the longer contexts. The benchmark uses the growth
+chunks only when they are the same as the chunks of a fresh prefill of the prompt. This is true for Qwen3.5,
+Qwen3.8 and GLM-5.3-Flash, whose cache checkpoints are at multiples of the 4,096-token chunk. Otherwise the
+benchmark prefills 3 new prompts of that context and uses the median of each chunk. DeepSeek-V4.1-Flash computes
+the last prompt tokens again after a prefix hit, so its prefill rows use new prompts. The `prefill_method` field
+of the result is `growth` or `fresh`, and `prefill_samples` has the total time of each prompt.
+
+### Drafts in one load
+
+`--draft-tokens 0,K` measures each cell with the drafts off and with K drafts, with one load. Only a runner that
+can turn its drafts off and on at run time can do this: DeepSeek-V4.1-Flash, with `--step-transport native` on
+8 cards. DeepSeek-V4.1-Flash makes drafts only on decode steps of 2 sequences or fewer. Thus a cell of 1 or 2
+streams runs once with each configuration. A wider cell runs once with no drafts, and its result is for both
+configurations. Other models use one run for each draft configuration.
+
+### The fields of a grid result
+
+A grid result has the fields of the other results, and these fields:
+
+| Field | Value |
+|---|---|
+| `grid`, `reuse` | `cross`, and whether the grid reused the prompts |
+| `draft_config` | The configuration of the run: `none`, `mtpK`, `dflashK`, `dspineK` or `dsparkK` |
+| `configs` | The configurations that the result is for |
+| `drafting` | Whether the decode steps of the cell can make drafts |
+| `prompt_tokens` | The tokens of each prompt: the context and the closing tokens |
+| `grown`, `grown_rows` | Whether all sequences of the cell grew from a shorter context, and how many did |
+| `resident`, `subset` | The sequences at the context of the cell, and whether the cell decodes fewer of them |
+| `prefill_method`, `prefill_chunks`, `prefill_samples` | For a prefill row: `growth` or `fresh`, the chunks that it adds, and the total of each prompt |
+
+Each result (with a grid or not) also has `host`: the 1-minute load average at the start and at the end of the
+result, the busy cores while it ran, and its start and end times. `stall_steps` and `stall_seconds` count the
+steps that took more than 10 times the median step and more than 0.1 s, and the time that they added. The rate
+includes these steps. Use these values to find results from a busy host.
+
+### Commands
 
 ```bash
-wright -m ~/models/DeepSeek-V4.1-Flash-1017 --spec-draft-n-max 3 -c 512000 -np 8 \
-  --decode-share 25:99
-
-uvx --from git+https://github.com/eugr/llama-benchy@e9be344578cec17745066b220798b80a0d2686d3 \
-  llama-benchy --base-url http://127.0.0.1:8080/v1 \
-  --model deepseek-ai/DeepSeek-V4.1-Flash-1017 \
-  --served-model-name deepseek-ai/DeepSeek-V4.1-Flash-1017 \
-  --tokenizer ~/models/DeepSeek-V4.1-Flash-1017 \
-  --pp 1024 4096 32768 --tg 512 1024 --concurrency 1 2 4 8 \
-  --runs 3 --warmup-runs 1 --no-cache --latency-mode generation --skip-coherence \
-  --book-url https://www.gutenberg.org/files/1661/1661-0.txt \
-  --extra-body 'temperature=1.0,top_p=1.0,reasoning_effort="low"'
+uv run --no-default-groups --group gaudi scripts/bench.py --model qwen3_5-gaudi2 \
+  --checkpoint ~/models/Qwen3.8-27B-FP8 --draft-tokens 2 --grid cross \
+  --prompt-file english=bench/corpus/english.jsonl --prompt-file code=bench/corpus/coding.jsonl \
+  --text-modes sampled --temperature 1.0 --top-k 20 --top-p 0.95 --seeds 1 \
+  --text-output-tokens 512 --text-steps 512 --render-options '{"enable_thinking": false}' \
+  --output bench/qwen-mtp2.jsonl
 ```
 
-To get the acceptance of drafts, read the `spec_accepted_tokens_total` and
-`spec_draft_tokens_total` counters at `/metrics` before and after each cell.
+For DeepSeek-V4.1-Flash with no drafts and with DSpark-3 in one load:
+
+```bash
+uv run --no-default-groups --group gaudi scripts/bench.py --model deepseek_v41-gaudi2 \
+  --checkpoint ~/models/DeepSeek-V4.1-Flash-1017 --draft-tokens 0,3 --step-transport native --grid cross \
+  --prompt-file english=bench/corpus/english.jsonl --prompt-file code=bench/corpus/coding.jsonl \
+  --text-modes sampled --temperature 1.0 --top-p 1.0 --seeds 1 \
+  --text-output-tokens 512 --text-steps 512 --render-options '{"reasoning_effort": "low"}' \
+  --output bench/deepseek.jsonl
+```
 
 ## Qwen3.8-27B, 1 card
 
-These results are from 2026-11-01.
+The four configurations ran on the same card.
 
-**No drafts** (`qwen-mtp0`)
+† In these MTP-2 cells on code, some steps took 0.5 to 1 s. This happened in the same cells in two runs, on
+two cards, and only with MTP-2 on code. The other configurations had no such steps.
 
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests | 32 requests |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1K | 3,460 / 64 / 65 | 3,295 / 125 / 126 | 3,305 / 238 / 240 | 3,291 / 362 / 400 | 3,293 / 485 / 599 | 3,300 / 567 / 758 |
-| 2K | 4,624 / 64 / 64 | 4,522 / 116 / 126 | 4,419 / 188 / 215 | 4,363 / 285 / 360 | 4,350 / 362 / 522 | 4,319 / 395 / 625 |
-| 4K | 4,858 / 64 / 64 | 4,491 / 104 / 115 | 4,512 / 146 / 187 | 4,547 / 184 / 281 | 4,521 / 210 / 373 | 4,530 / 227 / 435¹ |
-| 8K | 4,757 / 63 / 64 | 4,554 / 85 / 102 | 4,600 / 96 / 143 | 4,620 / 113 / 200 | 4,602 / 120 / 247¹ | 4,609 / 122 / 272¹ |
-| 16K | 4,351 / 60 / 61 | 4,263 / 59 / 82 | 4,296 / 58 / 105 | 4,290 / 61 / 129¹ | 4,287 / 58 / 137¹ | 4,290 / 60 / 157¹ |
-| 32K | 3,659 / 53 / 53 | 3,621 / 35 / 62 | 3,637 / 30 / 68¹ | 3,632 / 27 / 74¹ | 3,632 / 27 / 80¹ | 3,346 / 26 / 79¹ |
-| 64K | 2,753 / 44 / 45 | 2,734 / 16 / 42¹ | 2,747 / 12 / 39¹ | 2,744 / 11 / 40¹ | No fit | No fit |
-| 128K | 1,831 / 33 / 34¹ | 1,829 / 6 / 27¹ | 1,835 / 4 / 21¹ | No fit | No fit | No fit |
+**Prefill, 1 request** (prose)
 
-**MTP-1** (`qwen-mtp1`)
+| Context | No drafts | MTP-2 | DFlash 2 (7) | DSpine (15) |
+|---:|---:|---:|---:|---:|
+| 2K | 4,935 | 4,886 | 4,851 | 4,848 |
+| 4K | 5,129 | 5,088 | 5,066 | 5,067 |
+| 8K | 5,086 | 5,052 | 5,038 | 5,036 |
+| 16K | 4,810 | 4,782 | 4,772 | 4,770 |
+| 32K | 4,273 | 4,253 | 4,244 | 4,244 |
+| 64K | 3,473 | 3,460 | 3,455 | 3,454 |
 
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests | 32 requests |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1K | 3,330 / 93 / 93 | 3,153 / 175 / 178 | 3,162 / 276 / 296 | 3,161 / 416 / 494 | 3,168 / 505 / 655 | 3,165 / 557 / 791 |
-| 2K | 4,488 / 92 / 93 | 4,387 / 164 / 175 | 4,292 / 259 / 299 | 4,219 / 318 / 431 | 4,211 / 373 / 575 | 4,252 / 396 / 657 |
-| 4K | 4,726 / 89 / 89 | 4,370 / 128 / 160 | 4,392 / 172 / 239 | 4,434 / 200 / 332 | 4,416 / 206 / 384 | 4,416 / 229 / 461¹ |
-| 8K | 4,636 / 93 / 94 | 4,452 / 100 / 135 | 4,498 / 105 / 162 | 4,515 / 109 / 199 | 4,519 / 121 / 251¹ | 4,510 / 117 / 267¹ |
-| 16K | 4,250 / 83 / 84 | 4,158 / 65 / 98 | 4,190 / 61 / 116 | 4,199 / 61 / 134¹ | 4,188 / 60 / 150¹ | 4,192 / 59 / 160¹ |
-| 32K | 3,552 / 66 / 67 | 3,516 / 36 / 71 | 3,534 / 30 / 76¹ | 3,532 / 28 / 81¹ | 3,526 / 26 / 81¹ | 3,337 / 25 / 81¹ |
-| 64K | 2,655 / 54 / 54 | 2,636 / 16 / 51¹ | 2,649 / 11 / 46¹ | 2,645 / 11 / 44¹ | No fit | No fit |
-| 128K | 1,752 / 43 / 44¹ | 1,749 / 6 / 33¹ | 1,756 / 4 / 25¹ | No fit | No fit | No fit |
+**Decode, 1 request** (prose / code)
 
-**MTP-2** (`qwen-mtp2`)
+| Context | No drafts | MTP-2 | DFlash 2 (7) | DSpine (15) |
+|---:|---:|---:|---:|---:|
+| 2K | 64 / 64 | 99 / 131 | 97 / 166 | 91 / 167 |
+| 4K | 64 / 64 | 101 / 124 | 100 / 149 | 96 / 151 |
+| 8K | 61 / 61 | 93 / 119† | 85 / 178 | 82 / 187 |
+| 16K | 58 / 58 | 85 / 114 | 74 / 152 | 71 / 148 |
+| 32K | 57 / 56 | 83 / 106 | 70 / 133 | 68 / 133 |
+| 64K | 50 / 50 | 69 / 90 | 56 / 122 | 54 / 119 |
 
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests | 32 requests |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1K | 3,219 / 115 / 115 | 3,139 / 189 / 198 | 3,136 / 304 / 372 | 3,160 / 425 / 526 | 3,167 / 501 / 671 | 3,179 / 522 / 747 |
-| 2K | 4,427 / 113 / 113 | 4,360 / 206 / 215 | 4,269 / 268 / 318 | 4,219 / 311 / 446 | 4,230 / 360 / 560 | 4,207 / 372 / 627 |
-| 4K | 4,711 / 108 / 109 | 4,359 / 146 / 184 | 4,395 / 173 / 254 | 4,446 / 198 / 341 | 4,426 / 216 / 412 | 4,418 / 222 / 435¹ |
-| 8K | 4,627 / 103 / 104 | 4,449 / 113 / 151 | 4,495 / 104 / 170 | 4,525 / 107 / 215 | 4,509 / 112 / 252¹ | 4,514 / 119 / 267¹ |
-| 16K | 4,243 / 94 / 95 | 4,158 / 67 / 102 | 4,192 / 61 / 120 | 4,196 / 59 / 141¹ | 4,188 / 59 / 151¹ | 4,193 / 60 / 157¹ |
-| 32K | 3,554 / 71 / 71 | 3,514 / 37 / 77 | 3,531 / 30 / 79¹ | 3,533 / 28 / 82¹ | 3,531 / 26 / 83¹ | 3,322 / 25 / 85¹ |
-| 64K | 2,657 / 62 / 62 | 2,637 / 16 / 53¹ | 2,651 / 12 / 46¹ | 2,646 / 10 / 44¹ | No fit | No fit |
-| 128K | 1,753 / 45 / 45¹ | 1,750 / 6 / 34¹ | 1,757 / 4 / 26¹ | No fit | No fit | No fit |
+**Decode, 8 requests** (prose / code)
 
-## Mistral-Large-4, 8 cards
+| Context | No drafts | MTP-2 | DFlash 2 (7) | DSpine (15) |
+|---:|---:|---:|---:|---:|
+| 2K | 414 / 412 | 510 / 686 | 349 / 714 | 420 / 719 |
+| 4K | 386 / 387 | 483 / 604† | 334 / 576 | 399 / 585 |
+| 8K | 347 / 348 | 422 / 557† | 332 / 569 | 330 / 543 |
+| 16K | 290 / 290 | 351 / 474† | 284 / 515 | 289 / 476 |
+| 32K | 219 / 219 | 264 / 354 | 216 / 354 | 219 / 349 |
+| 64K | 148 / 147 | 179 / 235 | 140 / 244 | 158 / 243 |
 
-These results are from 2026-11-03.
+**Decode at 4K context** (prose / code)
 
-The model accepted 52% to 60% of the DSpark draft tokens. The drafter works on batches of up to 4
-sequences. At 32K with 16 requests, the KV cache held 11 requests at the same time. These results
-replace a sweep from 2026-11-01, which gave low decode rates at 8K and longer.
+| Requests | No drafts | MTP-2 | DFlash 2 (7) | DSpine (15) |
+|---:|---:|---:|---:|---:|
+| 1 | 64 / 64 | 101 / 124 | 100 / 149 | 96 / 151 |
+| 2 | 119 / 119 | 173 / 225† | 152 / 283 | 142 / 279 |
+| 4 | 215 / 217 | 294 / 387† | 224 / 423 | 255 / 428 |
+| 8 | 386 / 387 | 483 / 604† | 334 / 576 | 399 / 585 |
+| 16 | 598 / 598 | 676 / 875 | 556 / 604 | 578 / 587 |
+| 32 | 791 / 791 | 805 / 1,075 | 710 / 784 | 751 / 763 |
+| 64 | 1,011 / 1,011 | 1,006 / 1,007 | 998 / 998 | 999 / 998 |
 
-**No drafts** (`mistral-nodraft`)
+**Decode at 64K context** (prose / code)
 
-| Context | 1 request | 4 requests | 16 requests |
-|---:|---:|---:|---:|
-| 2K | 1,981 / 48 / 49 | 1,587 / 129 / 136 | 1,535 / 263 / 273 |
-| 8K | 2,043 / 43 / 44 | 1,882 / 96 / 100 | 1,875 / 176 / 192¹ |
-| 32K | 1,439 / 35 / 35 | 1,395 / 72 / 79¹ | 1,278 / 24 / 88¹ |
-
-**DSpark-3** (`mistral-dspark3`)
-
-| Context | 1 request | 2 requests | 4 requests |
-|---:|---:|---:|---:|
-| 2K | 1,950 / 74 / 75 | 1,838 / 110 / 122 | 1,567 / 141 / 155 |
-| 8K | 2,010 / 60 / 61 | 1,874 / 76 / 85 | 1,852 / 104 / 113 |
-| 32K | 1,427 / 48 / 48 | 1,389 / 64 / 67 | 1,382 / 79 / 86¹ |
-
-## GLM-5.3-Flash, 8 cards
-
-These results are from 2026-11-01.
-
-**No drafts** (`glm-8cards-mtp0`)
-
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests |
-|---:|---:|---:|---:|---:|---:|
-| 1K | 3,268 / 100 / 101 | 3,269 / 173 / 185 | 3,175 / 273 / 301 | 3,198 / 323 / 400 | 3,229 / 387 / 483 |
-| 2K | 3,881 / 99 / 99 | 3,794 / 159 / 170 | 3,468 / 223 / 268 | 3,363 / 258 / 360 | 3,427 / 262 / 409 |
-| 4K | 4,323 / 97 / 98 | 3,883 / 135 / 158 | 3,752 / 165 / 241 | 3,593 / 166 / 296 | 3,609 / 169 / 318 |
-| 8K | 4,228 / 90 / 90 | 3,957 / 102 / 143 | 3,903 / 105 / 182 | 3,817 / 104 / 218 | 3,847 / 103 / 249¹ |
-| 16K | 3,981 / 96 / 97 | 3,845 / 72 / 124 | 3,799 / 66 / 189 | 3,765 / 55 / 190¹ | 3,781 / 57 / 198¹ |
-| 32K | 3,517 / 96 / 97 | 3,446 / 38 / 108 | 3,436 / 31 / 109¹ | 3,423 / 28 / 149¹ | 3,430 / 25 / 174¹ |
-| 64K | 2,873 / 91 / 91 | 2,829 / 18 / 89¹ | 2,820 / 13 / 147¹ | 2,822 / 11 / 112¹ | 2,826 / 10 / 113¹ |
-| 128K | 2,092 / 85 / 86¹ | 2,073 / 8 / 79¹ | 2,071 / 5 / 67¹ | 2,073 / 4 / 128¹ | 2,074 / 4 / 156¹ |
-
-**MTP-1** (`glm-8cards-mtp1`)
-
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests |
-|---:|---:|---:|---:|---:|---:|
-| 1K | 3,179 / 130 / 130 | 3,106 / 200 / 211 | 3,141 / 269 / 310 | 3,179 / 305 / 363 | 3,121 / 286 / 356 |
-| 2K | 3,688 / 137 / 138 | 3,754 / 213 / 220 | 3,450 / 241 / 296 | 3,355 / 250 / 365 | 3,362 / 221 / 318 |
-| 4K | 4,315 / 136 / 137 | 3,964 / 150 / 185 | 3,789 / 165 / 247 | 3,532 / 155 / 279 | 3,561 / 149 / 262 |
-| 8K | 4,224 / 124 / 124 | 3,937 / 120 / 174 | 3,883 / 105 / 191 | 3,792 / 97 / 212 | 3,810 / 94 / 208¹ |
-| 16K | 3,970 / 130 / 131 | 3,811 / 72 / 148 | 3,765 / 62 / 195 | 3,738 / 57 / 184¹ | 3,756 / 52 / 170¹ |
-| 32K | 3,501 / 121 / 122 | 3,429 / 42 / 129 | 3,414 / 29 / 116¹ | 3,399 / 27 / 141¹ | 3,409 / 25 / 125¹ |
-| 64K | 2,858 / 126 / 126 | 2,817 / 20 / 109¹ | 2,808 / 13 / 158¹ | 2,809 / 11 / 152¹ | 2,812 / 11 / 109¹ |
-| 128K | 2,082 / 118 / 119¹ | 2,066 / 8 / 95¹ | 2,062 / 5 / 70¹ | 2,063 / 4 / 119¹ | 2,064 / 4 / 95¹ |
-
-**MTP-2** (`glm-8cards-mtp2`)
-
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests |
-|---:|---:|---:|---:|---:|---:|
-| 1K | 3,199 / 127 / 127 | 3,090 / 171 / 186 | 3,030 / 198 / 233 | 3,076 / 200 / 238 | 3,090 / 230 / 278 |
-| 2K | 3,827 / 125 / 125 | 3,745 / 174 / 185 | 3,794 / 194 / 229 | 3,398 / 173 / 237 | 3,330 / 183 / 256 |
-| 4K | 4,294 / 119 / 120 | 4,132 / 138 / 168 | 3,729 / 147 / 206 | 3,557 / 123 / 192 | 3,551 / 130 / 208 |
-| 8K | 4,215 / 118 / 118 | 3,947 / 109 / 159 | 3,882 / 95 / 158 | 3,791 / 84 / 157 | 3,802 / 86 / 187¹ |
-| 16K | 3,956 / 130 / 130 | 3,826 / 71 / 131 | 3,756 / 59 / 149 | 3,738 / 50 / 138¹ | 3,750 / 50 / 142¹ |
-| 32K | 3,499 / 120 / 120 | 3,430 / 40 / 114 | 3,416 / 29 / 91¹ | 3,393 / 26 / 105¹ | 3,413 / 25 / 116¹ |
-| 64K | 2,860 / 117 / 118 | 2,806 / 19 / 88¹ | 2,804 / 14 / 132¹ | 2,805 / 11 / 108¹ | 2,810 / 11 / 105¹ |
-| 128K | 2,085 / 115 / 115¹ | 2,066 / 8 / 90¹ | 2,062 / 5 / 60¹ | 2,063 / 4 / 60¹ | 2,064 / 4 / 56¹ |
+| Requests | No drafts | MTP-2 | DFlash 2 (7) | DSpine (15) |
+|---:|---:|---:|---:|---:|
+| 1 | 50 / 50 | 69 / 90 | 56 / 122 | 54 / 119 |
+| 2 | 81 / 80 | 103 / 143 | 80 / 150 | 77 / 161 |
+| 4 | 116 / 116 | 145 / 192 | 106 / 198 | 128 / 217 |
+| 8 | 148 / 147 | 179 / 235 | 140 / 244 | 158 / 243 |
+| 16 | No fit | No fit | No fit | No fit |
+| 32 | No fit | No fit | No fit | No fit |
+| 64 | No fit | No fit | No fit | No fit |
 
 ## GLM-5.3-Flash, 4 cards (`-tp4`)
 
-These results are from 2026-11-01.
+These results use `--step-transport native`. No drafts ran on 2026-11-15, and MTP-3 and DFlash 2 on 2026-11-16,
+on the same cards. With the DFlash 2 drafter, 64 requests at 4K and 16 requests at 64K do not fit.
 
-**No drafts** (`glm-4cards-mtp0`)
+**Prefill, 1 request** (prose)
 
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests |
-|---:|---:|---:|---:|---:|---:|
-| 1K | 2,396 / 91 / 91 | 2,366 / 155 / 159 | 2,376 / 222 / 233 | 2,387 / 235 / 291 | 2,374 / 270 / 335 |
-| 2K | 2,814 / 90 / 90 | 2,773 / 153 / 159 | 2,723 / 184 / 213 | 2,512 / 189 / 271 | 2,507 / 192 / 288 |
-| 4K | 3,365 / 88 / 88 | 2,985 / 110 / 133 | 2,913 / 127 / 182 | 2,700 / 116 / 216 | 2,717 / 123 / 228 |
-| 8K | 3,266 / 87 / 88 | 3,069 / 87 / 119 | 3,006 / 81 / 142 | 2,913 / 78 / 156 | 2,927 / 78 / 169¹ |
-| 16K | 3,037 / 85 / 86 | 2,916 / 54 / 104 | 2,887 / 51 / 138 | 2,854 / 43 / 145¹ | 2,863 / 40 / 141¹ |
-| 32K | 2,615 / 85 / 86 | 2,555 / 29 / 89 | 2,545 / 22 / 85¹ | 2,536 / 20 / 112¹ | 2,540 / 18 / 128¹ |
-| 64K | 2,046 / 82 / 83 | 2,016 / 14 / 79¹ | 2,009 / 25 / 167¹ | 2,009 / 9 / 87¹ | 2,014 / 8 / 101¹ |
-| 128K | 1,424 / 77 / 77¹ | 1,411 / 5 / 68¹ | 1,409 / 4 / 100¹ | 1,412 / 3 / 130¹ | 1,394 / 3 / 52¹ |
+| Context | No drafts | MTP-3 | DFlash 2 (7) |
+|---:|---:|---:|---:|
+| 2K | 2,949 | 2,929 | 2,918 |
+| 4K | 3,707 | 3,686 | 3,682 |
+| 8K | 3,716 | 3,702 | 3,697 |
+| 16K | 3,452 | 3,442 | 3,440 |
+| 32K | 2,962 | 2,953 | 2,956 |
+| 64K | 2,285 | 2,278 | 2,283 |
 
-**MTP-1** (`glm-4cards-mtp1`)
+**Decode, 1 request** (prose / code)
 
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests |
-|---:|---:|---:|---:|---:|---:|
-| 1K | 2,269 / 108 / 108 | 2,346 / 160 / 170 | 2,341 / 208 / 234 | 2,339 / 229 / 274 | 2,304 / 214 / 267 |
-| 2K | 2,768 / 112 / 112 | 2,766 / 170 / 176 | 2,601 / 172 / 214 | 2,446 / 171 / 246 | 2,471 / 162 / 229 |
-| 4K | 3,358 / 110 / 110 | 2,977 / 118 / 152 | 2,844 / 127 / 196 | 2,692 / 113 / 198 | 2,687 / 110 / 189 |
-| 8K | 3,266 / 112 / 112 | 3,039 / 91 / 136 | 2,980 / 80 / 145 | 2,885 / 74 / 156 | 2,902 / 72 / 168¹ |
-| 16K | 3,024 / 111 / 111 | 2,900 / 55 / 114 | 2,869 / 52 / 142 | 2,831 / 42 / 137¹ | 2,839 / 39 / 124¹ |
-| 32K | 2,600 / 108 / 108 | 2,539 / 31 / 101 | 2,521 / 24 / 129¹ | 2,523 / 18 / 109¹ | 2,527 / 19 / 103¹ |
-| 64K | 2,038 / 108 / 109 | 2,006 / 14 / 87¹ | 1,999 / 28 / 166¹ | 2,003 / 8 / 113¹ | 1,954 / 8 / 75¹ |
-| 128K | 1,418 / 100 / 100¹ | 1,405 / 5 / 77¹ | 1,402 / 3 / 103¹ | No fit | No fit |
+| Context | No drafts | MTP-3 | DFlash 2 (7) |
+|---:|---:|---:|---:|
+| 2K | 95 / 95 | 92 / 124 | 88 / 107 |
+| 4K | 95 / 94 | 96 / 130 | 89 / 117 |
+| 8K | 94 / 94 | 132 / 165 | 92 / 169 |
+| 16K | 93 / 93 | 120 / 137 | 87 / 108 |
+| 32K | 92 / 93 | 91 / 137 | 89 / 125 |
+| 64K | 91 / 91 | 95 / 121 | 86 / 113 |
 
-**MTP-2** (`glm-4cards-mtp2`)
+**Decode, 8 requests** (prose / code)
 
-| Context | 1 request | 2 requests | 4 requests | 8 requests | 16 requests |
-|---:|---:|---:|---:|---:|---:|
-| 1K | 2,341 / 102 / 103 | 2,297 / 140 / 154 | 2,291 / 156 / 177 | 2,293 / 146 / 174 | 2,278 / 164 / 200 |
-| 2K | 2,776 / 102 / 103 | 2,746 / 128 / 140 | 2,514 / 125 / 157 | 2,500 / 125 / 166 | 2,440 / 134 / 181 |
-| 4K | 3,349 / 98 / 99 | 3,100 / 103 / 127 | 2,886 / 103 / 143 | 2,680 / 90 / 142 | 2,672 / 96 / 155 |
-| 8K | 3,264 / 100 / 100 | 3,040 / 83 / 121 | 2,973 / 68 / 116 | 2,883 / 63 / 112 | 2,894 / 62 / 139¹ |
-| 16K | 3,020 / 106 / 107 | 2,900 / 56 / 105 | 2,862 / 47 / 109 | 2,832 / 40 / 103¹ | 2,840 / 37 / 108¹ |
-| 32K | 2,598 / 103 / 103 | 2,539 / 31 / 89 | 2,530 / 22 / 76¹ | 2,514 / 18 / 77¹ | 2,523 / 18 / 112¹ |
-| 64K | 2,034 / 93 / 94 | 2,000 / 13 / 79¹ | 1,989 / 13 / 92¹ | 1,995 / 8 / 78¹ | 1,947 / 8 / 67¹ |
-| 128K | 1,417 / 92 / 93¹ | 1,405 / 5 / 68¹ | 1,400 / 3 / 44¹ | No fit | No fit |
+| Context | No drafts | MTP-3 | DFlash 2 (7) |
+|---:|---:|---:|---:|
+| 2K | 324 / 320 | 332 / 333 | 317 / 324 |
+| 4K | 320 / 321 | 329 / 328 | 313 / 318 |
+| 8K | 316 / 316 | 324 / 325 | 297 / 302 |
+| 16K | 305 / 307 | 315 / 316 | 300 / 300 |
+| 32K | 297 / 298 | 305 / 305 | 279 / 288 |
+| 64K | 284 / 284 | 290 / 291 | 276 / 276 |
+
+**Decode at 4K context** (prose / code)
+
+| Requests | No drafts | MTP-3 | DFlash 2 (7) |
+|---:|---:|---:|---:|
+| 1 | 95 / 94 | 96 / 130 | 89 / 117 |
+| 2 | 160 / 161 | 152 / 224 | 150 / 157 |
+| 4 | 232 / 231 | 219 / 270 | 215 / 220 |
+| 8 | 320 / 321 | 329 / 328 | 313 / 318 |
+| 16 | 404 / 403 | 409 / 408 | 408 / 408 |
+| 32 | 467 / 468 | 467 / 467 | 466 / 465 |
+| 64 | 514 / 514 | 513 / 513 | No fit |
+
+**Decode at 64K context** (prose / code)
+
+| Requests | No drafts | MTP-3 | DFlash 2 (7) |
+|---:|---:|---:|---:|
+| 1 | 91 / 91 | 95 / 121 | 86 / 113 |
+| 2 | 149 / 149 | 144 / 179 | 140 / 168 |
+| 4 | 209 / 211 | 196 / 238 | 195 / 194 |
+| 8 | 284 / 284 | 290 / 291 | 276 / 276 |
+| 16 | 348 / 350 | 352 / 352 | No fit |
+| 32 | No fit | No fit | No fit |
+| 64 | No fit | No fit | No fit |
 
 ## DeepSeek-V4.1-Flash, 8 cards
 
-These results are from 2026-11-05, with DSpark-3 (`--spec-draft-n-max 3`). The method is different
-from the method of the other tables:
+These results use `--step-transport native`. One load measured both configurations. DSpark makes drafts only
+on decode steps of 2 requests or fewer, so with more requests the DSpark-3 values are the values with no
+drafts.
 
-- **Server:** One server ran all cells, with 512,000 tokens of context, `-np 8`, and
-  `--decode-share 25:99`.
-- **Prompt:** Each prompt has exactly 1K, 4K, or 32K tokens. The reply comes after it.
-- **Reply:** Each request generates a maximum of 512 or 1,024 tokens. A request stops when the
-  model ends its answer. Thus, some requests generate fewer tokens. Wright does not support
-  `min_tokens` or `ignore_eos`.
-- **Sampling:** The checkpoint has no `generation_config.json`. The requests use temperature 1.0,
-  top-p 1.0, and low reasoning.
-- **Drafts:** DSpark runs only on decode steps of 2 sequences or fewer. A larger step runs without
-  drafts. Thus, with 4 or 8 requests, most steps have no drafts. The percent in each cell is the
-  part of the draft tokens that the model accepted. In total, the model accepted 45%.
-- **Runs:** A cell is the mean of 3 runs after 1 warmup run. A `¹` marks a cell that ran once,
-  with no warmup. A `²` marks a cell that ran twice.
+**Prefill, 1 request** (prose)
 
-With 8 requests, prefill decreases to approximately 1,500 tok/s, because decode gets up to 99% of
-the card time. At 32K, a prefill takes approximately 10 s, and a reply takes less time. Thus, with
-more than one request, the requests decode mostly one after the other. As a result, the decode rate
-is low.
+| Context | Prefill |
+|---:|---:|
+| 2K | 5,377 |
+| 4K | 6,951 |
+| 8K | 7,819 |
+| 16K | 8,243 |
+| 32K | 8,216 |
+| 64K | 7,927 |
 
-**Replies of up to 512 tokens** (prefill / decode / peak, accepted drafts)
+**Decode, 1 request** (prose / code)
 
-| Prompt | 1 request | 2 requests | 4 requests | 8 requests |
-|---:|---:|---:|---:|---:|
-| 1K | 3,204 / 127 / 128, 43% | 3,341 / 187 / 198, 45% | 2,476 / 223 / 260, 57% | 1,510 / 247 / 369, 43% |
-| 4K | 4,017 / 115 / 116, 41% | 3,202 / 152 / 183, 43% | 2,356 / 151 / 224, 44% | 1,535 / 136 / 243, 44% |
-| 32K | 3,284 / 113 / 114, 44% | 2,665 / 53 / 117, 44% | 2,611 / 37 / 114, 48%¹ | 2,392 / 33 / 129, 45%¹ |
+| Context | No drafts | DSpark-3 |
+|---:|---:|---:|
+| 2K | 116 / 116 | 130 / 174 |
+| 4K | 115 / 115 | 139 / 168 |
+| 8K | 114 / 114 | 146 / 182 |
+| 16K | 113 / 113 | 140 / 175 |
+| 32K | 112 / 112 | 140 / 163 |
+| 64K | 109 / 109 | 127 / 168 |
 
-**Replies of up to 1,024 tokens** (prefill / decode / peak, accepted drafts)
+**Decode, 8 requests** (prose / code)
 
-| Prompt | 1 request | 2 requests | 4 requests | 8 requests |
-|---:|---:|---:|---:|---:|
-| 1K | 3,157 / 126 / 126, 45% | 3,343 / 163 / 219, 48% | 2,376 / 193 / 277, 48% | 1,514 / 257 / 395, 47% |
-| 4K | 4,021 / 128 / 128, 45% | 3,218 / 133 / 191, 42% | 2,351 / 134 / 250, 46% | 1,470 / 158 / 277, 42% |
-| 32K | 3,277 / 119 / 120, 49% | 2,796 / 52 / 122, 48%² | 2,453 / 43 / 122, 47%¹ | 2,338 / 37 / 129, 46%¹ |
+| Context | No drafts | DSpark-3 |
+|---:|---:|---:|
+| 2K | 469 / 469 | 469 / 469 |
+| 4K | 466 / 465 | 466 / 465 |
+| 8K | 457 / 457 | 457 / 457 |
+| 16K | 450 / 449 | 450 / 449 |
+| 32K | 437 / 436 | 437 / 436 |
+| 64K | 414 / 415 | 414 / 415 |
+
+**Decode at 4K context** (prose / code)
+
+| Requests | No drafts | DSpark-3 |
+|---:|---:|---:|
+| 1 | 115 / 115 | 139 / 168 |
+| 2 | 187 / 187 | 211 / 271 |
+| 4 | 295 / 296 | 295 / 296 |
+| 8 | 466 / 465 | 466 / 465 |
+| 16 | 606 / 605 | 606 / 605 |
+| 32 | 709 / 709 | 709 / 709 |
+| 64 | 831 / 831 | 831 / 831 |
+
+**Decode at 64K context** (prose / code)
+
+| Requests | No drafts | DSpark-3 |
+|---:|---:|---:|
+| 1 | 109 / 109 | 127 / 168 |
+| 2 | 175 / 175 | 201 / 248 |
+| 4 | 275 / 273 | 275 / 273 |
+| 8 | 414 / 415 | 414 / 415 |
+| 16 | 526 / 526 | 526 / 526 |
+| 32 | 603 / 603 | 603 / 603 |
+| 64 | 698 / 697 | 698 / 697 |
 
 ## Qwen3.5 dense, 1 card each
 
-These results are from 2026-11-03.
+These results have no drafts. The four sizes ran on the same card, one after the other.
 
-The four models ran at the same time, on four different cards.
+† A busy host made some steps of these cells slow.
 
-**Qwen3.5-9B, no drafts** (`qwen35-9b-mtp0`)
+**Prefill, 1 request** (prose)
 
-| Context | 1 request | 8 requests |
-|---:|---:|---:|
-| 8K | 12,994 / 169 / 170 | 12,397 / 304 / 517 |
+| Context | Qwen3.5-9B | Qwen3.5-4B | Qwen3.5-2B | Qwen3.5-0.8B |
+|---:|---:|---:|---:|---:|
+| 2K | 13,937 | 17,813 | 34,330 | 42,107 |
+| 4K | 14,654 | 18,810 | 38,481 | 47,334 |
+| 8K | 14,571 | 18,540 | 38,571 | 47,240 |
+| 16K | 13,794 | 17,227 | 36,789 | 44,407 |
+| 32K | 12,247 | 14,852 | 32,796 | 38,645 |
+| 64K | 9,936 | 11,576 | 26,694 | 30,430 |
 
-**Qwen3.5-4B, no drafts** (`qwen35-4b-mtp0`)
+**Decode, 1 request** (prose / code)
 
-| Context | 1 request | 8 requests |
-|---:|---:|---:|
-| 8K | 15,999 / 240 / 241 | 15,178 / 361 / 637 |
+| Context | Qwen3.5-9B | Qwen3.5-4B | Qwen3.5-2B | Qwen3.5-0.8B |
+|---:|---:|---:|---:|---:|
+| 2K | 173 / 173 | 252 / 252 | 418 / 427 | 600 / 599 |
+| 4K | 172 / 172 | 250 / 250 | 391 / 426 | 597 / 597† |
+| 8K | 162 / 162 | 229 / 229 | 421 / 408 | 588 / 588 |
+| 16K | 152 / 152 | 210 / 210 | 377 / 376 | 504 / 504 |
+| 32K | 147 / 147 | 200 / 199 | 338 / 337 | 436 / 435 |
+| 64K | 127 / 127 | 165 / 165 | 316 / 315 | 400 / 398 |
 
-**Qwen3.5-2B, no drafts** (`qwen35-2b-mtp0`)
+**Decode, 8 requests** (prose / code)
 
-| Context | 1 request | 8 requests |
-|---:|---:|---:|
-| 8K | 30,447 / 389 / 390 | 28,741 / 674 / 1,102 |
+| Context | Qwen3.5-9B | Qwen3.5-4B | Qwen3.5-2B | Qwen3.5-0.8B |
+|---:|---:|---:|---:|---:|
+| 2K | 1,086 / 1,088 | 1,435 / 1,462 | 2,471 / 2,481 | 3,104 / 3,121 |
+| 4K | 1,004 / 1,002 | 1,315 / 1,314 | 2,257 / 2,244 | 2,790 / 2,787 |
+| 8K | 882 / 879 | 1,113 / 1,112 | 2,158 / 2,155 | 2,634 / 2,636 |
+| 16K | 711 / 710 | 848 / 855 | 1,756 / 1,746 | 2,025 / 2,058 |
+| 32K | 518 / 518 | 593 / 591 | 1,282 / 1,282 | 1,441 / 1,426 |
+| 64K | 336 / 335 | 366 / 366 | 832 / 834† | 898 / 898† |
 
-**Qwen3.5-0.8B, no drafts** (`qwen35-0.8b-mtp0`)
+**Decode at 4K context** (prose / code)
 
-| Context | 1 request | 8 requests |
-|---:|---:|---:|
-| 8K | 36,359 / 504 / 506 | 34,211 / 818 / 1,309 |
+| Requests | Qwen3.5-9B | Qwen3.5-4B | Qwen3.5-2B | Qwen3.5-0.8B |
+|---:|---:|---:|---:|---:|
+| 1 | 172 / 172 | 250 / 250 | 391 / 426 | 597 / 597† |
+| 2 | 314 / 314† | 442 / 442† | 812 / 814 | 1,113 / 1,112 |
+| 4 | 563 / 562 | 760 / 760 | 1,375 / 1,376 | 1,784 / 1,652 |
+| 8 | 1,004 / 1,002 | 1,315 / 1,314 | 2,257 / 2,244 | 2,790 / 2,787 |
+| 16 | 1,533 / 1,532 | 1,884 / 1,882 | 3,643 / 3,580 | 4,365 / 4,380 |
+| 32 | 1,942 / 1,941 | 2,233 / 2,234 | 4,808 / 4,818 | 5,503 / 5,502 |
+| 64 | 2,404 / 2,401 | 2,660 / 2,660 | 5,584 / 5,528 | 6,163 / 6,160 |
 
+**Decode at 64K context** (prose / code)
+
+| Requests | Qwen3.5-9B | Qwen3.5-4B | Qwen3.5-2B | Qwen3.5-0.8B |
+|---:|---:|---:|---:|---:|
+| 1 | 127 / 127 | 165 / 165 | 316 / 315 | 400 / 398 |
+| 2 | 197 / 197 | 241 / 241 | 487 / 487 | 583 / 582 |
+| 4 | 273 / 273 | 312 / 312 | 674 / 674 | 751 / 761 |
+| 8 | 336 / 335 | 366 / 366 | 832 / 834† | 898 / 898† |
+| 16 | 378 / 377 | 398 / 397 | 929 / 936 | 973 / 979 |
+| 32 | 405 / 404 | 417 / 417 | 997 / 997 | 1,027 / 1,025 |
+| 64 | No fit | No fit | 1,062 / 1,062 | 1,085 / 1,085 |
+
+## Mistral-Large-4, 8 cards
+
+Wright 0.3.0 does not have new results for Mistral-Large-4. Refer to
+[`performance-0.2.0.md`](performance-0.2.0.md#mistral-large-4-8-cards).

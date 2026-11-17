@@ -19,9 +19,9 @@ import struct
 from dataclasses import dataclass
 
 from resin.models.glm5_3_flash.config import Glm53Config
+from resin_models_gaudi.common.sampling import PARAMS, sampler
 from resin_models_gaudi.glm5_3_flash.cache import ARENA_BLOCK_ROWS, ROW_BYTES
 from resin_models_gaudi.glm5_3_flash.weights import NS, RankSlices
-from resin_models_gaudi.qwen3_5.sampling import PARAMS, sampler
 from resin_models_gaudi.synapse.graph import Graph, Tensor
 from resin_models_gaudi.synapse.runtime import BF16, F8, F32, I32, U8, Device
 
@@ -111,6 +111,12 @@ class Dims:
 
 class LayerGraph:
     """A Graph with the decoder's building blocks."""
+
+    # 2 to COEF_PER_TOKEN tokens: mHC coefficients with one member per token (mhc_coeft); 0 keeps mhc_coef
+    COEF_PER_TOKEN = 0
+    # 2 to MIX_CHUNKS tokens: the site's projection in K chunks on 24 members (mhc_mixc), then mhc_coefp; 0 keeps
+    # mhc_mix
+    MIX_CHUNKS = 0
 
     def __init__(self, device: Device, name: str, dims: Dims, tokens: int) -> None:
         gathered = dims.gathered(tokens)
@@ -226,6 +232,18 @@ class LayerGraph:
                 struct.pack("iffi", self.d.hc_iters, self.d.hc_eps, self.d.eps, NS * H),
             )
             return coef
+        if 1 < T <= self.MIX_CHUNKS and self._rt is None:
+            C = 4 if T <= 4 else 2 if T <= 8 else 1  # 6 row groups x C chunks x ceil(T / 4) token groups: 24 members
+            mixp, ssp = self.tensor((T, 24, C), F32), self.tensor((T, C), F32)
+            self.node("rg_mhc_mixc_f32", [fn, X], [mixp, ssp])
+            coef = self.input("c_out", (T, 24), F32)
+            self.node(
+                "rg_mhc_coefp_f32",
+                [mixp, ssp, self.input(tag + "_base", (24,), F32), self.input(tag + "_scale", (3,), F32)],
+                [coef],
+                struct.pack("iffi", self.d.hc_iters, self.d.hc_eps, self.d.eps, NS * H),
+            )
+            return coef
         mix = self.tensor((T, 32), F32)
         if self._rt is not None:
             rt = self._rt
@@ -237,7 +255,8 @@ class LayerGraph:
         params = struct.pack("if", self.d.hc_iters, self.d.hc_eps)
         base, scale = self.input(tag + "_base", (24,), F32), self.input(tag + "_scale", (3,), F32)
         coef = self.input("c_out", (T, 24), F32)
-        self.node("rg_mhc_coef_f32", [mix, rt, base, scale], [coef], params)
+        guid = "rg_mhc_coeft_f32" if T <= self.COEF_PER_TOKEN else "rg_mhc_coef_f32"
+        self.node(guid, [mix, rt, base, scale], [coef], params)
         return coef
 
     def collapse(self, X: Tensor, coef: Tensor, ln: str, q8: int = 0, mode: int = 0):
@@ -1025,7 +1044,7 @@ def head_columns_graph(device: Device, dims: Dims, tokens: int, columns: int) ->
 
 
 def sample_graph(device: Device, dims: Dims, tokens: int, rows: int, nranks: int) -> Graph:
-    """The device sampler (``qwen3_5.sampling``) over every column's logits (rows = T) or column ``last``'s
+    """The device sampler (``common.sampling``) over every column's logits (rows = T) or column ``last``'s
     (rows = 1). ``logits_all`` is the ranks' all-gathered vocabulary slices, (V_r, T, nranks)."""
     d, T, R = dims, tokens, rows
     lg = LayerGraph(device, f"sample_T{T}_R{R}_n{nranks}", d, T)

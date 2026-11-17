@@ -1,34 +1,50 @@
 # Modifications
 
 Wright is a modified version of [Resin](https://github.com/ekzhang/resin), from commit
-`2638d8509b6661913a17642ef44e3f30e35f47e9`. Resin is licensed under the Apache License 2.0. This file is the notice that section 4(b)
-of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) and the
+`2638d8509b6661913a17642ef44e3f30e35f47e9`. Resin is licensed under the Apache License 2.0, in
+[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt). This file is the notice that section 4(b) of that
+license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) and the
 [README](README.md#license) describe.
+
+Resin's `LICENSE` file held the Apache License 2.0. Wright moved that text, unchanged, to
+`LICENSES/Apache-2.0.txt`. Wright's `LICENSE` file holds the GNU Affero General Public License v3.0.
 
 ## Upstream files that Wright changed
 
 - `.github/workflows/python-checks.yml`
+- `Cargo.lock`
 - `Cargo.toml`
+- `LICENSE`
 - `NOTICE`
 - `README.md`
 - `crates/resin-core/Cargo.toml`
 - `crates/resin-core/src/engine.rs`
 - `crates/resin-core/src/lib.rs`
 - `crates/resin-core/src/metrics.rs`
+- `crates/resin-core/src/planning.rs`
+- `crates/resin-core/src/resources/paged.rs`
+- `crates/resin-core/src/resources/paged_kv.rs`
+- `crates/resin-core/src/resources/prefix.rs`
 - `crates/resin-core/src/scheduler.rs`
+- `crates/resin-core/tests/engine.rs`
 - `crates/resin-http/Cargo.toml`
 - `crates/resin-http/src/anthropic.rs`
 - `crates/resin-http/src/lib.rs`
+- `crates/resin-http/src/metrics.rs`
 - `crates/resin-http/src/metrics_encoder.rs`
 - `crates/resin-http/src/openai.rs`
 - `crates/resin-http/src/protocol.rs`
 - `crates/resin-http/tests/protocols.rs`
 - `crates/resin-py/Cargo.toml`
+- `crates/resin-py/src/cache.rs`
 - `crates/resin-py/src/http.rs`
+- `crates/resin-py/src/http_distributed.rs`
 - `crates/resin-py/src/http_session.rs`
 - `crates/resin-py/src/lib.rs`
 - `crates/resin-py/src/metrics.rs`
+- `crates/resin-py/src/output.rs`
 - `crates/resin-py/src/recipe.rs`
+- `crates/resin-py/src/runner.rs`
 - `crates/resin-recipe/Cargo.toml`
 - `crates/resin-recipe/README.md`
 - `crates/resin-recipe/src/deepseek.rs`
@@ -50,8 +66,11 @@ of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) a
 - `docs/scheduler.md`
 - `docs/scripts.md`
 - `pyproject.toml`
+- `resin/__init__.py`
 - `resin/_resin.pyi`
 - `resin/backend/__init__.py`
+- `resin/backend/command_transport.py`
+- `resin/backend/distributed.py`
 - `resin/backend/metrics.py`
 - `resin/bench.py`
 - `resin/kernel_cache.py`
@@ -69,7 +88,10 @@ of that license asks for. Wright also adds new files, which [`NOTICE`](NOTICE) a
 - `tests/test_bench_preflight.py`
 - `tests/test_checkpoint_cache.py`
 - `tests/test_deploy_models.py`
+- `tests/test_distributed.py`
 - `tests/test_distributed_http.py`
+- `tests/test_distributed_metrics.py`
+- `tests/test_distributed_transport.py`
 - `tests/test_http_lifecycle.py`
 - `tests/test_http_server.py`
 - `tests/test_kernel_cache.py`

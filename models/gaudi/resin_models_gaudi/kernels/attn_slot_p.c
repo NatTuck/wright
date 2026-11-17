@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Slot attention, softmax partials (after attn_dec_p). Slot s holds C keys at positions key0 ..
 // key0 + C - 1 and M query columns; column m is token qpos0 + m / hpg. Key i is visible to
 // column m when key0 + i <= its position and key0 + i < klen (keys past the chunk's real tokens
@@ -8,13 +8,14 @@
 //   (natural key order with P_LINEAR: mla_slot_p),
 //   0 when not visible),  l = sum_i P[i]
 // A column with no visible keys gets mx = NINF * scale, P = 0 and l = 0.
-// slots (8, S) i32 per slot: [group, qcol0, qpos0, key0, klen, 0, kmin, 0] (kmin, P_LINEAR builds
-// only: keys before position kmin are not visible either, e.g. a window that does not start on a
-// page; 0 in every table that has no window)
+// slots (8, S) i32 per slot: [group, qcol0, qpos0, key0, klen, 0, kmin, 0] (kmin, P_LINEAR and KMIN
+// builds only: keys before position kmin are not visible either, e.g. a window that does not start on
+// a page; 0 in every table that has no window)
 // tensors: 0 sc (C, M, S) f32  1 slots | 2 P (C, M, S) bf16  3 mx (Mp, S) f32  4 l (Mp, S) f32
 // (Mp = M rounded up to 64; lane r of stats column block b is column 64 b + r)
-// WINDOW builds (ds_slot_pw.c, with P_LINEAR): slot field 7 is a window W (0: none); column m sees only keys
-// at positions >= its position - W + 1.
+// WINDOW builds (ds_slot_pw.c with P_LINEAR, attn_slot_pd.c): slot field 7 is a window W (0: none); column m
+// sees only keys at positions >= its position - W + 1.
+// BLOCK_ALL builds (attn_slot_pd.c): every column sees every key below klen (a bidirectional block).
 // PER_COLUMN builds (ds_slot_pw1.c, ds_slot_p1.c): one member per column, index space [M, S].
 // params: scale, hpg. index space: [ceil(M / 64), S]
 #include "common.h"
@@ -36,7 +37,7 @@ void main(tensor sc, tensor slots, tensor P, tensor mx, tensor l, float scale, i
         const int key0 = s_i32_ld_g(gen_addr(fc, slots));
         fc[0] = 4;
         const int klen = s_i32_ld_g(gen_addr(fc, slots));
-#ifdef P_LINEAR
+#if defined(P_LINEAR) || defined(KMIN)
         fc[0] = 6;
         const int kmin = s_i32_ld_g(gen_addr(fc, slots));
 #ifdef WINDOW
@@ -61,7 +62,11 @@ void main(tensor sc, tensor slots, tensor P, tensor mx, tensor l, float scale, i
             while (h >= hpg) { h -= hpg; t++; }
             for (int r = 0; r < nc && c0 + r < M; r++) {
                 const int m = c0 + r;
+#ifdef BLOCK_ALL
+                int lim = klen;
+#else
                 int lim = qpos0 + t + 1 < klen ? qpos0 + t + 1 : klen;
+#endif
                 lim -= key0;
                 lim = lim < 0 ? 0 : (lim > C ? C : lim);
                 const float limf = (float)lim;

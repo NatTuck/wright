@@ -24,7 +24,7 @@ from resin_models_gaudi.deepseek_v41.weights import (
     slot_rows,
     table_rows,
 )
-from resin_models_gaudi.qwen3_5.checkpoint import tperm
+from resin_models_gaudi.loading.convert import tperm
 
 CHECKPOINT = os.environ.get("DS41_CHECKPOINT") or None
 

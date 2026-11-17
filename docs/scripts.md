@@ -8,7 +8,7 @@ qualification. Model-specific configuration belongs in `deploy/models.py`.
 
 | File | Purpose |
 | --- | --- |
-| [bench.py](../scripts/bench.py) | Construct a registered runner on this host's cards; sweep prefill contexts and decode batches through `resin.bench`; save JSONL, plots and Perfetto traces. |
+| [bench.py](../scripts/bench.py) | Construct a registered runner on this host's cards; sweep prefill contexts and decode batches through `resin.bench`; save JSONL, plots and Perfetto traces. `--grid cross` measures the cross grid of contexts and stream counts in one load and reuses its prompts; `--draft-tokens 0,K` measures DeepSeek-V4.1-Flash with DSpark off and on in one load. Refer to [The cross grid](performance.md#the-cross-grid). |
 | [sweep.py](../scripts/sweep.py) | Measure prefill and decode by context length with llama-benchy against a real server, and run GPQA Diamond. |
 | [batch_sweep.py](../scripts/batch_sweep.py) | Run `bench.py` on real text across batch sizes and draft settings. |
 | [fetch_bench_corpus.py](../scripts/fetch_bench_corpus.py) | Fetch the pinned English and code passages for the real-text benchmarks. |

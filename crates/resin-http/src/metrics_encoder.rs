@@ -97,6 +97,22 @@ impl MetricsEncoder {
                 &[("mode", mode)],
             );
         }
+        let continuations = &r.continuations;
+        for (outcome, value) in [
+            ("retained", continuations.retained),
+            ("extended", continuations.extended),
+            ("publish", continuations.publish),
+            ("queue", continuations.queue),
+            ("row", continuations.row),
+            ("block", continuations.block),
+        ] {
+            self.counter(
+                "decode_continuations_total",
+                "Decisions whether a decode step's successor continues on device feedback, by outcome.",
+                value as f64,
+                &[("outcome", outcome)],
+            );
+        }
         self.gauge(
             "num_running_reqs",
             "Admitted nonterminal requests, including in-flight work.",
@@ -280,13 +296,15 @@ impl MetricsEncoder {
     fn cache(&mut self, c: &CacheMetrics) {
         for (state, value) in [
             ("capacity", c.capacity_slabs),
+            ("held", c.held_slabs),
             ("free", c.free_slabs),
             ("occupied", c.occupied_slabs),
             ("evictable", c.reclaimable_slabs),
         ] {
             self.gauge(
                 "cache_slabs",
-                "Physical slabs in the shared pool; evictable is a subset of occupied.",
+                "Physical slabs in the shared pool; held is this model's part of a pool that models \
+                 of other processes share; evictable is a subset of occupied.",
                 value.into(),
                 &[("state", state)],
             );

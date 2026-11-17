@@ -19,6 +19,10 @@ from typing import Any, Literal
 import resin
 
 
+class _Stopping(Exception):
+    """A stop signal arrived during ``join_stopping_on_signals``' wait."""
+
+
 class ProcessError(RuntimeError):
     """A worker raised an exception or exited unsuccessfully."""
 
@@ -126,6 +130,7 @@ class ProcessContext:
         the remaining workers are terminated. Raises as :meth:`join` does.
         """
         deadline: list[float | None] = [None]
+        waiting = [False]
 
         def stop(signum, frame) -> None:
             if deadline[0] is None:
@@ -134,13 +139,24 @@ class ProcessContext:
                     self.processes[0].terminate()
             else:
                 deadline[0] = 0.0
+            if waiting[0]:
+                waiting[0] = False
+                raise _Stopping  # out of a wait with no timeout (the group serves: no polling)
 
         previous = {
             number: signal.signal(number, stop)
             for number in (signal.SIGTERM, signal.SIGINT)
         }
         try:
-            while not self.join(timeout=0.25):
+            while True:
+                try:
+                    waiting[0] = deadline[0] is None
+                    done = self.join(timeout=None if waiting[0] else 0.25)
+                    waiting[0] = False
+                    if done:
+                        break
+                except _Stopping:
+                    pass
                 if deadline[0] is not None and time.monotonic() >= deadline[0]:
                     break
         finally:

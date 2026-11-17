@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Attention prologue for one token per member (NG = number of KV groups, compile-time):
 //   q_h = rope(rmsnorm_256(q_h) * qn_w)  -> q_g bf16 sigma order, (256, hpg*T), column = h%hpg + hpg*t
 //   k_g = rope(rmsnorm_256(k_g) * kn_w)  -> kn_g row t           (chunk positions, natural order)

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked gated delta rule, stage 2: per (head h,
 // chunk c), from KK[t][s] = k_t.k_s and QK[t][s] = q_t.k_s (row-major, lanes = s):
 //   A[t][s] = beta_t exp(G_t - G_s) KK[t][s]  (s < t),   P[t][s] = exp(G_t - G_s) QK[t][s]  (s <= t)

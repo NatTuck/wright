@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked KDA, stage 5, per (head h, chunk c): o = QS + PD (inter-chunk q e^G S + intra-chunk P (U - W S)),
 // then the gated RMSNorm of the head: out = o / rms(o) * w * sigmoid(gate), bf16 in sigma order (the
 // o_proj GEMM operand), row h 128 + i of token c 64 + t.

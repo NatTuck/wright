@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MXFP4 -> FP8 (E4M3 bias 7, +-240), natural element order.
 //   out = FP8(code * 2^(S - 127 - k)): the tensor scale is 2^k (x = out * 2^k), applied by the caller.
 //   Exact while every block is at most 13 exponents below the block that sets k (k = max S - 127 - 5);

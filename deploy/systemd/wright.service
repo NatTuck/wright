@@ -5,7 +5,9 @@ Description=Wright inference server for Intel Gaudi 2
 After=network.target
 
 [Service]
-Type=simple
+# Wright tells systemd when it has loaded; rank 0 of a multi-card model sends it.
+Type=notify
+NotifyAccess=all
 User=wright
 WorkingDirectory=/opt/wright
 Environment=HABANA_SCAL_BIN_PATH=/opt/habanalabs/engines_fw
@@ -23,7 +25,8 @@ KillSignal=SIGTERM
 TimeoutStopSec=120
 Restart=on-failure
 RestartSec=10
-# Loading can take many minutes, and the server only listens once it finishes.
+# Loading can take many minutes, and the server only listens once it finishes. While it loads,
+# `systemctl status wright` shows the progress in the journal.
 TimeoutStartSec=infinity
 
 [Install]

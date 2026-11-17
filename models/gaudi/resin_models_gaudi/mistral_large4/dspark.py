@@ -36,10 +36,11 @@ import numpy as np
 
 from resin.models.mistral_large4.config import MistralLarge4Config
 from resin_models_gaudi.gguf import pack
+from resin_models_gaudi.loading.convert import bf16_rne
+from resin_models_gaudi.loading.source import Safetensors
 from resin_models_gaudi.mistral_large4 import layers as L
 from resin_models_gaudi.mistral_large4.cache import PAGE_TOKENS, STORE_FIELDS
 from resin_models_gaudi.mistral_large4.weights import RankSlices
-from resin_models_gaudi.qwen3_5.checkpoint import bf16_rne
 from resin_models_gaudi.synapse.graph import Graph
 from resin_models_gaudi.synapse.runtime import F32, I8, I32, Device
 
@@ -109,14 +110,11 @@ def prepare_drafter(
     """One rank's drafter weights from the release's safetensors (bf16): ``d{l}.*`` per layer
     (the target layer graphs' names, sliced as the target's), ``d.*`` shared. GEMV matrices as
     Q8_0 planar."""
-    import torch
-    from safetensors import safe_open
-
-    path = Path(checkpoint) / SHARD
-    with safe_open(str(path), framework="pt") as f:
+    src = Safetensors(Path(checkpoint) / SHARD)
+    try:
 
         def t(name: str) -> np.ndarray:
-            return f.get_tensor("mtp_dspark." + name).to(torch.float32).numpy()
+            return src.f32("mtp_dspark." + name)
 
         sl = RankSlices.of(cfg, rank, nranks)
         H, heads, qk = cfg.hidden_size, cfg.num_attention_heads, cfg.qk_head_dim
@@ -167,6 +165,8 @@ def prepare_drafter(
         yield "d.mk_w2", _planar_q8(t(h + "output.weight")), "planar:" + Q8
         yield "d.joint", _planar_q8(t(h + "joint_proj.weight")), "planar:" + Q8
         yield "d.joint_b", t(h + "joint_proj.bias"), "f32"
+    finally:
+        src.close()
 
 
 def drafter_config(checkpoint: Path | str) -> dict:

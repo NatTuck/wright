@@ -367,7 +367,7 @@ def test_ds_q8_p2_power_of_two_scales(device, recipes):
 
 
 def bf16_round(x: np.ndarray) -> np.ndarray:
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_rne, bf16_to_f32
+    from resin_models_gaudi.loading.convert import bf16_rne, bf16_to_f32
 
     return bf16_to_f32(bf16_rne(np.asarray(x, np.float32)))
 
@@ -375,7 +375,7 @@ def bf16_round(x: np.ndarray) -> np.ndarray:
 def test_window_attention_with_sink(device, recipes):
     """One prefill chunk: keys into pages (mla_store_p2), a slot over them, windowed softmax (ds_slot_pw) and the
     output with the sink (ds_slot_out), against numpy."""
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_rne
+    from resin_models_gaudi.loading.convert import bf16_rne
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import BF16, F32, I32, U8
 
@@ -715,7 +715,7 @@ def test_compressor_pool_and_state(device, recipes):
 def test_two_part_attention_with_sink(device, recipes):
     """A windowed slot over the chunk's own keys and a slot over other keys (all visible), each with its column max
     and sum (ds_slot_ml), merged with the sink (ds_attn_comb): one softmax over both key sets."""
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_rne
+    from resin_models_gaudi.loading.convert import bf16_rne
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import BF16, F32, I32, U8
 
@@ -1935,18 +1935,19 @@ def test_dense_softmax_keeps_the_listed_entries(device, recipes):
             np.testing.assert_allclose(P[s, m], e, rtol=1e-2, atol=1e-6)
 
 
-def test_direct_slot_merge_equals_the_scan(device, recipes):
-    """ds_slot_mld (column c's slot is c / M) writes what ds_slot_ml writes when slot s covers columns M s .. M s +
-    M - 1, a slot of group -1 included."""
+@pytest.mark.parametrize("S", [5, 8, 16, 40])
+def test_direct_slot_merge_equals_the_scan(device, recipes, S):
+    """ds_slot_mld and ds_slot_ml8 (column c's slot is c / M; 64 and 8 columns per member) write what ds_slot_ml
+    writes when slot s covers columns M s .. M s + M - 1, a slot of group -1 included."""
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import F32, I32
 
     rng = np.random.default_rng(22)
-    D, M, S = 512, 8, 40
+    D, M = 512, 8
     W = M * S
     slots = np.zeros((S, 8), np.int32)
     slots[:, 1] = M * np.arange(S)
-    slots[7, 0] = -1
+    slots[S // 2, 0] = -1
     inputs = {
         "O": rng.standard_normal((S, M, D)).astype(np.float32),
         "mx": rng.standard_normal((S, 64)).astype(np.float32),
@@ -1954,8 +1955,9 @@ def test_direct_slot_merge_equals_the_scan(device, recipes):
         "slots": slots,
     }
     outs = []
-    for guid in ("rg_ds_slot_mld_f32", "rg_ds_slot_ml_f32"):
-        g = Graph(device, f"t_{guid}_direct")
+    guids = ("rg_ds_slot_mld_f32", "rg_ds_slot_ml8_f32", "rg_ds_slot_ml_f32")
+    for guid in guids:
+        g = Graph(device, f"t_{guid}_direct_{S}")
         g.node(
             guid,
             [g.input("O", (D, M, S), F32), g.input("mx", (64, S), F32), g.input("l", (64, S), F32),
@@ -1964,5 +1966,6 @@ def test_direct_slot_merge_equals_the_scan(device, recipes):
         )  # fmt: skip
         outs.append(Run(device, recipes, g)(inputs, ["out", "m", "lc"]))
         g.destroy()
-    for k in ("out", "m", "lc"):
-        np.testing.assert_array_equal(outs[0][k], outs[1][k])
+    for out in outs[:-1]:
+        for k in ("out", "m", "lc"):
+            np.testing.assert_array_equal(out[k], outs[-1][k])

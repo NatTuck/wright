@@ -15,11 +15,12 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    AppState,
+    AppState, Models,
     openai::{RequestResult, invalid_request, routed_rank, validate_sampling},
     protocol::{
         ConversationRequest, GenerationEvent, RequestFailure, ResponseAccumulator, json_error,
     },
+    request_log::RequestReceipt,
 };
 
 #[derive(Debug, Deserialize)]
@@ -31,10 +32,8 @@ pub(crate) struct MessagesRequest {
     #[serde(default)]
     tools: Vec<Value>,
     max_tokens: usize,
-    #[serde(default = "default_temperature")]
-    temperature: f64,
-    #[serde(default = "default_top_p")]
-    top_p: f64,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     top_k: Option<u32>,
     #[serde(default)]
     stop_sequences: Vec<String>,
@@ -45,67 +44,57 @@ pub(crate) struct MessagesRequest {
     extra: BTreeMap<String, Value>,
 }
 
-const fn default_temperature() -> f64 {
-    1.0
-}
-
-const fn default_top_p() -> f64 {
-    1.0
-}
-
 pub async fn messages(
-    State(state): State<AppState>,
+    State(models): State<Models>,
     headers: HeaderMap,
     Json(mut body): Json<MessagesRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+    let receipt = RequestReceipt::new(models.first(), &headers, "msg", "POST /v1/messages");
+    let state = match models.route(&body.model, "not_found_error") {
+        Ok(state) => state,
+        Err(response) => return receipt.reject(*response),
+    };
+    body.routed_dp_rank = match routed_rank(state, &headers, body.routed_dp_rank) {
         Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
+        Err(response) => return receipt.reject(*response),
     };
     let stream = body.stream;
-    let request = match conversation_request(&state, body) {
+    let request = match conversation_request(state, body, &receipt) {
         Ok(request) => request,
-        Err(response) => return *response,
+        Err(response) => return receipt.reject(*response),
     };
     let receiver = match state.enqueue(request.clone()) {
         Ok(receiver) => receiver,
         Err((status, message)) => {
-            return (status, Json(json_error(message, "api_error"))).into_response();
+            return receipt
+                .reject((status, Json(json_error(message, "api_error"))).into_response());
         }
     };
-    if stream {
+    receipt.queued(state, &request, stream);
+    receipt.respond(if stream {
         messages_stream(request, receiver).into_response()
     } else {
         messages_response(request, receiver).await
-    }
+    })
 }
 
 fn conversation_request(
     state: &AppState,
     mut body: MessagesRequest,
+    receipt: &RequestReceipt,
 ) -> RequestResult<ConversationRequest> {
-    if body.model != state.model.as_ref() {
-        return Err(Box::new(
-            (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(json_error(
-                    format!(
-                        "model {:?} is not served; expected {:?}",
-                        body.model, state.model
-                    ),
-                    "not_found_error",
-                )),
-            )
-                .into_response(),
-        ));
-    }
     if body.messages.is_empty() {
         return Err(invalid_request("messages must not be empty"));
     }
     if body.max_tokens == 0 {
         return Err(invalid_request("max_tokens must be positive"));
     }
-    validate_sampling(body.temperature, body.top_p, body.top_k, None)?;
+    let (temperature, top_p, top_k) = (
+        state.metadata.temperature(body.temperature),
+        state.metadata.top_p(body.top_p),
+        state.metadata.top_k(body.top_k),
+    );
+    validate_sampling(temperature, top_p, top_k, None)?;
     if body.stop_sequences.iter().any(String::is_empty) {
         return Err(invalid_request("stop sequences must not be empty"));
     }
@@ -134,14 +123,15 @@ fn conversation_request(
         body.extra.insert("thinking".to_owned(), thinking);
     }
     Ok(ConversationRequest {
-        id: state.request_id("msg"),
+        id: receipt.id.clone(),
+        client_request_id: receipt.client_request_id.clone(),
         model: body.model,
         messages,
         tools,
         max_output_tokens: Some(body.max_tokens),
-        temperature: body.temperature,
-        top_p: body.top_p,
-        top_k: body.top_k,
+        temperature,
+        top_p,
+        top_k,
         seed: None,
         logprobs: false,
         top_logprobs: 0,
@@ -154,6 +144,7 @@ fn conversation_request(
         reasoning_effort: None,
         extra: body.extra,
         tokenize_only: false,
+        return_progress: false,
     })
 }
 
@@ -364,7 +355,7 @@ fn messages_stream(
                     let wire_index = tool_indices.get(index).copied().unwrap_or(index);
                     yield named_event("content_block_delta", json!({"type": "content_block_delta", "index": wire_index, "delta": {"type": "input_json_delta", "partial_json": delta}}));
                 }
-                GenerationEvent::FirstToken | GenerationEvent::Tokenized { .. } | GenerationEvent::Logprobs(_) | GenerationEvent::PromptLogprobs(_) => {}
+                GenerationEvent::FirstToken | GenerationEvent::PromptProgress(_) | GenerationEvent::Tokenized { .. } | GenerationEvent::Logprobs(_) | GenerationEvent::PromptLogprobs(_) => {}
                 GenerationEvent::StopSequence(sequence) => { stop_sequence = Some(sequence); }
                 GenerationEvent::Finished { reason, output_tokens, .. } => {
                     terminated = true;

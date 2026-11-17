@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Quantized weights in the planar layout, one type per build (-DQT_<type>):
 //  -DDEQ: dequantize to bf16 W^T [M (fastest), K, nmat]; item = (row block, superblock)
 //  else : GEMV out[:, col] = W_e x_col: bf16 codes x bf16 x, f32 accumulation;

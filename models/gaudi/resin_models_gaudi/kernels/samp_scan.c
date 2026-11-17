@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Sampling, pass 1 of 5 (scan): one member per (vocabulary chunk, row). The row's logits are cut
 // into NC chunks of whole 64-token vectors; a member scans its chunk twice:
 //   1. the chunk's finite maximum m_c, the count of NaN / +inf logits and per-lane candidates:

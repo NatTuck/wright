@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Mistral-Large-4: RMSNorm or LayerNorm (with bias) over the first n rows of each column, f32 -> f32 (natural order,
 // the lq GEMVs' input):  mode 0: y = x * rsqrt(mean x^2 + eps) * w;  mode 1: y = (x - mean) * rsqrt(var + eps) * w + b
 // tensors: 0 x (>= n, T) f32  1 w (n) f32  2 b (n) f32 (mode 1; any tensor otherwise) | 3 y (n, T) f32

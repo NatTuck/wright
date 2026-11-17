@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Chunked KDA, stage 2, per (head h, chunk c): the decay is already folded into the Gram products
 // (kda_ck_in's scaled operands), so from KK[t][s] = decayed k_t.k_s and QK[t][s] = decayed q_t.k_s:
 //   A[t][s] = beta_t KK[t][s] (s < t)      P[t][s] = QK[t][s] (s <= t)

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Per-token FP8 quantization (tau order, pack_tau) of an activation for an FP8 GEMM, with optional producers:
 //   mode & 1: v = x * sin[t]              (chains the previous FP8 GEMM's per-token scale)
 //   mode & 2: v = x * rsqrt(mean x^2 + eps) * nw    (RMSNorm, e.g. q_norm)

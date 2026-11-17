@@ -1,5 +1,7 @@
 """MTP speculative decoding under Resin's Engine (set ``RESIN_GAUDI_QWEN35`` to a Qwen3.8-27B FP8
-checkpoint directory with its MTP layer).
+checkpoint directory with its MTP layer), and the same with the DFlash 2 drafter (set
+``RESIN_GAUDI_DFLASH`` to its directory; the ``dflash`` cases skip without it) and the DSpine
+drafter (``RESIN_GAUDI_DSPINE``; the ``dspine`` cases).
 
 Every emitted token is the target's sample at its position, so speculative output must equal
 non-speculative decoding exactly, greedy or seeded: alone, batched, with a stop token inside an
@@ -13,11 +15,22 @@ import os
 import shutil
 from pathlib import Path
 
-import numpy as np
 import pytest
 
+# the K and V page types: RESIN_GAUDI_CACHE_TYPES=fp8,fp8 runs the tests on an FP8 cache
+CACHE_TYPES = tuple(os.environ.get("RESIN_GAUDI_CACHE_TYPES", "bf16,bf16").split(","))
+
 CHECKPOINT = os.environ.get("RESIN_GAUDI_QWEN35")
+DRAFT = os.environ.get("RESIN_GAUDI_DFLASH")
+DSPINE = os.environ.get("RESIN_GAUDI_DSPINE")
 K = 2
+# drafter cases: (environment variable, directory, drafts a step verifies)
+DRAFTERS = {
+    "dflash": ("RESIN_GAUDI_DFLASH", DRAFT, 7),
+    "dflash3": ("RESIN_GAUDI_DFLASH", DRAFT, 3),
+    "dspine": ("RESIN_GAUDI_DSPINE", DSPINE, 15),
+    "dspine4": ("RESIN_GAUDI_DSPINE", DSPINE, 4),
+}
 
 pytestmark = pytest.mark.skipif(
     CHECKPOINT is None
@@ -27,23 +40,33 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="module")
-def runner():
+@pytest.fixture(scope="module", params=["mtp", *DRAFTERS])
+def runner(request):
+    """The MTP layer with 2 drafts, the DFlash drafter verifying all 7 of its drafts and 3 of
+    them, the DSpine drafter all 15 and 4."""
     from resin_models_gaudi.qwen3_5.runner import Qwen3_5GaudiRunner
     from resin_models_gaudi.synapse.runtime import SynapseError
 
+    drafter = request.param != "mtp"
+    variable, directory, drafts = DRAFTERS.get(request.param, ("", None, K))
+    if drafter and directory is None:
+        pytest.skip(f"set {variable} to the drafter directory")
     card = os.environ.get("RESIN_GAUDI_CARD")
     try:
         built = Qwen3_5GaudiRunner(
             CHECKPOINT,
             card=None if card is None else int(card),
             max_batch_size=4,
-            max_seq_len=8192,
+            max_seq_len=8192
+            + Qwen3_5GaudiRunner.lookahead_tokens(drafts if drafter else K, drafter),
             parent_capacity=24,
-            mtp=K,
+            mtp=drafts if drafter else K,
+            drafter=directory if drafter else None,
+            cache_types=CACHE_TYPES,
         )
     except SynapseError as error:
         pytest.skip(f"no Gaudi card available: {error}")
+    built.policy.mode = "always"  # these tests are about the verify steps
     yield built
     built.close()
 
@@ -84,39 +107,23 @@ def generate(engine, prompts, params) -> list[list[int]]:
 
 
 def reference(engine, runner, prompt, params) -> list[int]:
-    """Non-speculative decoding of ``prompt`` on the runner's model (with the Engine's cache
-    idle and its prefix cache cleared, so its slabs are free to use)."""
-    from resin_models_gaudi.qwen3_5.model import Sampling, SingleSequence
-    from resin_models_gaudi.qwen3_5.sampling import row_params
+    """Non-speculative decoding of ``prompt`` on the runner (plain steps through its native executor, with the
+    Engine's cache idle and its prefix cache cleared, so its slabs are free to use)."""
+    from qwen_sequence import PlanSequence
+
+    from resin import SamplingParams
 
     engine.clear_prefix_cache()
-    model = runner.model
-    seq = SingleSequence(model, range(1, 13))
-    vocab = model.dims.vocab
-
-    def sampling(position):
-        if not params.temperature:
-            return None
-        table = row_params(
-            1,
-            vocab,
-            temperatures=[params.temperature],
-            top_ps=[params.top_p],
-            top_ks=[vocab if params.top_k is None else params.top_k],
-            seeds=np.array([params.seed], np.uint64),
-            offsets=np.array([position * 32], np.uint64),
-        )
-        return Sampling(
-            table, np.array([params.seed], np.uint64), np.array([position * 32])
-        )
-
-    out = [seq.prefill(prompt, sampling(len(prompt)))]
+    seq = PlanSequence(runner, range(1, 13))
+    step = SamplingParams(
+        temperature=params.temperature,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        seed=params.seed if params.seed is not None else 0,
+    )
+    out = [seq.prefill(prompt, step)]
     while len(out) < params.max_output_tokens:
-        position = seq.pos + 1
-        out.append(
-            int(model.decode([seq.next_row()], [out[-1]], sampling(position))[0])
-        )
-        seq.advance()
+        out.append(seq.decode(out[-1], step))
     return out
 
 
@@ -155,6 +162,31 @@ def test_speculation_equals_plain_decoding(engine, runner, text_ids, seed):
         assert expected != greedy
 
 
+def test_switching_between_drafts_and_plain_decoding(engine, runner, text_ids):
+    """The draft policy switches a row between verify steps and plain steps (each way, chained
+    or not, with the drafter's device acceptance): the tokens equal plain decoding."""
+    prompts = [text_ids[:37], text_ids[1000:1129]]
+    settings = [params() for _ in prompts]
+    expected = [
+        reference(engine, runner, p, q) for p, q in zip(prompts, settings, strict=True)
+    ]
+    engine.clear_prefix_cache()
+    leases = [
+        engine.submit(p, sampling_params=q)
+        for p, q in zip(prompts, settings, strict=True)
+    ]
+    modes = ["never", "always", "always", "never", "always", "never", "never", "always"]
+    steps = 0
+    try:
+        while engine.has_work():
+            runner.policy.mode = modes[(steps // 3) % len(modes)]
+            engine.step()
+            steps += 1
+    finally:
+        runner.policy.mode = "always"
+    assert [lease.take_result() for lease in leases] == expected
+
+
 def test_stop_inside_an_accepted_block(engine, runner, text_ids):
     prompt = text_ids[:37]
     plain = reference(engine, runner, prompt, params())
@@ -165,7 +197,10 @@ def test_stop_inside_an_accepted_block(engine, runner, text_ids):
 
 
 def test_decoding_across_the_state_block_boundary(engine, runner, text_ids):
-    prompt = text_ids[:4090]
+    # the docs' 4090-token prefix sits on a greedy near-tie at position 4093 that the drafter's
+    # 8-column verify step resolves differently from 1-column decoding (as does a plain prefill
+    # ending there against decoding the same tokens), so the drafter cases start four earlier
+    prompt = text_ids[: 4090 if runner.model.drafter is None else 4086]
     expected = reference(engine, runner, prompt, params(max_output_tokens=16))
     engine.clear_prefix_cache()
     assert generate(engine, [prompt], [params(max_output_tokens=16)]) == [expected]
@@ -210,3 +245,42 @@ def test_no_compiles_after_start(engine, runner, text_ids):
     engine.clear_prefix_cache()
     generate(engine, [text_ids[100:1100], text_ids[3000:3003]], [params(3), params()])
     assert runner.device.compile_count == runner.compiles_at_start
+
+
+def plain_margins(engine, runner, prompt, n) -> tuple[list[int], list[float]]:
+    """Plain decoding of ``prompt`` (as ``reference``, greedy) and each token's top-2 logit margin (the prompt's
+    token: inf)."""
+    import numpy as np
+    from qwen_sequence import PlanSequence
+
+    engine.clear_prefix_cache()
+    seq = PlanSequence(runner, range(1, 13))
+    out, margins = [seq.prefill(prompt)], [float("inf")]
+    while len(out) < n:
+        out.append(seq.decode(out[-1]))
+        top = np.sort(np.asarray(runner.model.logits()).reshape(-1))[-2:]
+        margins.append(float(top[1] - top[0]))
+    return out, margins
+
+
+@pytest.mark.parametrize("length", [2040, 4086])
+def test_wide_verify_steps_across_a_key_chunk_equal_plain_decoding(
+    engine, runner, text_ids, length
+):
+    """A drafter's verify steps of 8 and 16 columns from just before a 2048-key chunk boundary (4096 is also the
+    STATE block's) give plain decoding's tokens, with differences only where plain decoding's top two logits are
+    within 1.0."""
+    widths = [w for w in runner.model.verify_widths if w in (8, 16)]
+    if runner.model.drafter is None or not widths:
+        pytest.skip("a drafter's verify steps of 8 or 16 columns")
+    prompt = text_ids[:length]
+    want, margins = plain_margins(engine, runner, prompt, 40)
+    for width in widths:
+        runner.force_width = width
+        try:
+            engine.clear_prefix_cache()
+            got = generate(engine, [prompt], [params(max_output_tokens=40)])[0]
+        finally:
+            runner.force_width = None
+        diff = next((i for i in range(len(want)) if got[i] != want[i]), None)
+        assert diff is None or margins[diff] < 1.0, (width, diff, margins[diff])

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // MLA slot attention: reset the accumulators of mla_slot_acc (any head width D) before a
 // chunk's first slot launch (output 0, max NINF, sum 0).
 // tensors: 0 acc_o (D, W, G) f32  1 acc_m (W, G) f32  2 acc_l (W, G) f32 | 3 sink (64, 1) i32

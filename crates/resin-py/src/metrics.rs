@@ -104,6 +104,20 @@ fn histogram(value: &Bound<'_, PyAny>) -> PyResult<Histogram> {
 #[derive(Clone, PartialEq)]
 pub(crate) struct RunnerMetrics(RunnerMetricsSnapshot);
 
+impl RunnerMetrics {
+    /// A native executor's speculation counters, as its runner's `metrics_snapshot` reports them.
+    #[cfg_attr(not(feature = "gaudi"), allow(dead_code))]
+    pub(crate) fn speculation(drafts: u64, accepted: u64, verify_rows: u64) -> Self {
+        Self(RunnerMetricsSnapshot {
+            forward_execution_seconds: BTreeMap::new(),
+            spec_draft_tokens: drafts,
+            spec_accepted_tokens: accepted,
+            spec_verify_rows: verify_rows,
+            dp_attention_sync_wait_seconds: None,
+        })
+    }
+}
+
 #[pymethods]
 impl RunnerMetrics {
     #[new]

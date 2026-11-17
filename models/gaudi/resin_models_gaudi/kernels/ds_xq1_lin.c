@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Per-token FP8 quantization in natural order with power-of-two scales, one member per token: the values of
 // ds_xq_lin with one copy per token (R = 1).
 //   s_t = the smallest power of two with max|x_t| <= 240 s_t;  q = fp8(x_t / s_t).

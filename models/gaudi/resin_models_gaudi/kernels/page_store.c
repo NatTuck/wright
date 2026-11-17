@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Store 512-byte rows into the cache arena. sink is a small i32 token output.
 // Rows of -1 are skipped.
 // tensors: 0 arena (128, PR, NB) i32  1 rows (N,) i32  2 vals (128, N) i32 | 3 sink (64, 1) i32

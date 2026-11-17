@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Routed experts: one (M, K) FP8 matrix per route slot, copied from the expert the router chose.
 // slot = t * R + k -> ids[k, t]; R = 0 (prefill pages): slot s -> ids[s, 0]. An id out of range (padding,
 // unused page) gives zeros.

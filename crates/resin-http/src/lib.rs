@@ -3,6 +3,7 @@ mod metrics;
 mod metrics_encoder;
 mod openai;
 mod protocol;
+mod request_log;
 mod ui;
 
 use std::{
@@ -30,7 +31,7 @@ pub use metrics::{
 pub use metrics_encoder::{MetricsEncodeError, MetricsEncoder};
 pub use protocol::{
     ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
-    TokenLogprob,
+    PromptProgress, TokenLogprob,
 };
 
 pub const EVENT_QUEUE_CAPACITY: usize = 64;
@@ -57,7 +58,7 @@ impl Default for RouteConfig {
 /// What `GET /v1/models` tells about the served model in addition to its id. The response
 /// does not include a field that is `None`. `Some(false)` tells that the model does not
 /// support the capability.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelMetadata {
     /// The maximum number of prompt and generated tokens in one request.
@@ -81,6 +82,31 @@ pub struct ModelMetadata {
     pub input_modalities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_modalities: Option<Vec<String>>,
+    /// The sampling settings of a request that gives none: the model's recommended values
+    /// (its `generation_config.json`). Without them, temperature 1.0, top_p 1.0 and no top_k.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_top_k: Option<NonZeroU32>,
+}
+
+impl ModelMetadata {
+    /// A request's temperature: the one it gives, else the model's default, else 1.0.
+    pub fn temperature(&self, requested: Option<f64>) -> f64 {
+        requested.or(self.default_temperature).unwrap_or(1.0)
+    }
+
+    /// A request's top_p: the one it gives, else the model's default, else 1.0.
+    pub fn top_p(&self, requested: Option<f64>) -> f64 {
+        requested.or(self.default_top_p).unwrap_or(1.0)
+    }
+
+    /// A request's top_k: the one it gives, else the model's default, else none.
+    pub fn top_k(&self, requested: Option<u32>) -> Option<u32> {
+        requested.or(self.default_top_k.map(NonZeroU32::get))
+    }
 }
 
 /// The model that the server serves: the id that requests must name, and its metadata.
@@ -117,6 +143,14 @@ impl From<Arc<str>> for ServedModel {
     }
 }
 
+/// One model of the server: what `GET /v1/models` tells about it, and the queue that its
+/// requests go to.
+pub struct ModelRoute {
+    pub model: ServedModel,
+    pub jobs: mpsc::Sender<GenerationJob>,
+}
+
+/// One served model's state in the handlers.
 #[derive(Clone)]
 struct AppState {
     jobs: mpsc::Sender<GenerationJob>,
@@ -124,6 +158,46 @@ struct AppState {
     metadata: Arc<ModelMetadata>,
     next_id: Arc<AtomicU64>,
     routed_dp_size: usize,
+}
+
+/// Every served model, in registration order. A request goes to the model that it names.
+#[derive(Clone)]
+struct Models {
+    routes: Arc<[AppState]>,
+}
+
+impl Models {
+    fn first(&self) -> &AppState {
+        &self.routes[0]
+    }
+
+    /// The state of the model that a request names, or HTTP 404 with the served ids.
+    fn route(
+        &self,
+        model: &str,
+        error_type: &str,
+    ) -> Result<&AppState, Box<axum::response::Response>> {
+        if let Some(state) = self
+            .routes
+            .iter()
+            .find(|state| state.model.as_ref() == model)
+        {
+            return Ok(state);
+        }
+        let served = self
+            .routes
+            .iter()
+            .map(|state| format!("{:?}", state.model))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(Box::new(axum::response::IntoResponse::into_response((
+            StatusCode::NOT_FOUND,
+            axum::Json(protocol::json_error(
+                format!("model {model:?} is not served; the server serves {served}"),
+                error_type,
+            )),
+        ))))
+    }
 }
 
 impl AppState {
@@ -161,13 +235,46 @@ pub fn router(
     routes: RouteConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Router {
-    let model = model.into();
-    let state = AppState {
-        jobs,
-        model: model.id,
-        metadata: Arc::new(model.metadata),
-        next_id: Arc::new(AtomicU64::new(1)),
-        routed_dp_size: routes.routed_dp_size,
+    router_for(
+        vec![ModelRoute {
+            model: model.into(),
+            jobs,
+        }],
+        routes,
+        metrics,
+    )
+}
+
+/// A router for several models, each with its own queue. Panics without a model or with
+/// two models of one id.
+pub fn router_for(
+    models: Vec<ModelRoute>,
+    routes: RouteConfig,
+    metrics: Option<MetricsEndpoint>,
+) -> Router {
+    assert!(!models.is_empty(), "a server serves at least one model");
+    let next_id = Arc::new(AtomicU64::new(1));
+    let states = models
+        .into_iter()
+        .map(|route| AppState {
+            jobs: route.jobs,
+            model: route.model.id,
+            metadata: Arc::new(route.model.metadata),
+            next_id: next_id.clone(),
+            routed_dp_size: routes.routed_dp_size,
+        })
+        .collect::<Vec<_>>();
+    for (index, state) in states.iter().enumerate() {
+        assert!(
+            states[..index]
+                .iter()
+                .all(|other| other.model != state.model),
+            "model {:?} is served twice",
+            state.model
+        );
+    }
+    let state = Models {
+        routes: states.into(),
     };
     let mut router = Router::new().route("/health", get(openai::health));
     if let Some(metrics) = metrics {
@@ -238,8 +345,29 @@ pub async fn serve_with_drain(
     metrics: Option<MetricsEndpoint>,
     shutdown: impl Future<Output = Duration>,
 ) -> std::io::Result<()> {
+    serve_models_with_drain(
+        listener,
+        vec![ModelRoute {
+            model: model.into(),
+            jobs,
+        }],
+        routes,
+        metrics,
+        shutdown,
+    )
+    .await
+}
+
+/// As [`serve_with_drain`] for several models: a request goes to the model that it names.
+pub async fn serve_models_with_drain(
+    listener: tokio::net::TcpListener,
+    models: Vec<ModelRoute>,
+    routes: RouteConfig,
+    metrics: Option<MetricsEndpoint>,
+    shutdown: impl Future<Output = Duration>,
+) -> std::io::Result<()> {
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = axum::serve(listener, router(model, jobs, routes, metrics))
+    let server = axum::serve(listener, router_for(models, routes, metrics))
         .with_graceful_shutdown(async {
             let _ = stopped.await;
         })

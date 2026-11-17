@@ -7,6 +7,7 @@ structural Python protocol.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,11 @@ class ModelCapabilities:
     thinking_levels are the reasoning_effort values that the model takes, from the least
     to the most effort, for example ``NativeRecipe.reasoning_efforts``. They require
     reasoning=True.
+
+    default_temperature, default_top_p and default_top_k are the sampling settings of a
+    request that gives none: the model's recommended values, as in its
+    ``generation_config.json``. Without them the server uses temperature 1.0, top_p 1.0 and
+    no top_k.
     """
 
     function_calling: bool | None = None
@@ -37,6 +43,9 @@ class ModelCapabilities:
     thinking_levels: tuple[str, ...] | None = None
     input_modalities: tuple[str, ...] | None = None
     output_modalities: tuple[str, ...] | None = None
+    default_temperature: float | None = None
+    default_top_p: float | None = None
+    default_top_k: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("function_calling", "reasoning"):
@@ -57,6 +66,26 @@ class ModelCapabilities:
                 )
         if self.thinking_levels is not None and self.reasoning is not True:
             raise ValueError("thinking_levels must be None unless reasoning=True")
+        for name, low, high in (
+            ("default_temperature", 0.0, float("inf")),
+            ("default_top_p", 0.0, 1.0),
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if (
+                type(value) not in (float, int)
+                or type(value) is bool
+                or value != value
+                or not (low <= value <= high)
+                or (name == "default_top_p" and value == 0.0)
+                or value == float("inf")
+            ):
+                raise ValueError(f"{name} must be a finite number in its range or None")
+        if self.default_top_k is not None and (
+            type(self.default_top_k) is not int or self.default_top_k < 1
+        ):
+            raise ValueError("default_top_k must be a positive int or None")
 
     def to_wire(self) -> dict[str, object]:
         """The fields that are not None, as the native server takes them."""
@@ -68,6 +97,9 @@ class ModelCapabilities:
                 ("thinking_levels", self.thinking_levels),
                 ("input_modalities", self.input_modalities),
                 ("output_modalities", self.output_modalities),
+                ("default_temperature", self.default_temperature),
+                ("default_top_p", self.default_top_p),
+                ("default_top_k", self.default_top_k),
             )
             if value is not None
         }
@@ -238,17 +270,92 @@ class HttpServer:
         return self._model
 
     @property
+    def models(self) -> list[str]:
+        """Every served model's id, in registration order."""
+        if self._native is not None:
+            return list(self._native.models)
+        return [self._model]
+
+    def register(
+        self,
+        engine: Engine,
+        *,
+        recipe: Recipe,
+        model: str | None = None,
+        stream_interval: int = 1,
+        capabilities: ModelCapabilities | None = None,
+        share: float = 1.0,
+    ) -> None:
+        """Serve one more model, on its own Engine, before ``serve``.
+
+        A request goes to the model that its ``model`` field names, and
+        ``GET /v1/models`` lists every model. The Engines step in turn on one
+        thread (they share one card); ``share`` weighs a model's card time
+        against the others'. Give the Engines one ``CachePool`` so that the
+        models share cache memory.
+        """
+        from resin.backend.distributed import DistributedEngine
+
+        if self._coordinator is not None or isinstance(engine, DistributedEngine):
+            raise ValueError("a server with a DistributedEngine serves one model")
+        if type(stream_interval) is not int or not 1 <= stream_interval <= 2**32 - 1:
+            raise ValueError("stream_interval must be a positive integer fitting u32")
+        if model is None:
+            tokenizer = recipe.tokenizer
+            model = None if tokenizer is None else tokenizer.name_or_path
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(
+                "model is required when it cannot be inferred from the recipe"
+            )
+        if capabilities is not None and not isinstance(capabilities, ModelCapabilities):
+            raise ValueError("capabilities must be a ModelCapabilities or None")
+        assert self._native is not None
+        self._native.register(
+            engine,
+            recipe,
+            model=model,
+            stream_interval=stream_interval,
+            capabilities=None if capabilities is None else capabilities.to_wire(),
+            share=float(share),
+        )
+
+    def register_replicas(self, router, *, model: str) -> None:
+        """Serve one more model whose Engines run in other processes, one per card.
+
+        ``router`` is a ``resin._resin._ReplicaRouter`` whose replicas have joined
+        (``router.accept``). Each request goes to one replica: the replica of its
+        conversation, unless that replica is much busier than another. It can sit
+        beside a ``DistributedEngine``.
+        """
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model must be a nonempty string")
+        if self._native is None:
+            raise ValueError("only the HTTP frontend serves replicas")
+        self._native.register_replicas(router, model=model)
+
+    @property
     def running(self) -> bool:
         if self._native is not None:
             return self._native.running
         return self._coordinator is not None and self._coordinator.running
 
-    def serve(self, *, host: str = "127.0.0.1", port: int = 8000) -> None:
-        """Block while serving, until Ctrl-C or another thread calls shutdown."""
+    def serve(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        on_listening: Callable[[], object] | None = None,
+    ) -> None:
+        """Block while serving, until Ctrl-C or another thread calls shutdown.
+
+        ``on_listening`` is called once the listener is bound and SIGTERM drains the server:
+        a client that connects after it is called is served. Its error stops the server and
+        raises here. A non-root distributed driver has no listener and does not call it.
+        """
 
         try:
             if self._native is not None:
-                self._native.serve(host=host, port=port)
+                self._native.serve(host=host, port=port, on_listening=on_listening)
             elif self._coordinator is not None:
                 self._coordinator.serve()
         finally:

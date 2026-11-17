@@ -1,3 +1,4 @@
+use resin_core::Phase;
 use resin_core::engine::{
     EngineCore, Error, ErrorKind, ExecutionPlan, OwnedTokenRows, Runner, RunnerConfig,
     SchedulerConfig, Submission, TokenRows,
@@ -718,6 +719,178 @@ fn unsafe_decode_boundaries_fall_back_before_enqueuing_a_continuation() {
             .map(OwnedTokenRows::view)
             .map_err(Clone::clone);
         engine.complete_step_with(&mut model, output, Ok).unwrap();
+        engine.close(&mut model).unwrap();
+    }
+}
+
+#[test]
+fn decode_rows_past_max_speculative_rows_continue_closer_to_a_block_end() {
+    // Lookahead 3 and two rows at position 124 of 128-token blocks. A step that may speculate writes up to four
+    // tokens a row, so a second step could cross the block; past max_speculative_rows each row writes one token
+    // and leases no lookahead.
+    for (speculative, retained) in [(None, false), (Some(1), true), (Some(2), false)] {
+        let mut engine = EngineCore::new(
+            RunnerConfig {
+                cache_layout: Some(
+                    KvLayout::new(
+                        8,
+                        vec![KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap()],
+                    )
+                    .unwrap(),
+                ),
+                cache_write_lookahead_tokens: 3,
+                max_speculative_rows: speculative,
+                ..Default::default()
+            },
+            4,
+            512,
+            SchedulerConfig::default(),
+            true,
+        )
+        .unwrap();
+        let mut model = Model::default();
+        engine.submit(input(vec![1; 124], 40)).unwrap();
+        engine.submit(input(vec![2; 124], 40)).unwrap();
+        let plan = loop {
+            let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+            if plan.phase == Phase::Decode && plan.sequence_ids.len() == 2 {
+                break plan;
+            }
+            let output = model.forward(plan);
+            let output = output
+                .as_ref()
+                .map(OwnedTokenRows::view)
+                .map_err(Clone::clone);
+            engine.complete_step_with(&mut model, output, Ok).unwrap();
+        };
+        assert_eq!(plan.context_lengths, [124, 124]);
+        assert_eq!(
+            engine.retain_continuation(&plan),
+            retained,
+            "{speculative:?}"
+        );
+        if retained {
+            let next = engine.continuation_plan().unwrap().unwrap();
+            assert_eq!(next.context_lengths, [125, 125]); // one token a row, not four
+            engine
+                .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 3], &[0, 1, 2]), Ok)
+                .unwrap();
+            // a row past max_speculative_rows may not return more than one token
+            let error = engine
+                .complete_step_with(&mut model, TokenRows::new(&[4, 5, 4], &[0, 2, 3]), Ok)
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Internal);
+        } else {
+            assert!(engine.continuation_plan().unwrap().is_none());
+            let output = model.forward(plan);
+            let output = output
+                .as_ref()
+                .map(OwnedTokenRows::view)
+                .map_err(Clone::clone);
+            engine.complete_step_with(&mut model, output, Ok).unwrap();
+            engine.close(&mut model).unwrap();
+        }
+    }
+}
+
+#[test]
+fn lookahead_drop_near_a_block_end_keeps_grown_pages() {
+    // Two rows at 125 may speculate, so their step leases lookahead 3 into the next 128-token block. A third row
+    // then takes the batch past max_speculative_rows: no lookahead, so the two rows need one block less than they
+    // hold. That must keep the grown pages, not fail the step.
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    8,
+                    vec![KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            cache_write_lookahead_tokens: 3,
+            max_speculative_rows: Some(2),
+            ..Default::default()
+        },
+        4,
+        512,
+        SchedulerConfig::default(),
+        false,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    engine.submit(input(vec![1; 125], 40)).unwrap();
+    engine.submit(input(vec![2; 125], 40)).unwrap();
+    let mut decoded = [0usize; 4];
+    let mut joined = false;
+    while decoded[3] < 2 {
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        if plan.phase == Phase::Decode {
+            decoded[plan.sequence_ids.len()] += 1;
+        }
+        let output = model.forward(plan);
+        let output = output
+            .as_ref()
+            .map(OwnedTokenRows::view)
+            .map_err(Clone::clone);
+        engine.complete_step_with(&mut model, output, Ok).unwrap();
+        if decoded[2] > 0 && !joined {
+            engine.submit(input(vec![3; 8], 40)).unwrap();
+            joined = true;
+        }
+    }
+    engine.close(&mut model).unwrap();
+}
+
+#[test]
+fn continuation_outcomes_are_counted() {
+    // 128-token blocks, lookahead 3: a step at 1 continues; one at 124 would lease past its block; queued work
+    // asks for a fresh plan.
+    for (prompt, queued, expected) in [
+        (1, false, "retained"),
+        (124, false, "block"),
+        (1, true, "queue"),
+    ] {
+        let mut engine = stop_overlap_engine();
+        engine.enable_metrics().unwrap();
+        let mut model = Model::default();
+        engine.submit(input(vec![1; prompt], 40)).unwrap();
+        engine.step(&mut model).unwrap();
+        let plan = engine.prepare_step(&mut model, None).unwrap().unwrap();
+        if queued {
+            engine.submit(input(vec![2; 4], 40)).unwrap();
+        }
+        let retained = engine.retain_continuation(&plan);
+        let counts = engine.metrics_snapshot().unwrap().continuations;
+        let got = [
+            ("retained", counts.retained),
+            ("queue", counts.queue),
+            ("row", counts.row),
+            ("block", counts.block),
+        ];
+        for (outcome, count) in got {
+            assert_eq!(
+                count,
+                u64::from(outcome == expected),
+                "{prompt} {queued}: {got:?}"
+            );
+        }
+        assert_eq!(retained, expected == "retained");
+        if retained {
+            engine.continuation_plan().unwrap().unwrap();
+            engine
+                .complete_continuing_step_with(&mut model, TokenRows::new(&[3], &[0, 1]), Ok)
+                .unwrap();
+            engine
+                .complete_step_with(&mut model, TokenRows::new(&[4], &[0, 1]), Ok)
+                .unwrap();
+        } else {
+            let output = model.forward(plan);
+            let output = output
+                .as_ref()
+                .map(OwnedTokenRows::view)
+                .map_err(Clone::clone);
+            engine.complete_step_with(&mut model, output, Ok).unwrap();
+        }
         engine.close(&mut model).unwrap();
     }
 }

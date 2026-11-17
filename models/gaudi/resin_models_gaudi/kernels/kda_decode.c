@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright Aaron Botsis
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright Aaron Botsis
 // Batched KDA decode (GLM-5.3-Flash linear attention): one token of each of B sequences, the recurrent state
 // read from and written back to the cache arena. Per member (head h, sequence b), gdn_decode's structure with
 // the math of tools/glm_np.py kda_recurrent / kda_module: short conv (state = the last 3 inputs) + SiLU,

@@ -26,6 +26,9 @@ pub(crate) struct RunnerConfig {
     pub(super) continuation_prefill: bool,
     pub(super) cache_write_lookahead_tokens: u32,
     pub(super) cache_layout: Option<Py<CacheLayout>>,
+    pub(super) max_speculative_rows: Option<u32>,
+    pub(super) continuation_extension: Option<NonZeroU32>,
+    pub(super) draft_tokens: u32,
 }
 
 impl RunnerConfig {
@@ -39,6 +42,9 @@ impl RunnerConfig {
                 .cache_layout
                 .as_ref()
                 .map(|layout| layout.clone_ref(py)),
+            max_speculative_rows: self.max_speculative_rows,
+            continuation_extension: self.continuation_extension,
+            draft_tokens: self.draft_tokens,
         }
     }
 }
@@ -52,8 +58,12 @@ impl RunnerConfig {
         prefill_chunk_size = None,
         continuation_prefill = false,
         cache_write_lookahead_tokens = 0,
-        cache_layout = None
+        cache_layout = None,
+        max_speculative_rows = None,
+        continuation_extension = None,
+        draft_tokens = 0
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         _py: Python<'_>,
         max_batch_tokens: Option<u32>,
@@ -61,6 +71,9 @@ impl RunnerConfig {
         continuation_prefill: bool,
         cache_write_lookahead_tokens: u32,
         cache_layout: Option<Py<CacheLayout>>,
+        max_speculative_rows: Option<u32>,
+        continuation_extension: Option<u32>,
+        draft_tokens: u32,
     ) -> PyResult<Self> {
         if cache_write_lookahead_tokens > 0 && cache_layout.is_none() {
             return Err(PyValueError::new_err(
@@ -73,7 +86,17 @@ impl RunnerConfig {
             continuation_prefill,
             cache_write_lookahead_tokens,
             cache_layout,
+            max_speculative_rows,
+            continuation_extension: positive_u32("continuation_extension", continuation_extension)?,
+            draft_tokens,
         })
+    }
+
+    /// Drafts a speculative decode step verifies for each row (0: no speculation).
+    /// The HTTP log's verify-launch lines count acceptance against it.
+    #[getter]
+    fn draft_tokens(&self) -> u32 {
+        self.draft_tokens
     }
 
     #[getter]
@@ -96,6 +119,20 @@ impl RunnerConfig {
         self.cache_write_lookahead_tokens
     }
 
+    /// Decode steps with more rows than this do not speculate (one token a row).
+    #[getter]
+    fn max_speculative_rows(&self) -> Option<u32> {
+        self.max_speculative_rows
+    }
+
+    /// Decode continuations may cross cache blocks (pages leased in place); a
+    /// chain still ends where a row reaches a multiple of this many tokens, so
+    /// that prefixes can be published. None: continuations stay within a block.
+    #[getter]
+    fn continuation_extension(&self) -> Option<u32> {
+        self.continuation_extension.map(NonZeroU32::get)
+    }
+
     #[getter]
     fn cache_layout(&self, py: Python<'_>) -> Option<Py<CacheLayout>> {
         self.cache_layout
@@ -105,12 +142,14 @@ impl RunnerConfig {
 
     fn __repr__(&self) -> String {
         format!(
-            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, cache_write_lookahead_tokens={}, cache={})",
+            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, cache_write_lookahead_tokens={}, cache={}, max_speculative_rows={:?}, continuation_extension={:?})",
             self.max_batch_tokens(),
             self.prefill_chunk_size(),
             self.continuation_prefill,
             self.cache_write_lookahead_tokens,
             self.cache_layout.is_some(),
+            self.max_speculative_rows,
+            self.continuation_extension(),
         )
     }
 }

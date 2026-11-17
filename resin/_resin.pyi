@@ -1,4 +1,5 @@
-from collections.abc import Sequence
+import os
+from collections.abc import Callable, Sequence
 from typing import Any, Final, final
 from collections.abc import Mapping
 from typing import Literal
@@ -400,6 +401,116 @@ class CacheLayout:
         """
 
 @final
+class SlabSide:
+    """
+    One side of a `SlabTable`, for `CachePool(..., boundary=side)`.
+    """
+    @property
+    def side(self, /) -> int: ...
+
+class SlabTable:
+    """
+    A slab table in shared memory: one KV arena layout that a tensor-parallel model's pool (side 0) and one-card
+    replicas' pools (side k, the replica on card k) share across one boundary slab B, the same on every card. The
+    tensor-parallel model holds slabs 1 to B - 1, each replica B to `capacity` of its card. The boundary moves down
+    when the tensor-parallel model gives its highest slab, up once every replica gave slab B.
+    """
+    @staticmethod
+    def create(
+        path: str | os.PathLike[str],
+        capacity: int,
+        cards: int,
+        tp_floor: int,
+        replica_floors: Sequence[int],
+    ) -> SlabTable:
+        """
+        Make the table at `path` (a new file): `capacity` slabs, `cards` replica cards, and the floor of the
+        tensor-parallel model and of each replica (slabs each keeps). The boundary starts halfway between the
+        floors.
+        """
+    @staticmethod
+    def open(path: str | os.PathLike[str]) -> SlabTable:
+        """
+        Map the table that `create` made at `path`.
+        """
+    @property
+    def boundary(self, /) -> int:
+        """
+        The first slab of the replicas' side; the tensor-parallel model holds the slabs below it.
+        """
+    @property
+    def capacity(self, /) -> int: ...
+    @property
+    def cards(self, /) -> int: ...
+    @property
+    def path(self, /) -> str: ...
+    def side(self, /, side: int) -> SlabSide:
+        """
+        The side of the tensor-parallel model (0) or of the replica on card `side` (1 to `cards`).
+        """
+    def sides(self, /) -> list[tuple[int, int, int, int | None, bool]]:
+        """
+        Each side: (floor, slabs on its side of the boundary, the edge slab it gave or 0, oldest prefix stamp or
+        None, whether it wants slabs).
+        """
+
+class CachePool:
+    """
+    A pool of equal-sized cache slabs that several Engines share: one Engine
+    for each model that the process serves.
+
+    Give it to each Engine (`Engine(..., cache_pool=pool)`). Every runner's
+    `CacheLayout` must declare `parent_capacity` slabs, and all of them address
+    one device arena. A slab belongs to one Engine while it holds that Engine's
+    blocks and returns to the pool when it is free. When an Engine needs a slab
+    and none is free, the least recently used cached prefix of any Engine goes
+    first; no Engine evicts another Engine's live requests. An Engine whose
+    growth finds no slab waits while other Engines' live requests hold them.
+    `cache_floor` reserves slabs for an Engine.
+
+    With `boundary` (a side of a `SlabTable`), the pool shares the arena with pools in other processes: it places
+    blocks only in its side of the table's boundary slab, and when the other side wants slabs it gives its edge
+    slab (after evicting the prefixes in it), so the boundary moves. A thread of its own does that work between
+    steps. `scrub(slabs)` (a list of slab ids), if given, clears those slabs on the device and returns when they
+    are clear: the pool calls it for every slab that it gains or gives, before the slab is used on either side.
+    """
+    def __new__(
+        cls,
+        /,
+        parent_capacity: int,
+        *,
+        boundary: SlabSide | None = None,
+        scrub: Callable[[list[int]], object] | None = None,
+    ) -> CachePool: ...
+    @property
+    def held_slabs(self, /) -> int:
+        """
+        Slabs the pool holds: all of them, or with a boundary its side's.
+        """
+    def __repr__(self, /) -> str: ...
+    def bound_slabs(self, /) -> list[int]:
+        """
+        Slabs that each Engine's blocks occupy (live or cached), in join order.
+        """
+    @property
+    def engines(self, /) -> int:
+        """
+        The Engines that joined, in order.
+        """
+    @property
+    def free_slabs(self, /) -> int: ...
+    @property
+    def parent_capacity(self, /) -> int:
+        """
+        Physical slabs, without the null slab.
+        """
+    @property
+    def pool_id(self, /) -> int:
+        """
+        The pool identity that every Engine's `ResourceBinding` carries.
+        """
+
+@final
 class CacheRetention:
     """
     Cache-block lifetime policy.
@@ -478,6 +589,8 @@ class Engine:
         prefix_cache: bool = False,
         enable_overlap: bool = True,
         enable_metrics: bool = True,
+        cache_pool: CachePool | None = None,
+        cache_floor: int = 0,
     ) -> Engine: ...
     def __repr__(self, /) -> str: ...
     def _metrics_prometheus_protobuf(
@@ -517,6 +630,16 @@ class Engine:
     def has_work(self, /) -> bool: ...
     @property
     def max_running_requests(self, /) -> int: ...
+    @property
+    def max_speculative_rows(self, /) -> int | None:
+        """
+        Decode steps with more rows than this lease no write lookahead and
+        verify no drafts (the runner config's `max_speculative_rows`; None: any
+        step may). Set it between steps for a runner that turns its drafts off
+        (0) or on again; it fails while a step is in flight.
+        """
+    @max_speculative_rows.setter
+    def max_speculative_rows(self, /, value: int | None) -> None: ...
     @property
     def metrics_enabled(self, /) -> bool: ...
     def metrics_snapshot(self, /) -> EngineMetrics | None:
@@ -646,6 +769,131 @@ class ForwardOutput:
     def top_logprobs(self, /) -> npt.NDArray[np.float32] | None: ...
     @property
     def top_token_ids(self, /) -> npt.NDArray[np.uint32] | None: ...
+
+@final
+class GaudiGlue:
+    """
+    The glue functions of the Gaudi runtime library the device loaded
+    (`Device.libraries.runtime`). The `gaudi` feature only.
+    """
+    def __new__(cls, /, path: str) -> GaudiGlue: ...
+
+@final
+class GaudiProgram:
+    """
+    A model step's stream calls as one native program. It is built once after
+    the recipes compile: `section`, then the ops in stream order, with `take`
+    or `select` (and `arm`) opening a nested list that `end` closes, then
+    `finish`. A step then runs a list of sections with its register array
+    (`run`, without the GIL); `calls` gives the same walk's calls, recorded,
+    for tests and check mode. An operand is an int, or (base, register, scale)
+    for `base + registers[register] * scale`. The `gaudi` feature only.
+    """
+    def __new__(cls, /, registers: int) -> GaudiProgram: ...
+    def allgather(
+        self,
+        /,
+        send: int | tuple[int, int, int],
+        recv: int | tuple[int, int, int],
+        count: int | tuple[int, int, int],
+        bf16: bool = False,
+    ) -> None: ...
+    def allreduce(
+        self,
+        /,
+        address: int | tuple[int, int, int],
+        count: int | tuple[int, int, int],
+        bf16: bool = False,
+    ) -> None: ...
+    def arm(self, /) -> int: ...
+    def calls(
+        self, /, registers: Sequence[int], sections: Sequence[int | str]
+    ) -> list[tuple[str, list[int]]]:
+        """
+        The calls a step with these registers makes, recorded: (kind, integers)
+        per call. A launch is (recipe, then slot and address of each binding).
+        """
+    def collective_free(self, /, section: int | str) -> bool: ...
+    def copy(
+        self,
+        /,
+        dst: int | tuple[int, int, int],
+        src: int | tuple[int, int, int],
+        bytes: int | tuple[int, int, int],
+    ) -> None: ...
+    def copy_multi(
+        self, /, src: Sequence[int], bytes: Sequence[int], dst: Sequence[int]
+    ) -> None: ...
+    def download(
+        self,
+        /,
+        host: int | tuple[int, int, int],
+        src: int | tuple[int, int, int],
+        bytes: int | tuple[int, int, int],
+    ) -> None: ...
+    def end(self, /) -> None: ...
+    def finish(self, /) -> None: ...
+    def launch(
+        self,
+        /,
+        recipe: int,
+        slots: Sequence[int],
+        addresses: Sequence[int],
+        dynamic: Sequence[tuple[int, int | tuple[int, int, int]]] = ...,
+    ) -> None: ...
+    def memset(
+        self,
+        /,
+        dst: int | tuple[int, int, int],
+        value: int,
+        count: int | tuple[int, int, int],
+    ) -> None: ...
+    def record(self, /, slot: int) -> None: ...
+    @property
+    def registers(self, /) -> int: ...
+    def run(
+        self,
+        /,
+        glue: GaudiGlue,
+        registers: npt.NDArray[np.uint64],
+        sections: Sequence[int | str],
+    ) -> int:
+        """
+        Make the step's calls on the card, without the GIL; returns the number
+        of calls. On a failure the RuntimeError's `issued` is the number of
+        calls the stream took first.
+        """
+    @staticmethod
+    def run_sequence(
+        glue: GaudiGlue,
+        steps: Sequence[tuple[GaudiProgram, int | str]],
+        registers: npt.NDArray[np.uint64],
+    ) -> int: ...
+    def section(self, /, name: str) -> int: ...
+    @property
+    def sections(self, /) -> list[str]: ...
+    def select(
+        self, /, keys: Sequence[tuple[int, int]], table: Sequence[int]
+    ) -> None: ...
+    @staticmethod
+    def sequence_calls(
+        steps: Sequence[tuple[GaudiProgram, int | str]], registers: Sequence[int]
+    ) -> list[tuple[str, list[int]]]: ...
+    def take(self, /, register: int) -> None: ...
+    def upload(
+        self,
+        /,
+        dst: int | tuple[int, int, int],
+        host: int | tuple[int, int, int],
+        bytes: int | tuple[int, int, int],
+    ) -> None: ...
+    def upload_ring(
+        self,
+        /,
+        dst: int | tuple[int, int, int],
+        host: int | tuple[int, int, int],
+        bytes: int | tuple[int, int, int],
+    ) -> None: ...
 
 @final
 class Gemma4Media:
@@ -1134,6 +1382,9 @@ class RunnerConfig:
         continuation_prefill: bool = False,
         cache_write_lookahead_tokens: int = 0,
         cache_layout: CacheLayout | None = None,
+        max_speculative_rows: int | None = None,
+        continuation_extension: int | None = None,
+        draft_tokens: int = 0,
     ) -> RunnerConfig: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -1141,9 +1392,27 @@ class RunnerConfig:
     @property
     def cache_write_lookahead_tokens(self, /) -> int: ...
     @property
+    def continuation_extension(self, /) -> int | None:
+        """
+        Decode continuations may cross cache blocks (pages leased in place); a
+        chain still ends where a row reaches a multiple of this many tokens, so
+        that prefixes can be published. None: continuations stay within a block.
+        """
+    @property
     def continuation_prefill(self, /) -> bool: ...
     @property
     def max_batch_tokens(self, /) -> int | None: ...
+    @property
+    def draft_tokens(self, /) -> int:
+        """
+        Drafts a speculative decode step verifies for each row (0: no speculation).
+        The HTTP log's verify-launch lines count acceptance against it.
+        """
+    @property
+    def max_speculative_rows(self, /) -> int | None:
+        """
+        Decode steps with more rows than this do not speculate (one token a row).
+        """
     @property
     def prefill_chunk_size(self, /) -> int | None: ...
 
@@ -1259,6 +1528,51 @@ class SchedulerConfig:
     def prefill_chunk_size(self, /) -> int: ...
     @property
     def schedule_conservativeness(self, /) -> float: ...
+
+@final
+class StepChannelDriver:
+    """The driver end of the step channel: one Unix socket per follower, in rank order."""
+    def __new__(
+        cls, /, path: str | os.PathLike[str], token: bytes, ranks: Sequence[int]
+    ) -> StepChannelDriver: ...
+    def accept(self, /, timeout: float) -> None: ...
+    @property
+    def followers(self, /) -> list[tuple[int, int]]: ...
+    def send(
+        self,
+        /,
+        kind: int,
+        seq: int,
+        status: int,
+        pieces: Sequence[npt.NDArray[np.uint8]],
+        timeout: float,
+        what: str,
+    ) -> None: ...
+    def gather(
+        self, /, kind: int, seq: int, timeout: float | None, what: str
+    ) -> list[tuple[int, int, npt.NDArray[np.uint8]]]: ...
+    def close(self, /) -> None: ...
+
+@final
+class StepChannelFollower:
+    """A follower end of the step channel: one Unix socket to the driver."""
+    def __new__(
+        cls, /, path: str | os.PathLike[str], token: bytes, rank: int, timeout: float
+    ) -> StepChannelFollower: ...
+    def receive(
+        self, /, timeout: float | None, what: str
+    ) -> tuple[int, int, int, npt.NDArray[np.uint8]]: ...
+    def send(
+        self,
+        /,
+        kind: int,
+        seq: int,
+        status: int,
+        pieces: Sequence[npt.NDArray[np.uint8]],
+        timeout: float,
+        what: str,
+    ) -> None: ...
+    def close(self, /) -> None: ...
 
 @final
 class Text:
@@ -1467,13 +1781,54 @@ class _HttpServer:
         enable_demo: bool = True,
         distributed: Any | None = None,
         capabilities: dict | None = None,
+        share: float = 1.0,
     ) -> _HttpServer: ...
     def __repr__(self, /) -> str: ...
     @property
-    def model(self, /) -> str: ...
+    def model(self, /) -> str:
+        """
+        The first model's id.
+        """
+    @property
+    def models(self, /) -> list[str]:
+        """
+        Every served model's id, in registration order.
+        """
+    def register(
+        self,
+        /,
+        engine: Engine,
+        recipe: "Recipe",
+        *,
+        model: str,
+        stream_interval: int = 1,
+        capabilities: dict | None = None,
+        share: float = 1.0,
+    ) -> None:
+        """
+        Serve one more model on its own Engine (before `serve`). `share` weighs its card time
+        against the other models': the Engines step in turn on one card.
+        """
+    def register_replicas(self, /, router: _ReplicaRouter, *, model: str) -> None:
+        """
+        Serve one more model whose Engines run in other processes, one per card, through
+        `router` (a `_ReplicaRouter` whose replicas have joined). It can sit beside a
+        distributed model. Each request goes to one replica.
+        """
     @property
     def running(self, /) -> bool: ...
-    def serve(self, /, *, host: str = "127.0.0.1", port: int = 8000) -> None: ...
+    def serve(
+        self,
+        /,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        on_listening: Callable[[], object] | None = None,
+    ) -> None:
+        """
+        Serve until shutdown. `on_listening`, if given, is called (with no arguments) once the
+        listener is bound and SIGTERM drains the server: from then on a client connects.
+        """
     def shutdown(self, /) -> None:
         """
         Request shutdown from another thread; serve returns after the current
@@ -1501,6 +1856,50 @@ class _HttpSession:
     def close(self, /) -> None: ...
     def process(self, /, events: Sequence[TokenEvent]) -> _HttpEvents: ...
 
+@final
+class _ReplicaRouter:
+    """
+    The router end: accepts the replicas of one model, then belongs to the HTTP server.
+    """
+    def __new__(
+        cls, /, path: str | os.PathLike[str], token: bytes, count: int
+    ) -> _ReplicaRouter: ...
+    def accept(self, /, timeout: float) -> str:
+        """
+        Wait until every replica has joined and sent READY; return the model's metadata as JSON.
+        Every replica must report the same metadata.
+        """
+    @property
+    def count(self, /) -> int: ...
+
+@final
+class _ReplicaServer:
+    """
+    The replica end: serves one Engine's requests from the router until shutdown.
+    """
+    def __new__(
+        cls,
+        /,
+        path: str | os.PathLike[str],
+        token: bytes,
+        index: int,
+        engine: Engine,
+        recipe: "Recipe",
+        *,
+        model: str = "resin",
+        stream_interval: int = 1,
+        capabilities: dict | None = None,
+        timeout: float = 600.0,
+        gate: Any | None = None,
+    ) -> _ReplicaServer: ...
+    def serve(self, /) -> None:
+        """
+        Serve until the router asks this replica to stop. An error stops the replica: it tells
+        the router, cancels its requests and raises.
+        """
+    @property
+    def index(self, /) -> int: ...
+
 class _NativeResponseParser(FinalizingResponseParser):
     """
     Common native handle recognized directly by the HTTP actor.
@@ -1509,6 +1908,25 @@ class _NativeResponseParser(FinalizingResponseParser):
         self, /, token_ids: "Sequence[int] | npt.NDArray[np.uint32]"
     ) -> list[ParserEvent]: ...
     def finish(self, /, reason: 'Literal["stop", "length"]') -> list[ParserEvent]: ...
+
+def set_log_sink(
+    prefix: str | None = None, colors: bool = False, path: str | os.PathLike[str] | None = None
+) -> None:
+    """
+    Write native lines without Python, as the server's handlers do: `prefix` before each message
+    (a rank's or a replica's), coloredlogs' colors on stderr when `colors`, and each line also
+    appended to `path`. `None` sends native records to Python's `logging` again.
+    """
+
+def set_log_level(level: int) -> None:
+    """
+    Let native code log at and above a Python logging level (10 debug, 20 info,
+    30 warning, 40 error). Levels above error silence it; `logging.NOTSET` (0)
+    and other levels at most 5 enable trace output.
+
+    Native records reach the `wright.http` logger (a child of `wright`), so a
+    handler on either shows them. Nothing is logged until this is called.
+    """
 
 def _media_from_buffers(
     metadata: bytes, buffers: "Sequence[npt.NDArray[Any]]"

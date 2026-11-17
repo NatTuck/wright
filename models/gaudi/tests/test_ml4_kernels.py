@@ -260,7 +260,7 @@ NB_TEST = 32  # arena blocks (32 MB)
 def test_mla_store_gather(device, recipes, D):
     """mla_store's FP8 latent (with scale), bf16 rope and index units, read back on the host
     and through mla_gather's key and index-key modes"""
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_rne, bf16_to_f32
+    from resin_models_gaudi.loading.convert import bf16_rne, bf16_to_f32
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import BF16, F32, I32, U8
 
@@ -337,8 +337,8 @@ def test_mla_store_gather(device, recipes, D):
 @pytest.mark.parametrize("D", [576, 512])
 @pytest.mark.parametrize("T,pos0", [(16, 2490), (1, 4100), (16, 0)])
 def test_mla_slot_attention(device, recipes, D, T, pos0):
-    from resin_models_gaudi.qwen3_5.attention import SlotRow, plan_slots
-    from resin_models_gaudi.qwen3_5.checkpoint import bf16_rne, bf16_to_f32
+    from resin_models_gaudi.common.attention import SlotRow, plan_slots
+    from resin_models_gaudi.loading.convert import bf16_rne, bf16_to_f32
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import F32, I32
 
