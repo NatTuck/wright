@@ -1147,7 +1147,7 @@ class DeepSeekV41Gaudi:
                     if self.dense(s):
                         graphs[key + ("dense",)] = L.attention_graph(
                             dev, d, T, s.win_slots, s.win_keys, nb, self.pages, ratio=ratio, residual=residual,
-                            query_block=qb, capture=capture, dense=DENSE_KEYS, scores=self.kmax,
+                            query_block=qb, capture=capture, dense=DENSE_KEYS, scores=L.INDEX_TILE,
                         )  # fmt: skip
                 else:
                     graphs[key] = L.attention_pre_graph(
