@@ -797,7 +797,11 @@ pub fn fill(
             for c in 0..t {
                 let seen = vis[c];
                 let keys = (seen - first).clamp(0, tp * INDEX_KEYS);
-                w.set(tables.ixg[ri], g * t + c, keys + INDEX_RUN);
+                w.set(
+                    tables.ixg[ri],
+                    g * t + c,
+                    keys + if g == 0 { 0 } else { INDEX_RUN },
+                );
                 w.set(tables.ixn[ri], g * t + c, seen.min(INDEX_RUN));
                 if !tables.prefill {
                     w.set(tables.ixt[ri], g * t + c, keys);

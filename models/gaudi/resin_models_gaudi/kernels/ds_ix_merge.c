@@ -31,10 +31,26 @@ static inline uint64 mkey(float64 v)
 #define DECODE(v) ((v) ^ (int64)BIAS)
 #define FLUSH(vb, a, b, v, vp, vs)                                                              \
     {                                                                                           \
-        int5 co_ = {(a), c, 0, 0, 0};                                                            \
+        int5 co_ = {(vb), c, 0, 0, 0};  /* the vector's base row, so a partial vector lands in place */ \
         v_i32_st_tnsr_partial(co_, list, (vp), (b) - (a) - 1, (a) - (vb));                        \
         v_i32_st_tnsr_partial(co_, pos_out, (vp), (b) - (a) - 1, (a) - (vb));                     \
         v_f32_st_tnsr_partial(co_, sout, (vs), (b) - (a) - 1, (a) - (vb));                        \
+    }
+
+// entry (slot, keyed row) -> the slot's lane of the position and score vectors: the values at the row's lane are
+// reduced to every lane (0x7FFFFFFF for the other lanes, below any position and above any score's bits) and then
+// placed at the slot's lane
+#define EMIT(slot, keyed, vP, vQ, vS, vT)                                                        \
+    {                                                                                            \
+        int64 pp_, ss_, pl_, sl_;                                                                 \
+        pp_ = v_i32_sel_eq_i32_b(lo, (keyed), pv, (int64)0x7FFFFFFF);                              \
+        ss_ = v_i32_sel_eq_i32_b(lo, (keyed), svec, (int64)0x7FFFFFFF);                            \
+        RED(pp_, pl_, v_i32_min_b);                                                               \
+        RED(ss_, sl_, v_i32_min_b);                                                               \
+        (vP) = v_i32_sel_eq_i32_b(lane, (int64)((slot) - vb), pl_, (vP));                          \
+        (vS) = v_i32_sel_eq_i32_b(lane, (int64)((slot) - vb), sl_, (vS));                          \
+        (vQ) = v_i32_sel_eq_i32_b(lane, (int64)((slot) - vb - 64), pl_, (vQ));                     \
+        (vT) = v_i32_sel_eq_i32_b(lane, (int64)((slot) - vb - 64), sl_, (vT));                     \
     }
 
 #define BIAS 0x80000000
@@ -100,7 +116,7 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                 s0 += x & 0xFFFF;
                 t0 += x >> 16;
             }
-            if (m == 0) {  // the slot record: the fill's count, and the tie cut as a position
+            {  // the slot record: the fill's count, and the tie cut as a position
                 const int all = st + tt <= KS ? 0x7FFFFFFF : st >= KS ? -1 : 0;
                 int64 rec = 0;
                 rec = v_i32_sel_eq_i32_b(lane, (int64)0, (int64)(lim > 0 ? 0 : -1), rec);
@@ -148,14 +164,8 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                             vB = v_i32_sel_eq_i32_b(lane, (int64)(a - vb - 64), l, vB);
                             vA = v_i32_sel_eq_i32_b(lane, (int64)(z - vb), h, vA);
                             vB = v_i32_sel_eq_i32_b(lane, (int64)(z - vb - 64), h, vB);
-                            vPA = v_i32_sel_eq_i32_b(lo, l, pv, vPA);
-                            vPB = v_i32_sel_eq_i32_b(lo, l, pv, vPB);
-                            vSA = v_i32_sel_eq_i32_b(lo, l, svec, vSA);
-                            vSB = v_i32_sel_eq_i32_b(lo, l, svec, vSB);
-                            vPA = v_i32_sel_eq_i32_b(lo, h, pv, vPA);
-                            vPB = v_i32_sel_eq_i32_b(lo, h, pv, vPB);
-                            vSA = v_i32_sel_eq_i32_b(lo, h, svec, vSA);
-                            vSB = v_i32_sel_eq_i32_b(lo, h, svec, vSB);
+                            EMIT(a, l, vPA, vPB, vSA, vSB)
+                            EMIT(z, h, vPA, vPB, vSA, vSB)
                             if (pass == 1)
                                 tw = v_i32_max_b(tw, h);
                             lo = v_i32_sel_eq_i32_b(lo, l, (int64)0x7FFFFFFF, lo);
@@ -168,10 +178,7 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                         RED(lo, l, v_i32_min_b);
                         vA = v_i32_sel_eq_i32_b(lane, (int64)(a - vb), l, vA);
                         vB = v_i32_sel_eq_i32_b(lane, (int64)(a - vb - 64), l, vB);
-                        vPA = v_i32_sel_eq_i32_b(lo, l, pv, vPA);
-                        vPB = v_i32_sel_eq_i32_b(lo, l, pv, vPB);
-                        vSA = v_i32_sel_eq_i32_b(lo, l, svec, vSA);
-                        vSB = v_i32_sel_eq_i32_b(lo, l, svec, vSB);
+                        EMIT(a, l, vPA, vPB, vSA, vSB)
                         if (pass == 1)
                             tw = v_i32_max_b(tw, l);
                         lo = v_i32_sel_eq_i32_b(lo, l, (int64)0x7FFFFFFF, lo);
@@ -192,7 +199,7 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                 if (g > va)
                     FLUSH(vb, va, g, vA, vPA, as_float64(vSA))
             }
-            if (NM == 1) {  // the tie cut as a position (the dense attention's mask reads it)
+            {  // the tie cut as a position (the dense attention's mask reads it)
                 const int all = st + tt <= KS ? 0x7FFFFFFF : st >= KS ? -1 : 0;
                 int64 cv = (int64)all;
                 if (all == 0) {
@@ -206,7 +213,7 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                 v_i32_st_tnsr_partial(rc, slots, cv, 0, 0);
             }
             // the slots past the listed entries: the next merge ranks them last, and lists none of them
-            if (m == NM - 1) {
+            {
                 const int used = st + tt < KS ? st + tt : KS;
                 for (int i = used & ~63; i < KS; i += 64) {
                     const int first = i < used ? used - i : 0;

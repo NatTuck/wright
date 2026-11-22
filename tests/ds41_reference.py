@@ -504,7 +504,7 @@ class Reference(_Model):
                 first = g * tp * INDEX_KEYS
                 keys = np.clip(vis - first, 0, tp * INDEX_KEYS)
                 v[f"ixs{ratio}"][g] = first
-                v[f"ixg{ratio}"][g] = keys + L.INDEX_RUN
+                v[f"ixg{ratio}"][g] = keys + (0 if g == 0 else L.INDEX_RUN)
                 v[f"ixn{ratio}"][g] = np.minimum(vis, L.INDEX_RUN)
                 if not s.prefill:
                     v[f"ixt{ratio}"][g] = keys

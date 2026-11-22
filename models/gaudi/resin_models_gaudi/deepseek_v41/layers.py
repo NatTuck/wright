@@ -1143,7 +1143,9 @@ def index_select_graph(
             else lg.tensor((64, T), I32)
         )
         lg.node("rg_ix_thr_f32", [score, vis], [thr], struct.pack("i", INDEX_TOP))
-    cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
+    # ix_bcnt writes whole 64-block groups of a column, so the counts cover every group of 4096 rows
+    groups = -(-K // 4096)
+    cnt, gsum = lg.tensor((64 * groups, T), I32), lg.tensor((groups, T), I32)
     lg.node("rg_ix_bcnt_f32", [score, vis, thr], [cnt, gsum])
     lg.node(
         "rg_ix_list_map_f32" if cpos is not None else "rg_ix_list_f32",
@@ -1190,7 +1192,9 @@ def index_merge_graph(
             lg.input("ix_sout", (run, T), F32),
             lg.input("ix_pos_out", (run, T), I32),
         ],
-        struct.pack("iiii", max(1, 48 // T), run, heads, run),
+        # one member per column: a column's list is a single ascending scan, so its slots never straddle the
+        # members ix_list splits a column into (which would need the partial-vector store aligned to each)
+        struct.pack("iiii", 1, run, heads, run),
     )
     return lg.g
 

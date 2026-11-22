@@ -2048,9 +2048,10 @@ def test_tiled_index_selection_matches_full(device, recipes):
     K = rows * groups
     # columns that see everything, most of it, little, nothing, and a middle amount
     vis = np.array([K, 5000, 900, 0, 3000], np.int32)
-    score = rng.standard_normal((K, T)).astype(np.float32)
+    # a graph tensor's shape is fastest dimension first, so a (rows, T) score tensor is a (T, rows) array
+    score = rng.standard_normal((T, K)).astype(np.float32)
     for t in range(T):
-        score[vis[t] :, t] = -3.0e38  # past a column's visible entries
+        score[t, vis[t] :] = -3.0e38  # past a column's visible entries
     full = Graph(device, "t_ds41_ix_full")
     sc, V = full.input("score", (K, T), F32), full.input("vis", (T,), I32)
     fthr = full.tensor((64, T), I32)
@@ -2090,12 +2091,16 @@ def test_tiled_index_selection_matches_full(device, recipes):
         def run_tiled(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             recipe = recipes.compile(tiled)
             for g in range(groups):
-                tile = np.ascontiguousarray(scores[g * rows : (g + 1) * rows, :])
+                tile = np.ascontiguousarray(scores[:, g * rows : (g + 1) * rows])
                 device.h2d(merge[g % 2] + 4 * T * (0 if g == 0 else run), tile)
                 device.h2d(
                     one["vis"],
                     np.array(
-                        [run + max(0, min(int(vis[t]) - g * rows, rows)) for t in range(T)],
+                        [
+                            (0 if g == 0 else run)
+                            + max(0, min(int(vis[t]) - g * rows, rows))
+                            for t in range(T)
+                        ],
                         np.int32,
                     ),
                 )
