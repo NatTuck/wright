@@ -10,6 +10,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -25,6 +26,7 @@ from blake3 import blake3
 _SCHEMA_VERSION = 2
 _DEFAULT_RECORD_SUFFIX = ".resin-cache.json"
 _T = TypeVar("_T")
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,15 +159,19 @@ class ArtifactCache:
         try:
             raw_record = json.loads(record_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError) as error:
-            raise CorruptCacheError(
-                f"{artifact_path}: readiness record {record_path.name} is unreadable ({error}); "
-                f"remove this record (and its artifact) to rebuild it"
-            ) from error
-        if not isinstance(raw_record, dict):
-            raise CorruptCacheError(
-                f"{artifact_path}: readiness record {record_path.name} is not a JSON object; "
-                f"remove this record (and its artifact) to rebuild it"
+            # An unreadable record is an incomplete publication (e.g. a killed builder), not corruption of
+            # committed bytes: name it loudly, then fall back to building (the self-healing contract).
+            _log.warning(
+                "cache: %s: readiness record %s is unreadable (%s); rebuilding this entry",
+                artifact_path, record_path.name, error,
             )
+            return
+        if not isinstance(raw_record, dict):
+            _log.warning(
+                "cache: %s: readiness record %s is not a JSON object; rebuilding this entry",
+                artifact_path, record_path.name,
+            )
+            return
         size, digest = _fingerprint(artifact_path)
         try:
             relative = artifact_path.relative_to(self._root).as_posix()

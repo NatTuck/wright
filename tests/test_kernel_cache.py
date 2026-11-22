@@ -65,6 +65,57 @@ class TestArtifactCache:
         assert cache.misses == 2
         assert cache.validate(artifact, identity="kernel")
 
+    def test_corrupt_committed_entry_raises_named_error(self, tmp_path: Path) -> None:
+        from resin.kernel_cache import CorruptCacheError
+
+        cache = ArtifactCache(tmp_path, "test-abi")
+        artifact = cache.root / "module.so"
+        artifact.parent.mkdir(parents=True)
+        source = tmp_path / "source.so"
+        source.write_bytes(b"compiled payload" * 64)
+
+        def build() -> str:
+            artifact.write_bytes(source.read_bytes())
+            return "built"
+
+        def load(path: Path) -> str:
+            return "loaded"
+
+        assert (
+            cache.load_or_build_from(
+                artifact, source=source, identity="kernel", load=load, build=build
+            )
+            == "built"
+        )
+        assert (
+            cache.load_or_build_from(
+                artifact, source=source, identity="kernel", load=load, build=build
+            )
+            == "loaded"
+        )
+        # The committed bytes change while the readiness record still describes the old bytes: genuine
+        # corruption (not an incomplete publish) must raise a named error, not silently rebuild.
+        artifact.write_bytes(b"tampered" * 8)
+        try:
+            cache.load_or_build_from(
+                artifact, source=source, identity="kernel", load=load, build=build
+            )
+        except CorruptCacheError as error:
+            message = str(error)
+            assert "module.so" in message
+            assert "blake3" in message and "size" in message
+        else:
+            raise AssertionError("a corrupt committed entry must raise CorruptCacheError")
+        # Removing the named entry (artifact + record) restores self-healing.
+        artifact.unlink()
+        cache.record_path(artifact).unlink()
+        assert (
+            cache.load_or_build_from(
+                artifact, source=source, identity="kernel", load=load, build=build
+            )
+            == "built"
+        )
+
     def test_load_or_build_keeps_relative_artifact_behavior(
         self, tmp_path: Path
     ) -> None:
