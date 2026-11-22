@@ -1312,6 +1312,75 @@ class DeepSeekV41Gaudi:
             hk = out[f"x{k}"].reshape(4, H).mean(0)
             c = emb @ hk / (en * np.linalg.norm(hk) + 1e-30)
             print(f"[dump {tag}] x[{k}] mean-stream: best embedding cosine {float(c.max()):.6f}")
+        # (a) the four streams the head's collapse mixes: sane individually, or is one of them dead?
+        for k in (0, 1):
+            st = out[f"x{k}"].reshape(4, H)
+            norms = [float(np.linalg.norm(st[i])) for i in range(4)]
+            cs = [(float(st[i] @ st[j] / (norms[i] * norms[j] + 1e-30)), i, j)
+                  for i in range(4) for j in range(i + 1, 4)]
+            print(f"[dump {tag}] x[{k}] stream norms {['%.2f' % n for n in norms]} "
+                  f"pairwise cos max {max(cs)[0]:.4f} min {min(cs)[0]:.4f}")
+        # (b) the final norm's weight, and the residual's RMS (what the head's norm sees)
+        nw = dev.d2h(self.w["norm"], (H,), np.float32)
+        print(f"[dump {tag}] norm weight: mean {nw.mean():.5f} rms {np.sqrt((nw**2).mean()):.5f} "
+              f"min {nw.min():.5f} max {nw.max():.5f}")
+        for k in (0, 1):
+            print(f"[dump {tag}] x[{k}] rms {np.sqrt((out[f'x{k}']**2).mean()):.4f} "
+                  f"rms after norm {np.sqrt(((out[f'x{k}'] * np.tile(nw, 4))**2).mean()):.4f}")
+        # (c) the top-1 GLOBAL token id (the head's output is this rank's vocabulary slice)
+        start = self.sl.vocab.start
+        top = np.argsort(logits)[::-1][:5]
+        from tokenizers import Tokenizer as _Tk
+
+        _tk = _Tk.from_file(str(self.checkpoint / "tokenizer.json"))
+        print(f"[dump {tag}] top-5 global ids {[int(start + t) for t in top]} (slice start {start}) "
+              f"as text {[_tk.decode([int(start + t)]) for t in top]}")
+        # (e) the collapse coefficients the head actually uses, against c_identity
+        for k in (0, 1):
+            cc = dev.d2h(self.cbuf[k], (24,), np.float32)
+            print(f"[dump {tag}] c[{k}] lanes 0..11 {np.round(cc[:12], 4).tolist()}")
+        ident = np.zeros(24, np.float32)
+        ident[0] = 1.0
+        ident[8 + np.arange(4) * 5] = 1.0
+        print(f"[dump {tag}] c_identity lanes 0..11 {np.round(ident[:12], 4).tolist()}")
+        # (d) the head ALONE, on an embedding row: does it produce a sane token from a known input?
+        s1 = Shape(1, False)
+        prog1 = self._programs.get(s1)
+        if prog1 is not None and prog1.head is not None:
+            from tokenizers import Tokenizer
+
+            tk = Tokenizer.from_file(str(self.checkpoint / "tokenizer.json"))
+            xb = dev.malloc(max(256, 16 * H))
+            ob = dev.malloc(max(256, 16 * H))  # the head's X_out, which it also writes
+            lb = dev.malloc(4 * d.vocab)
+            try:
+                for word in ("1", " Paris", " the"):
+                    ids = tk.encode(word).ids
+                    if not ids:
+                        continue
+                    row = dev.d2h(self.w["emb"] + 4 * H * ids[0], (H,), np.float32)
+                    x = np.zeros((4 * H, 1), np.float32)
+                    x[:H, 0] = row
+                    dev.h2d(xb, x)
+                    op = prog1.head
+                    # the program's own bindings first (weights, consts), then the inputs we replace
+                    op.recipe.bind_slots(op.slots, op.addresses)
+                    op.recipe.bind("X", xb)
+                    op.recipe.bind("c", self.c_identity[1])
+                    op.recipe.bind("p", self.pzero)
+                    op.recipe.bind("logits", lb)
+                    op.recipe.bind("X_out", ob)
+                    op.recipe.launch()
+                    dev.sync()
+                    lo = dev.d2h(lb, (d.vocab,), np.float32)
+                    t5 = np.argsort(lo)[::-1][:5]
+                    print(f"[dump {tag}] head alone on emb[{word!r}]: top-5 global "
+                          f"{[int(start + t) for t in t5]} "
+                          f"as text {[tk.decode([int(start + t)]) for t in t5]}")
+            finally:
+                dev.free(xb)
+                dev.free(ob)
+                dev.free(lb)
 
     # ------------------------------------------------------------------ programs
     def _op(
