@@ -527,7 +527,7 @@ def ffn_graph(device: Device, dims: Dims, tokens: int, paged: bool = False) -> G
         struct.pack("iif", K, E, d.route_scale),
     )
     a8, shs = lg.q8p(g13, sin=hs, swiglu=True)
-    # BF16: the reference's shared expert is a bf16 product too, and rg_ds_xsum reads it 128 rows at a time
+    # BF16: the reference's shared expert is a bf16 product too; rg_ds_xsum_b16 reads it 128 rows at a time
     sh = lg.gemm8(a8, "sh_w2", H, dt=BF16)
     if paged:
         _paged_experts(lg, h32, ids, wts, sh, shs)
@@ -542,13 +542,13 @@ def ffn_graph(device: Device, dims: Dims, tokens: int, paged: bool = False) -> G
         [hq, hsl],
         struct.pack("ifii", K, d.limit, w - w0, 0),
     )
-    y2 = _w2(lg, hq, ids, K, BF16)  # always BF16: rg_ds_xsum reads it 128 rows at a time
+    y2 = _w2(lg, hq, ids, K, BF16)  # always BF16: rg_ds_xsum_b16 reads it 128 rows at a time
     if (
         T > 1
     ):  # the next sub-layer's coefficients, created late
         lg.site(X, "hcf")
     lg.node(
-        "rg_ds_xsum_f32",
+        "rg_ds_xsum_b16_f32",
         [y2, lg.input("x2.c", (H, E), F32), hsl, ids, wts, sh, shs],
         [lg.p_out()],
         struct.pack("i", K),
@@ -615,12 +615,12 @@ def _paged_experts(
         [d2],
         struct.pack("ii", 0, 0),
     )
-    y2 = lg.tensor((H, PS, P), BF16)  # always BF16: rg_ds_xcomb reads it 128 rows at a time
+    y2 = lg.tensor((H, PS, P), BF16)  # always BF16: rg_ds_xcomb_b16 reads it 128 rows at a time
     lg.node(
         "batch_gemm", [lg.view(hq, (w, PS, P)), lg.view(d2, (w, H, P))], [y2], GEMM_NT
     )
     lg.node(
-        "rg_ds_xcomb_f32",
+        "rg_ds_xcomb_b16_f32",
         [lg.view(y2, (H, S)), lg.input("x2.c", (H, E), F32), hs, ids, bm, wts, sh, shs],
         [lg.p_out()],
         struct.pack("i", K),
