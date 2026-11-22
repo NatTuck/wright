@@ -1681,12 +1681,19 @@ def test_index_keys_fp8_store_and_gather(device, recipes):
     sink = g.input("sink", (64, 1), I32)
     g.node("rg_mla_store_i8_f32", [arena, g.input("rows", (8, T), I32), g.input("kn", (512, T), F32),
                                    g.input("ix", (128, T), F32)], [sink])  # fmt: skip
-    g.node("rg_ds_ix_gather_f32", [arena, g.input("pages", (1, 1), I32), g.input("slots", (8, 1), I32), sink],
-           [g.input("out", (256, 64, 1), F8), g.input("scales", (128, 1), F32)])  # fmt: skip
+    # the gather reads the step's compressed-page table (one arena row per page per column) plus the owner's
+    # latent offset, not a per-slot page table: entry [pbase + page][col] is the page's first arena row less
+    # ``ioff`` (the owner's offset plus PAGE_ROWS), and slot lane 7 is the tile's first page.
+    g.node("rg_ds_ix_gather_f32",
+           [arena, g.input("cmp_blocks", (1, T), I32), g.input("slots", (8, 1), I32), sink,
+            g.input("loff", (64,), I32)],
+           [g.input("out", (256, 64, 1), F8), g.input("scales", (128, 1), F32)],
+           struct.pack("i", 129))  # fmt: skip
     klen = 100
     out = run_graph(device, recipes, g, {
         "arena": np.zeros((NB, PR, 512), np.uint8), "sink": np.zeros((1, 64), np.int32), "rows": rows,
-        "kn": np.zeros((T, 512), np.float32), "ix": keys.astype(np.float32), "pages": np.array([[B]], np.int32),
+        "kn": np.zeros((T, 512), np.float32), "ix": keys.astype(np.float32),
+        "cmp_blocks": np.full((1, T), B - 129, np.int32), "loff": np.array([0] + [-1] * 63, np.int32),
         "slots": np.array([[0, 0, 0, 0, klen, 0, 1, 0]], np.int32), "out": np.full((1, 64, 256), 0x55, np.uint8),
         "scales": np.full((1, 128), -1.0, np.float32)}, ["out", "scales"])  # fmt: skip
     out["out"] = out["out"].reshape(1, 128, 128)
@@ -1714,7 +1721,7 @@ def test_index_scores_fp8(device, recipes):
     flat = arena.reshape(-1, 512)
     pages = np.zeros((S, C // 128), np.int32)
     for p in range(nkeys // 128):
-        r0 = 40 * p + 3
+        r0 = 40 * p + 200  # above PAGE_ROWS: the page table stores the row less ioff
         pages.reshape(-1)[p] = r0
         flat[r0 : r0 + 32] = kb[128 * p : 128 * (p + 1)].reshape(32, 512)
         flat[r0 + 32, :512] = ks[128 * p : 128 * (p + 1)].view(np.uint8)
@@ -1728,15 +1735,23 @@ def test_index_scores_fp8(device, recipes):
     q8, qsc = g.tensor((128, NH, S), F8), g.tensor((NH, S), F32)
     g.node("rg_ix_slot_q8_f32", [g.input("q", (128, NH * T), F8), g.input("qs", (NH * T,), F32), tab], [q8, qsc])
     k8w, k8, ksc = g.tensor((256, C // 2, S), F8), g.tensor((128, C, S), F8), g.tensor((C, S), F32)
-    g.node("rg_ds_ix_gather_f32", [g.input("arena", (512, PR, NB), U8), g.input("pages", (C // 128, S), I32), tab,
-                                   g.input("dep", (64,), I32)], [k8w, ksc])  # fmt: skip
+    # the gather reads the compressed-page table (per column, one arena row per page) and the owner's latent
+    # offset: cmp_blocks[pbase + page][col] is the page's first arena row less ioff (owner offset + PAGE_ROWS)
+    # ioff = loff[0] + PAGE_ROWS: with loff[0] = -PAGE_ROWS the table holds each page's first arena row
+    # directly, which is what this test's `pages` already is
+    cmp_blocks = pages.T.astype(np.int32)
+    g.node("rg_ds_ix_gather_f32",
+           [g.input("arena", (512, PR, NB), U8), g.input("cmp_blocks", (C // 128, S), I32), tab,
+            g.input("dep", (64,), I32), g.input("loff", (64,), I32)],
+           [k8w, ksc], struct.pack("i", 129))  # fmt: skip
     g.node("reshape", [k8w], [k8])
     sc = g.tensor((C, NH, S), F32)
     g.node("batch_gemm", [q8, k8], [sc], GEMM_NT)
     g.node("rg_ds_ix_slot_acc8_f32", [sc, g.input("w", (NH, T), F32), tab, g.input("score", (C * S, T), F32),
                                       qsc, ksc], [g.input("sink", (64, 1), I32)], struct.pack("f", 1.0 / 64))  # fmt: skip
     out = run_graph(device, recipes, g, {
-        "slots": slots, "q": qb, "qs": qs, "arena": arena, "pages": pages, "dep": np.zeros(64, np.int32),
+        "slots": slots, "q": qb, "qs": qs, "arena": arena, "cmp_blocks": cmp_blocks,
+        "dep": np.zeros(64, np.int32), "loff": np.array([-129] + [-1] * 63, np.int32),
         "w": w, "score": np.zeros((T, C * S), np.float32), "sink": np.zeros((1, 64), np.int32)}, ["score"])  # fmt: skip
     for s in range(S):
         kk = keys[C * s : C * (s + 1)]
@@ -2292,7 +2307,10 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
     S2 = lpg * slots
     rng = np.random.default_rng(11)
     # every block's first position and the entries its last column sees: some blocks see nothing of a tile
-    # the table's view is (T, 2) -- the graph tensor is (2, T), lane 0 the position, lane 1 the count
+    # the table's view is (T, 2) -- the graph tensor is (2, T), lane 0 the position, lane 1 the count -- and its
+    # row is the QUERY BLOCK index, which is what the fill writes: block b covers columns b*qb .. b*qb + qb - 1,
+    # so row b*qb is block 0's row only when qb == 1 (a decode step).  Writing block b's entry at row b*qb (the
+    # column) is the bug this gate exists to catch.
     blk = np.zeros((T, 2), np.int32)
     blk[:nblk, 0] = rng.integers(0, 4096, nblk)
     blk[:nblk, 1] = rng.integers(0, 5000, nblk)
@@ -2306,12 +2324,12 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
             for rg in range(S2):
                 b, tile = rg % nblk, g * tp + rg // nblk
                 first, c0 = tile * keys, b * qb
-                ln = min(max(int(block[c0, 1]) - first, 0), keys)
+                ln = min(max(int(block[b, 1]) - first, 0), keys)
                 if ln <= 0:
                     continue
                 key0 = 0 if tile == 0 else run + (tile - g * tp) * keys
                 rec[g * S2 + rg] = [
-                    0, L.INDEX_HEADS * c0, int(block[c0, 0]), key0, key0 + ln, c0, ratio,
+                    0, L.INDEX_HEADS * c0, int(block[b, 0]), key0, key0 + ln, c0, ratio,
                     first // page,
                 ]  # fmt: skip
         return rec, gb
@@ -2343,6 +2361,9 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
         # every group's slot records carry their own tile's keys, and a slot past a column's visible entries is
         # the padding record (lane 0 = -1) the launches read as "no keys"
         assert (got[:, 0] == -1).any() and (got[:, 0] == 0).any()
+        # every block of tile 0 sees a key, so every one of the first S2 records must be live: a kernel that
+        # reads the wrong row of blk produces all-padding records and cannot pass this
+        assert np.all(got[:S2, 0] == 0), got[:S2, 0].tolist()
         # RED: move one block's seen count and the records must follow
         moved = blk.copy()
         moved[0, 1] += 3 * keys

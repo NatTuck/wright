@@ -10,7 +10,7 @@
 // step's one column each, so c0 = b*qb in both). The record's lanes are what index_score_graph reads:
 //   [0] group (0), [1] index_heads*c0 (qcol0), [2] q (qpos0), [3] key0, [4] key0 + len, [5] c0 (qtok0),
 //   [6] ratio, [7] the tile's first index page (ds_ix_gather's page table base)
-// with len = clamp(seen - first, 0, keys) the keys of the tile the block's last column can see (blk[1, c0]).
+// with len = clamp(seen - first, 0, keys) the keys of the tile the block's last column can see (blk[1, b]).
 // A slot with no key of its tile visible gets lane 0 = -1 and the rest 0 (the launches' "no keys" padding).
 //
 // It also publishes each group's first key (gbase), which the merge and the block kernels read, so the host
@@ -36,7 +36,11 @@ void main(tensor blk, tensor rec, tensor gbase, int S2, int nblk, int qb, int he
             const int tile = g * tp + rg / nblk;
             const int first = tile * keys;
             const int c0 = b * qb;
-            int5 bc = {0, c0, 0, 0, 0};
+            // ``blk`` is one row per QUERY BLOCK, not per column: block b's row is b (the fill writes
+            // (rows.column + b0) / qb, which is b).  Reading row b*qb -- the block's first column -- is the
+            // same row only when qb == 1, i.e. in a decode step; in a prefill step it reads a row the fill
+            // never wrote, so every block past the first gets len = 0 and the whole chain lists nothing.
+            int5 bc = {0, b, 0, 0, 0};
             const int q = s_i32_ld_g(gen_addr(bc, blk));
             bc[0] = 1;
             const int seen = s_i32_ld_g(gen_addr(bc, blk));
