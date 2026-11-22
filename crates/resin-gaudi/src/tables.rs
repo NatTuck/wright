@@ -24,6 +24,31 @@ impl Words<'_> {
     pub fn fill(&mut self, offset: usize, count: usize, value: impl Into<i64>) {
         self.0[offset / 4..offset / 4 + count].fill(value.into() as i32);
     }
+
+    /// Bulk-write `values` (i64, cast to i32) at a table's byte `offset`, word `index`: one bounds
+    /// check for the run, then a tight loop the compiler vectorizes (vs per-element `set`).
+    pub fn set_many_i64(&mut self, offset: usize, index: usize, values: &[i64]) {
+        let start = offset / 4 + index;
+        let dst = &mut self.0[start..start + values.len()];
+        for (d, &v) in dst.iter_mut().zip(values) {
+            *d = v as i32;
+        }
+    }
+
+    /// Bulk-write `values` (f32, as their bits) at a table's byte `offset`, word `index`.
+    pub fn set_many_f32(&mut self, offset: usize, index: usize, values: &[f32]) {
+        let start = offset / 4 + index;
+        let dst = &mut self.0[start..start + values.len()];
+        for (d, &v) in dst.iter_mut().zip(values) {
+            *d = v.to_bits() as i32;
+        }
+    }
+
+    /// Copy `values` (i32 words) verbatim at a table's byte `offset`, word `index` (one memcpy).
+    pub fn copy_words(&mut self, offset: usize, index: usize, values: &[i32]) {
+        let start = offset / 4 + index;
+        self.0[start..start + values.len()].copy_from_slice(values);
+    }
 }
 
 /// The words of a host copy that holds `nbytes` bytes from its start (4-byte aligned).

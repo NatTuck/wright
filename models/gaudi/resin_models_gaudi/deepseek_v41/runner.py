@@ -226,6 +226,19 @@ class DeepSeekV41GaudiRunner:
         # release
         self.executor = build_executor(self)
         self.forward = self.executor.forward
+        if __import__("os").environ.get("RESIN_DS41_TIMINGS"):
+            import time as _t
+            _fwd = self.forward
+            def _timed_forward(plan, *args, **kwargs):
+                t0 = dict(self.executor.timings); w0 = _t.perf_counter()
+                out = _fwd(plan, *args, **kwargs)
+                w1 = _t.perf_counter(); t1 = self.executor.timings
+                d = {k: round((t1[k] - t0[k]) / 1e6, 1) for k in t1}
+                d["wall"] = round((w1 - w0) * 1e3, 1)
+                d["phase"] = str(getattr(plan, "phase", "?"))
+                print(f"TIMINGS {d}", flush=True)
+                return out
+            self.forward = _timed_forward
         self.enqueue = self.executor.enqueue
         self.release = self.executor.release
         self.metrics_snapshot = self.executor.metrics_snapshot  # the Engine's metrics, no Python

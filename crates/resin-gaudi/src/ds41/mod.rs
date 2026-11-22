@@ -20,6 +20,41 @@ pub const PENDING_SLOTS: i64 = 4;
 const LANES: usize = (INDEX_KEYS / PAGE_TOKENS) as usize;
 const ROPE: usize = 128;
 
+/// Env-gated (`RESIN_DS41_FILL_PROF=1`) per-section fill timers (stderr, once per fill). Off: one branch.
+struct FillProf {
+    on: bool,
+    last: std::time::Instant,
+    acc: Vec<(&'static str, u64)>,
+}
+impl FillProf {
+    fn new() -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("RESIN_DS41_FILL_PROF").map(|v| v == "1").unwrap_or(false));
+        Self { on, last: std::time::Instant::now(), acc: Vec::new() }
+    }
+    fn mark(&mut self, name: &'static str) {
+        if self.on {
+            let now = std::time::Instant::now();
+            self.acc.push((name, (now - self.last).as_nanos() as u64));
+            self.last = now;
+        }
+    }
+    fn report(&self, t: usize, prefill: bool) {
+        if !self.on { return; }
+        let mut order: Vec<&'static str> = Vec::new();
+        let mut sums: Vec<u64> = Vec::new();
+        for &(name, ns) in &self.acc {
+            match order.iter().position(|&n| n == name) {
+                Some(i) => sums[i] += ns,
+                None => { order.push(name); sums.push(ns); }
+            }
+        }
+        let total: u64 = sums.iter().sum();
+        let parts: Vec<String> = order.iter().zip(&sums).map(|(n, ns)| format!("{n}={:.1}", *ns as f64 / 1e6)).collect();
+        eprintln!("FILL_PROF t={t} prefill={prefill} total={:.1}ms {}", total as f64 / 1e6, parts.join(" "));
+    }
+}
+
 /// A layer that owns a compressed cache: its ratio, its pages per HISTORY block and its row offset in a block.
 #[derive(Clone, Debug)]
 pub struct Owner {
@@ -337,9 +372,11 @@ pub fn fill(
     if host.len() < tables.nbytes || !tables.nbytes.is_multiple_of(4) {
         return Err("the host copy is too small or misaligned".into());
     }
+    let mut prof = FillProf::new();
     for &(lo, hi) in &tables.zero {
         host[lo..hi].fill(0);
     }
+    prof.mark("zero");
     let mut w = words(host, tables.nbytes)?;
     let qb = tables.qb.max(1);
     let r_count = rows.len();
@@ -354,17 +391,17 @@ pub fn fill(
     for r in 0..2 {
         for (column, &position) in pos.iter().enumerate() {
             let cs = rope(cs_all[r], position)?;
-            for (lane, &value) in cs.iter().enumerate() {
-                w.set_f32(tables.cs[r], column * ROPE + lane, value);
-                w.set_f32(
-                    tables.cs_inv[r],
-                    column * ROPE + lane,
-                    if lane < 64 { value } else { -value },
-                );
+            w.set_many_f32(tables.cs[r], column * ROPE, cs);
+            // cs_inv is cs with its last 64 lanes negated: copy the row, then flip the tail's signs
+            w.set_many_f32(tables.cs_inv[r], column * ROPE, cs);
+            let inv_start = tables.cs_inv[r] / 4 + column * ROPE;
+            for d in w.0[inv_start + 64..inv_start + ROPE].iter_mut() {
+                *d = (-f32::from_bits(*d as u32)).to_bits() as i32;
             }
         }
     }
 
+    prof.mark("rope");
     // each row's blocks: WINDOW rows and ids from logical block window_first (padded with 0), HISTORY rows from
     // block 0 (padded with -1 to at least the model's page count)
     let window_width = (0..r_count)
@@ -414,6 +451,7 @@ pub fn fill(
         .map(|k| rows.pos0[k] + rows.real[k] - 1)
         .collect();
 
+    prof.mark("blocks_setup");
     // window slots, and every layer's window pages and store rows
     let sliding = model.sliding_window;
     let (win_slots, pages) = (tables.win_slots, tables.win_pages);
@@ -455,11 +493,14 @@ pub fn fill(
             }
         }
     }
+    let mut lat_buf: Vec<i32> = Vec::with_capacity(lat0.len());
+    prof.mark("slots_lat0");
     for (&lat, &offset) in tables.lat.iter().zip(&model.layer_rows) {
-        for (index, &value) in lat0.iter().enumerate() {
-            w.set(lat, index, if value >= 0 { value + offset } else { -1 });
-        }
+        lat_buf.clear();
+        lat_buf.extend(lat0.iter().map(|&v| if v >= 0 { (v + offset) as i32 } else { -1 }));
+        w.copy_words(lat, 0, &lat_buf);
     }
+    prof.mark("lat");
     for (&table, &offset) in tables.rows.iter().zip(&model.layer_rows) {
         w.fill(table, t * 8, -1);
         for &c in &cols {
@@ -470,6 +511,7 @@ pub fn fill(
         }
     }
 
+    prof.mark("rows");
     // compressor: ratio-2 groups (completed at odd positions) and pending tokens, ratio-1 entries
     let odd: Vec<usize> = cols.iter().copied().filter(|&c| pos[c] % 2 == 1).collect();
     let groups2 = tables.groups2;
@@ -564,6 +606,7 @@ pub fn fill(
         }
     }
 
+    prof.mark("compressor");
     // indexer: visible entries, compressed pages, index launches
     let mut counts = Counts {
         sparse: false,
@@ -703,29 +746,35 @@ pub fn fill(
                 }
             }
         }
-        // each live column's HISTORY rows, per page of this ratio
+    prof.mark("ix_vis");
+        // each live column's HISTORY rows, per page of this ratio. A column's row depends only on its
+        // sequence's HISTORY (not the column): compute each row's page buffer once, copy to its columns.
         let per = (HISTORY_TOKENS / ratio / page) as usize;
         let blocks = tables.cmp_blocks[ri];
+        let pages_n = model.pages;
+        let mut row_bufs: Vec<Vec<i32>> = Vec::with_capacity(r_count);
+        for k in 0..r_count {
+            let hist = history(k);
+            let mut buf = vec![0i32; pages_n];
+            for (i, b) in buf.iter_mut().enumerate() {
+                let value = padded(hist, history_width, (i / per) as i64, -1)?;
+                *b = if value >= 0 {
+                    (value + PAIR_ROWS * (i % per) as i64) as i32
+                } else {
+                    -1
+                };
+            }
+            row_bufs.push(buf);
+        }
         for c in 0..t {
             if !live(c) {
-                w.fill(blocks + c * model.pages * 4, model.pages, -1);
+                w.fill(blocks + c * pages_n * 4, pages_n, -1);
                 continue;
             }
             let k = col_row[c] as usize;
-            let hist = history(k);
-            for i in 0..model.pages {
-                let value = padded(hist, history_width, (i / per) as i64, -1)?;
-                w.set(
-                    blocks,
-                    c * model.pages + i,
-                    if value >= 0 {
-                        value + PAIR_ROWS * (i % per) as i64
-                    } else {
-                        -1
-                    },
-                );
-            }
+            w.copy_words(blocks, c * pages_n, &row_bufs[k]);
         }
+    prof.mark("cmp_blocks");
         // index launches: per query column, its keys in chunks of INDEX_KEYS
         let mut records: Vec<(usize, i64, i64, i64, i64)> = Vec::new();
         for k in 0..r_count {
@@ -787,9 +836,12 @@ pub fn fill(
         }
     }
 
+    prof.mark("index");
     if with_tokens {
         fill_tokens(model, tables, host, rows, n, tokens, host_tables)?;
     }
+    prof.mark("tokens");
+    prof.report(t, tables.prefill);
     Ok(counts)
 }
 
@@ -915,8 +967,15 @@ pub fn engram_gather_into(
             .ok_or_else(|| format!("Engram row {id} is outside the host table"))?;
         let codes = &weight[row * 256..row * 256 + 256];
         let scales = &scale[row * 8..row * 8 + 8];
-        for i in 0..256 {
-            out[r * 256 + i] = lut[usize::from(scales[i / 32])][usize::from(codes[i])];
+        let out_row = &mut out[r * 256..r * 256 + 256];
+        // hoist the LUT row per 32-code block (one scale lookup, not one per code)
+        for (blk, &sc) in scales.iter().enumerate() {
+            let l = &lut[usize::from(sc)];
+            let src = &codes[blk * 32..blk * 32 + 32];
+            let dst = &mut out_row[blk * 32..blk * 32 + 32];
+            for (d, &c) in dst.iter_mut().zip(src) {
+                *d = l[usize::from(c)];
+            }
         }
     }
     Ok(())
@@ -947,11 +1006,7 @@ fn engram_gather_host(
             }
             engram_gather_into(ht.weight, ht.scale, &col_ids, &mut scratch)?;
             let base = c * (256 * width);
-            for j in 0..width {
-                for i in 0..256 {
-                    w.set_f32(offset, base + j * 256 + i, scratch[j * 256 + i]);
-                }
-            }
+            w.set_many_f32(offset, base, &scratch);
         }
     }
     Ok(())
@@ -1032,13 +1087,12 @@ pub fn fill_draft(
     for r in 0..2 {
         for (column, &position) in pos.iter().enumerate() {
             let cs = rope(cs_all[r], position)?;
-            for (lane, &value) in cs.iter().enumerate() {
-                w.set_f32(tables.cs[r], column * ROPE + lane, value);
-                w.set_f32(
-                    tables.cs_inv[r],
-                    column * ROPE + lane,
-                    if lane < 64 { value } else { -value },
-                );
+            w.set_many_f32(tables.cs[r], column * ROPE, cs);
+            // cs_inv is cs with its last 64 lanes negated: copy the row, then flip the tail's signs
+            w.set_many_f32(tables.cs_inv[r], column * ROPE, cs);
+            let inv_start = tables.cs_inv[r] / 4 + column * ROPE;
+            for d in w.0[inv_start + 64..inv_start + ROPE].iter_mut() {
+                *d = (-f32::from_bits(*d as u32)).to_bits() as i32;
             }
         }
     }
