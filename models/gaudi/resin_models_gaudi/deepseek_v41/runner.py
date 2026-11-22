@@ -63,6 +63,7 @@ class DeepSeekV41GaudiRunner:
         parent_capacity: int | None = None,
         num_layers: int | None = None,
         engram: str = "card",
+        engram_prewarm: bool = True,
         draft_tokens: int = 0,
         replay: int | None = None,
         defer_cache: bool = False,
@@ -141,7 +142,7 @@ class DeepSeekV41GaudiRunner:
         self.model = DeepSeekV41Gaudi(
             self.device, checkpoint, cfg, capacity=self._fit, max_seq_len=max_seq_len, rank=rank, nranks=nranks,
             layers=num_layers, engram=engram, barrier=barrier, log=log if rank == 0 else (lambda *_: None),
-            dspark=speculative, replay=replay, defer_cache=True,
+            dspark=speculative, replay=replay, defer_cache=True, engram_prewarm=engram_prewarm,
         )  # fmt: skip
         if barrier is not None:
             barrier()

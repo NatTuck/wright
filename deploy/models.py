@@ -80,6 +80,12 @@ class ModelSpec:
     recipe: str | None = None
     # Defaults for the chat recipe, as (name, value) pairs.
     recipe_options: tuple[tuple[str, Any], ...] = ()
+    # DeepSeek-V4.1 Engram: "card" shards the lookup tables across the cards; "host" keeps them in
+    # host RAM (a shared mmap of the checkpoint shards) and gathers/dequantizes the rows per step in
+    # the native fill. "host" is what fits the tables on 4 cards at 512k context.
+    engram: str = "card"
+    engram_gather: str = "auto"
+    engram_prewarm: bool = False
 
     @property
     def repo_id(self) -> str:
@@ -294,6 +300,36 @@ MODEL_SPECS = {
         draft_tokens=0,
         prefill_chunk_size=2048,
         media=False,
+    ),
+    # 4 cards, 512k context, batch 1-8: the 188.8 GiB Engram tables do not fit on 4 cards (47.2 GiB/card
+    # of table crowds out the KV arena), so they stay in host RAM (a shared mmap of the checkpoint
+    # shards) and the native fill gathers/dequantizes the rows per step. Host-only; prewarm makes the
+    # gather RAM-resident. Text only (no vision tower).
+    "deepseek_v41-gaudi2-tp4": ModelSpec(
+        name="deepseek_v41-gaudi2-tp4",
+        family="deepseek_v41",
+        accelerator="gaudi2",
+        checkpoint=Checkpoint(
+            repo_id="deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            revision="1bae0e1088993b9b82de08f59de5be5a34e42170",
+            directory="",
+            required_files=("config.json", "tokenizer.json", "tokenizer_config.json"),
+            patterns=("*.json", "model*.safetensors"),
+        ),
+        model_mount="/models/deepseek-v41-flash-1017",
+        model_volume="resin-deepseek-v41-flash-1017-models-v1",
+        gpu="HL-225",
+        label="deepseek_v41-gaudi2-tp4",
+        world_size=4,
+        attn_tp=4,
+        context_length=512_000,
+        max_batch_size=8,
+        draft_tokens=0,
+        prefill_chunk_size=2048,
+        media=False,
+        engram="host",
+        engram_gather="mmap",
+        engram_prewarm=True,
     ),
     # Text only: the GGUF has no Pixtral tower; the tokenizer and chat template come from
     # the official release (its vocabulary equals the GGUF's, id for id).
@@ -549,12 +585,16 @@ def create_runner(
     defer_cache: bool = False,
     native_ranks=None,
     cache_types: tuple[str | None, str | None] | None = None,
+    engram: str | None = None,
+    engram_gather: str | None = None,
+    engram_prewarm: bool | None = None,
 ):
     """Construct one runner with model-specific cache geometry and draft support.
     ``defer_cache``: load the weights only, for a card that several models share (the runner's
     ``attach`` gives it the shared cache arena). ``native_ranks``: a Qwen3.5/3.8 rank's
     ``resin._resin.GaudiRanks`` (``--step-transport native``), in place of ``groups``.
-    ``cache_types``: the types of the K and V cache pages (``kv_cache_types``; None: the model's)."""
+    ``cache_types``: the types of the K and V cache pages (``kv_cache_types``; None: the model's).
+    ``engram``/``engram_gather``/``engram_prewarm``: DeepSeek-V4.1 Engram overrides (None: the preset's)."""
     spec = get_model(model)
     checkpoint = spec.path if checkpoint is None else Path(checkpoint)
     return _create_gaudi_runner(
@@ -576,6 +616,9 @@ def create_runner(
         defer_cache=defer_cache,
         native_ranks=native_ranks,
         cache_types=check_cache_types(spec, cache_types),
+        engram=engram,
+        engram_gather=engram_gather,
+        engram_prewarm=engram_prewarm,
     )
 
 
@@ -595,6 +638,9 @@ def _create_gaudi_runner(
     defer_cache: bool = False,
     native_ranks=None,
     cache_types: tuple[str, str] = ("bf16", "bf16"),
+    engram: str | None = None,
+    engram_gather: str | None = None,
+    engram_prewarm: bool | None = None,
 ):
     """One Gaudi card per rank, selected by ``hpu:N`` (its accel index) or the first free one.
     ``cache_types``: checked by ``check_cache_types``; only Qwen3.5/3.8 has a choice."""
@@ -602,6 +648,18 @@ def _create_gaudi_runner(
         raise ValueError(f"{spec.name} does not share a card with other models yet")
     if native_ranks is not None and spec.family not in NATIVE_RANK_FAMILIES:
         raise ValueError(f"{spec.name} has no native rank dispatch")
+    # Engram flags are DeepSeek-V4.1-only; resolve overrides against the preset.
+    if (engram is not None or engram_gather is not None or engram_prewarm is not None) and (
+        spec.family != "deepseek_v41"
+    ):
+        raise ValueError(f"{spec.name} has no Engram tables (--engram/--engram-gather/--engram-prewarm)")
+    engram = spec.engram if engram is None else engram
+    engram_gather = spec.engram_gather if engram_gather is None else engram_gather
+    engram_prewarm = spec.engram_prewarm if engram_prewarm is None else engram_prewarm
+    if engram not in ("card", "host"):
+        raise ValueError(f"engram {engram!r}: 'card' or 'host'")
+    if engram_gather not in ("pooled", "mmap", "auto"):
+        raise ValueError(f"engram_gather {engram_gather!r}: 'pooled', 'mmap' or 'auto'")
     if spec.family == "glm5_3_flash":
         from resin_models_gaudi.glm5_3_flash.runner import (
             PREFILL_CHUNK_SIZES,
@@ -650,6 +708,8 @@ def _create_gaudi_runner(
             num_layers=num_layers,
             draft_tokens=draft_tokens,
             defer_cache=defer_cache,
+            engram=engram,
+            engram_prewarm=engram_prewarm,
         )
     if spec.family == "qwen4_exp":
         from resin_models_gaudi.qwen4_exp.runner import (
@@ -834,6 +894,19 @@ def checkpoint_weight_bytes(spec: ModelSpec, checkpoint: Path) -> int:
         for path in root.iterdir()
         if path.suffix in (".gguf", ".safetensors")
     )
+
+
+def engram_table_bytes(spec: ModelSpec, checkpoint: Path) -> int:
+    """The Engram lookup tables' file bytes — ``sum(engram_num_embeddings) * 264`` (256 E4M3 codes +
+    8 E8M0 scale bytes per row). Host-Engram keeps these in host RAM, not on the cards, so the fit
+    check subtracts them from the card weight share. 0 for families without Engram tables."""
+    if spec.family != "deepseek_v41":
+        return 0
+    import json
+
+    cfg = json.loads((checkpoint / "config.json").read_text())
+    text = cfg.get("text_config", cfg)
+    return sum(text.get("engram_num_embeddings", [])) * 264
 
 
 def validate_gaudi_options(

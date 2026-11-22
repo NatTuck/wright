@@ -55,6 +55,9 @@ class ModelFlags:
     gpu_memory_utilization: float | None = None
     tokenizer: Path | None = None
     spec_draft_n_max: int | None = None
+    engram: str | None = None
+    engram_gather: str | None = None
+    engram_prewarm: bool | None = None
     model_draft: Path | None = None
     cache_type_k: CacheType | None = None
     cache_type_v: CacheType | None = None
@@ -272,6 +275,9 @@ def server_arguments(
     parallel: int = -1,
     batch_size: int | None = None,
     draft_tokens: int | None = None,
+    engram: str | None = None,
+    engram_gather: str | None = None,
+    engram_prewarm: bool | None = None,
     model_draft: Path | None = None,
     cache_types: tuple[CacheType | None, CacheType | None] = (None, None),
     device: str | None = None,
@@ -303,6 +309,8 @@ def server_arguments(
         ("--max-batch-size", parallel if parallel > 0 else None),
         ("--prefill-chunk-size", batch_size),
         ("--draft-tokens", draft_tokens),
+        ("--engram", engram),
+        ("--engram-gather", engram_gather),
         ("--assistant-checkpoint", model_draft),
         # (a model's flags of a layout come as their text)
         ("--cache-type-k", None if cache_types[0] is None else CacheType(cache_types[0]).value),
@@ -318,6 +326,8 @@ def server_arguments(
     ):
         if value is not None:
             line += [flag, str(value)]
+    if engram_prewarm is not None:
+        line += ["--engram-prewarm" if engram_prewarm else "--no-engram-prewarm"]
     line += [
         "--numa",
         numa.value,
@@ -637,6 +647,34 @@ def serve(
             rich_help_panel=_RUNTIME,
         ),
     ] = None,
+    engram: Annotated[
+        str | None,
+        typer.Option(
+            metavar="MODE",
+            help="Where the DeepSeek-V4.1 Engram tables live: 'card' or 'host'. Host keeps them "
+            "in the checkpoint's file and gathers rows each step, which is what makes four cards "
+            "possible. (default: the model's)",
+            rich_help_panel=_RUNTIME,
+        ),
+    ] = None,
+    engram_gather: Annotated[
+        str | None,
+        typer.Option(
+            metavar="HOW",
+            help="How the host gather reads the tables: 'pooled', 'mmap', or 'auto' by measured "
+            "page-cache residency. (default: the model's)",
+            rich_help_panel=_RUNTIME,
+        ),
+    ] = None,
+    engram_prewarm: Annotated[
+        bool | None,
+        typer.Option(
+            "--engram-prewarm/--no-engram-prewarm",
+            help="Read the two Engram shards once at startup so the gather can map them. "
+            "(default: the model's)",
+            rich_help_panel=_RUNTIME,
+        ),
+    ] = None,
     spin_wait: Annotated[
         float | None,
         typer.Option(
@@ -717,6 +755,9 @@ def serve(
                 gpu_memory_utilization=gpu_memory_utilization,
                 tokenizer=tokenizer,
                 spec_draft_n_max=spec_draft_n_max,
+                engram=engram,
+                engram_gather=engram_gather,
+                engram_prewarm=engram_prewarm,
                 model_draft=model_draft,
                 cache_type_k=cache_type_k,
                 cache_type_v=cache_type_v,
@@ -781,6 +822,9 @@ def serve(
                 parallel=flags.parallel,
                 batch_size=flags.batch_size,
                 draft_tokens=flags.spec_draft_n_max,
+                engram=flags.engram,
+                engram_gather=flags.engram_gather,
+                engram_prewarm=flags.engram_prewarm,
                 model_draft=flags.model_draft,
                 cache_types=(flags.cache_type_k, flags.cache_type_v),
                 device=flags.device,

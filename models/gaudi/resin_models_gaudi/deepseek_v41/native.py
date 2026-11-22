@@ -176,6 +176,7 @@ def build_executor(runner):
             "draft_tokens": runner.speculative_tokens,
             "dspark_rows": DSPARK_ROWS,
             "engram_n": m.cfg.engram_max_ngram_size - 1,
+            "engram_host": m.engram == "host",
             "spin_ns": int(runtime._SPIN_WAIT * 1e9),
         },
         draft=draft,

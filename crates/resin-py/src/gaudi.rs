@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 
-use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadwriteArray1, PyUntypedArrayMethods};
+use numpy::{
+    PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1,
+    PyUntypedArrayMethods,
+};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -44,11 +47,44 @@ type EngramArgs = (
     Vec<i64>,
     Vec<i64>,
 );
-/// A fill's model, its shapes' tables by (columns, prefill), and the rotation tables.
+/// Bind the host Engram tables readonly for a fill call. The returned guards must outlive the
+/// `ds41::HostTable` slices borrowed from them (both live to the end of the calling fill).
+pub(crate) fn engram_host_guards<'py>(
+    py: Python<'py>,
+    tables: &[(Py<PyArray2<u8>>, Py<PyArray2<u8>>)],
+) -> Vec<(PyReadonlyArray2<'py, u8>, PyReadonlyArray2<'py, u8>)> {
+    tables
+        .iter()
+        .map(|(w, s)| (w.bind(py).readonly(), s.bind(py).readonly()))
+        .collect()
+}
+
+/// Borrow the host Engram tables' bytes from their readonly guards (contiguous, as the mmap views are).
+pub(crate) fn engram_host_slices<'a>(
+    guards: &'a [(PyReadonlyArray2<'_, u8>, PyReadonlyArray2<'_, u8>)],
+) -> PyResult<Vec<ds41::HostTable<'a>>> {
+    guards
+        .iter()
+        .map(|(w, s)| {
+            Ok(ds41::HostTable {
+                weight: w
+                    .as_slice()
+                    .map_err(|_| PyValueError::new_err("engram_host weight must be contiguous"))?,
+                scale: s
+                    .as_slice()
+                    .map_err(|_| PyValueError::new_err("engram_host scale must be contiguous"))?,
+            })
+        })
+        .collect()
+}
+
+/// A fill's model, its shapes' tables by (columns, prefill), the rotation tables, and the host
+/// Engram tables (per layer: (weight (rows,256) u8, scale (rows,8) u8) mmap views; empty in card mode).
 pub(crate) type Ds41Parts = (
     ds41::Model,
     HashMap<(usize, bool), ds41::Tables>,
     [Py<PyArray2<f32>>; 2],
+    Vec<(Py<PyArray2<u8>>, Py<PyArray2<u8>>)>,
 );
 /// (sparse, cand, ixc, radix1, radix2, ix1, ix2, pf1, pf2, dense1, dense2)
 type Ds41Counts = (
@@ -73,15 +109,23 @@ pub(crate) struct Ds41Fill {
     /// by (columns, prefill)
     shapes: HashMap<(usize, bool), ds41::Tables>,
     cs: [Py<PyArray2<f32>>; 2],
+    /// host Engram lookup tables, per Engram layer index: (weight (rows,256) u8, scale (rows,8) u8),
+    /// numpy views over the shared mmap, held alive like cs. Empty in card mode.
+    engram_host: Vec<(Py<PyArray2<u8>>, Py<PyArray2<u8>>)>,
 }
 
 impl Ds41Fill {
-    /// The fill's model, every shape's tables and the rotation tables (for the native executor).
+    /// The fill's model, every shape's tables, the rotation tables and the host Engram tables (for
+    /// the native executor).
     pub(crate) fn parts(&self, py: Python<'_>) -> Ds41Parts {
         (
             self.model.clone(),
             self.shapes.clone(),
             [self.cs[0].clone_ref(py), self.cs[1].clone_ref(py)],
+            self.engram_host
+                .iter()
+                .map(|(w, s)| (w.clone_ref(py), s.clone_ref(py)))
+                .collect(),
         )
     }
 
@@ -96,7 +140,7 @@ impl Ds41Fill {
 #[pymethods]
 impl Ds41Fill {
     #[new]
-    #[pyo3(signature = (*, heads, index_heads, sliding_window, layer_rows, owners, pending, pages, kmax, kc, candidate, engram, cs0, cs1, radix_min, prefilter, dense_keys, geometry))]
+    #[pyo3(signature = (*, heads, index_heads, sliding_window, layer_rows, owners, pending, pages, kmax, kc, candidate, engram, cs0, cs1, radix_min, prefilter, dense_keys, geometry, engram_host=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         heads: i64,
@@ -116,6 +160,7 @@ impl Ds41Fill {
         prefilter: (i64, i64),
         dense_keys: i64,
         geometry: (i64, i64, i64, i64, i64, i64),
+        engram_host: Option<Vec<(Bound<'_, PyArray2<u8>>, Bound<'_, PyArray2<u8>>)>>,
     ) -> PyResult<Self> {
         // the cache geometry the Python side uses: (page tokens, history tokens, page rows, index rows, index
         // keys, pending slots)
@@ -166,6 +211,33 @@ impl Ds41Fill {
             }
             None => None,
         };
+        let engram_host = match engram_host {
+            None => Vec::new(),
+            Some(tables) => {
+                if engram.is_none() {
+                    return Err(PyValueError::new_err(
+                        "engram_host needs the engram hash parameters",
+                    ));
+                }
+                let mut held = Vec::with_capacity(tables.len());
+                for (w, s) in tables {
+                    let (ws, ss) = (w.shape(), s.shape());
+                    if ws.len() != 2 || ws[1] != 256 || ss.len() != 2 || ss[1] != 8 || ws[0] != ss[0]
+                    {
+                        return Err(PyValueError::new_err(
+                            "engram_host needs (weight (rows,256) u8, scale (rows,8) u8) per layer",
+                        ));
+                    }
+                    if !w.is_c_contiguous() || !s.is_c_contiguous() {
+                        return Err(PyValueError::new_err(
+                            "engram_host weight and scale must be C-contiguous",
+                        ));
+                    }
+                    held.push((w.unbind(), s.unbind()));
+                }
+                held
+            }
+        };
         Ok(Self {
             model: ds41::Model {
                 heads,
@@ -193,7 +265,45 @@ impl Ds41Fill {
             },
             shapes: HashMap::new(),
             cs: [cs0.unbind(), cs1.unbind()],
+            engram_host,
         })
+    }
+
+    /// The host Engram dequant LUT (256,256) f32: `LUT[scale, code] = OCP[code] * 2^(scale-127)`.
+    /// A verification surface for the host-gather oracle tests; not used in the step path.
+    #[staticmethod]
+    fn _engram_lut(py: Python<'_>) -> Bound<'_, PyArray2<f32>> {
+        let rows: Vec<Vec<f32>> = ds41::engram_lut().iter().map(|r| r.to_vec()).collect();
+        PyArray2::from_vec2(py, &rows).unwrap()
+    }
+
+    /// Gather + dequantize global row `ids` from host Engram table `layer` (verification surface for
+    /// the oracle gate; the step path uses the same `engram_gather_into` core). Returns `(n, 256)` f32.
+    fn _engram_gather<'py>(
+        &self,
+        py: Python<'py>,
+        layer: usize,
+        ids: PyReadonlyArray1<i64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let (w, s) = self
+            .engram_host
+            .get(layer)
+            .ok_or_else(|| PyValueError::new_err("no such host Engram layer"))?;
+        let wg = w.bind(py).readonly();
+        let sg = s.bind(py).readonly();
+        let weight = wg
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("engram_host weight must be contiguous"))?;
+        let scale = sg
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("engram_host scale must be contiguous"))?;
+        let ids = ids
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("ids must be contiguous"))?;
+        let mut out = vec![0f32; ids.len() * 256];
+        ds41::engram_gather_into(weight, scale, ids, &mut out).map_err(PyValueError::new_err)?;
+        let rows: Vec<Vec<f32>> = out.chunks(256).map(|c| c.to_vec()).collect();
+        Ok(PyArray2::from_vec2(py, &rows).unwrap())
     }
 
     /// Byte offsets of a shape's tables: a dict of the `Tables` fields.
@@ -207,6 +317,10 @@ impl Ds41Fill {
             groups2: item(layout, "groups2")?,
             ix_visb2: item(layout, "ix_visb2")?,
             engram_ids: item(layout, "engram_ids")?,
+            engram_emb: match layout.get_item("engram_emb")? {
+                Some(value) => value.extract()?,
+                None => Vec::new(),
+            },
             cslots: item::<Option<(usize, usize)>>(layout, "cslots")?.map(Into::into),
             cmp_lat: item(layout, "cmp_lat")?,
             draft: item(layout, "draft")?,
@@ -313,6 +427,8 @@ impl Ds41Fill {
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("host must be a contiguous uint8 array"))?;
         let model = &self.model;
+        let host_guards = engram_host_guards(py, &self.engram_host);
+        let host_tables = engram_host_slices(&host_guards)?;
         let counts = py
             .detach(|| {
                 ds41::fill(
@@ -325,6 +441,7 @@ impl Ds41Fill {
                     with_tokens,
                     floor,
                     cs_all,
+                    &host_tables,
                 )
             })
             .map_err(PyValueError::new_err)?;
@@ -389,7 +506,9 @@ impl Ds41Fill {
             .as_slice_mut()
             .map_err(|_| PyValueError::new_err("host must be a contiguous uint8 array"))?;
         let model = &self.model;
-        py.detach(|| ds41::fill_tokens(model, tables, host, &rows, n, tokens))
+        let host_guards = engram_host_guards(py, &self.engram_host);
+        let host_tables = engram_host_slices(&host_guards)?;
+        py.detach(|| ds41::fill_tokens(model, tables, host, &rows, n, tokens, &host_tables))
             .map_err(PyValueError::new_err)
     }
 

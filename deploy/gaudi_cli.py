@@ -122,6 +122,28 @@ def add_gaudi_arguments(parser: argparse.ArgumentParser) -> None:
     gaudi.add_argument(
         "--cxx", help="C++ compiler for native code. Sets CXX. (default: g++)"
     )
+    gaudi.add_argument(
+        "--engram",
+        choices=("card", "host"),
+        default=None,
+        help="DeepSeek-V4.1 only: where the Engram lookup tables live — card (sharded across the "
+        "cards) or host (host RAM, gathered/dequantized per step in the native fill). Host fits the "
+        "tables on 4 cards at 512k context. (default: the preset's)",
+    )
+    gaudi.add_argument(
+        "--engram-gather",
+        choices=("pooled", "mmap", "auto"),
+        default=None,
+        help="DeepSeek-V4.1 only: host Engram gather mode. The native path always mmaps the "
+        "RAM-resident tables; this selects the preset's documented mode. (default: the preset's)",
+    )
+    gaudi.add_argument(
+        "--engram-prewarm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="DeepSeek-V4.1 only: prewarm the host Engram tables resident at startup so the per-step "
+        "gather is a RAM read. (default: the preset's)",
+    )
 
 
 _VARIABLES = {

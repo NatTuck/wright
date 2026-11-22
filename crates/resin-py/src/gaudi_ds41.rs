@@ -27,7 +27,9 @@ use resin_gaudi::sampling::{self, PARAMS, TOP_MAX as TOP};
 use resin_gaudi::{ds41, speculative, step};
 
 use crate::cache::CacheLayout;
-use crate::gaudi::{Ds41Context, Ds41Fill, GaudiGlue, GaudiProgram, item};
+use crate::gaudi::{
+    Ds41Context, Ds41Fill, GaudiGlue, GaudiProgram, engram_host_guards, engram_host_slices, item,
+};
 use crate::gaudi_exec::{
     Images, Pinned, ScoreRequest, Scored, Timings, check_paged_plan, post_accept, prompt_columns,
     score_columns, score_position, score_requests, since,
@@ -262,6 +264,11 @@ pub(crate) struct Ds41Executor {
     model: ds41::Model,
     tables: HashMap<(usize, bool), ds41::Tables>,
     cs: [Py<PyArray2<f32>>; 2],
+    /// host Engram lookup tables (per layer: weight/scale mmap views), empty in card mode
+    engram_host: Vec<(Py<PyArray2<u8>>, Py<PyArray2<u8>>)>,
+    /// host-Engram mode: the gather needs each step's newest token on the host, so a continuation
+    /// must harvest its feeding step's sample first (no device-feedback tokens), and decode is serial
+    engram_host_mode: bool,
     context: Py<Ds41Context>,
     shapes: HashMap<(usize, bool), Shaped>,
     layout: Py<CacheLayout>,
@@ -526,6 +533,8 @@ impl Ds41Executor {
         };
         let rows = rows.view();
         let model = &self.model;
+        let host_guards = engram_host_guards(py, &self.engram_host);
+        let host_tables = engram_host_slices(&host_guards)?;
         let counts = py
             .detach(|| {
                 ds41::fill(
@@ -538,6 +547,7 @@ impl Ds41Executor {
                     with_tokens,
                     floor,
                     cs_all,
+                    &host_tables,
                 )
             })
             .map_err(PyValueError::new_err)?;
@@ -947,8 +957,12 @@ impl Ds41Executor {
             };
             let start = Instant::now();
             let (model, rows) = (&self.model, verify.view());
-            py.detach(|| ds41::fill_tokens(model, tables, host, &rows, b * width, Some(&tokens)))
-                .map_err(|error| post_accept(py, error))?;
+            let host_guards = engram_host_guards(py, &self.engram_host);
+            let host_tables = engram_host_slices(&host_guards)?;
+            py.detach(|| {
+                ds41::fill_tokens(model, tables, host, &rows, b * width, Some(&tokens), &host_tables)
+            })
+            .map_err(|error| post_accept(py, error))?;
             self.timings.fill += since(start);
         }
         self.set_counts(&counts);
@@ -1459,7 +1473,7 @@ impl Ds41Executor {
             }
             None => None,
         };
-        let (fill_model, fill_tables, cs) = fill.parts(py);
+        let (fill_model, fill_tables, cs, engram_host) = fill.parts(py);
         let mut built = HashMap::new();
         for (key, d) in &shapes {
             let program = |name: &str| -> PyResult<Arc<step::Program>> {
@@ -1534,11 +1548,19 @@ impl Ds41Executor {
         let (slab_rows, window_block_rows, history_block_rows, window_per_slab) = geometry;
         let (draft_tokens, dspark_rows) =
             (item(&model, "draft_tokens")?, item(&model, "dspark_rows")?);
+        let engram_host_mode = item::<bool>(&model, "engram_host").unwrap_or(false);
+        if engram_host_mode != !engram_host.is_empty() {
+            return Err(PyValueError::new_err(
+                "the engram_host flag and the host Engram tables must agree",
+            ));
+        }
         Ok(Self {
             glue,
             model: fill_model,
             tables: fill_tables,
             cs,
+            engram_host,
+            engram_host_mode,
             context,
             shapes: built,
             layout,
@@ -2154,9 +2176,42 @@ impl Ds41Executor {
         let mut this = slf.borrow_mut();
         let checked = this.check_cache(p);
         this.gated(py, checked)?;
-        // the tokens before each row's position are known once every step but the one feeding this is recorded
-        this.harvest(py, usize::from(native_feedback.is_some()))?;
+        // the tokens before each row's position are known once every step but the one feeding this is recorded.
+        // host-Engram: the gather needs the newest token on the host, so a continuation harvests its feeding
+        // step's REAL sample first (host decode is serial by design). The plan's one-position-stale bound token
+        // must NEVER reach the host hash or the Engram context — it would poison every later Row.before.
+        let host_continuation = this.engram_host_mode && native_feedback.is_some();
+        let feeding = if host_continuation {
+            this.inflight.last().map(|c| {
+                let b = c.bind(py).borrow();
+                (b.stage, b.sequences.len())
+            })
+        } else {
+            None
+        };
+        this.harvest(
+            py,
+            if host_continuation {
+                0
+            } else {
+                usize::from(native_feedback.is_some())
+            },
+        )?;
         let (positions, tokens) = match &native_feedback {
+            Some(positions) if host_continuation => {
+                let (stage, rows) = feeding.ok_or_else(|| {
+                    PyValueError::new_err("a host-Engram continuation needs a feeding step's sample")
+                })?;
+                // the feeding step's actual samples (its staging event was waited by harvest), not the
+                // plan's stale bound token
+                let sampled: Vec<i64> = this
+                    .staged(stage, rows)
+                    .tokens
+                    .iter()
+                    .map(|&t| i64::from(t))
+                    .collect();
+                (positions.clone(), Some(sampled))
+            }
             Some(positions) => (positions.clone(), None),
             None => (
                 p.context_lengths

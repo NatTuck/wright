@@ -338,6 +338,7 @@ class DeepSeekV41Gaudi:
         layers: int | None = None,
         recipes: RecipeCache | None = None,
         engram: str = "card",
+        engram_prewarm: bool = True,
         gather: bool = True,
         weights: dict[str, int] | None = None,
         barrier: Callable[[], None] | None = None,
@@ -358,6 +359,7 @@ class DeepSeekV41Gaudi:
         self.rank, self.nranks = rank, nranks
         self.n_layers = cfg.num_hidden_layers if layers is None else layers
         self.engram = engram
+        self.engram_prewarm = engram_prewarm
         self.checkpoint = Path(checkpoint)
         self.sl = RankSlices.of(cfg, rank, nranks)
         # DSpark: its stages after the full backbone, drafting blocks of ``block`` tokens
@@ -408,6 +410,8 @@ class DeepSeekV41Gaudi:
         self.w = weights if weights is not None else self._load(barrier)
         log(f"ds41 rank {rank}/{nranks}: weights in {time.time() - t0:.0f} s")
         self.eg_vocab = 0
+        self.eg_host = {}  # host-Engram: layer -> (weight (rows,256) u8, scale (rows,8) u8) mmap views
+        self._eg_host_maps = []  # holds the mappings + views alive for the model's lifetime
         if self.engram_layers and engram == "card":
             self._hash_tables()
             for layer in (
@@ -418,6 +422,8 @@ class DeepSeekV41Gaudi:
                     rows = self.eg_rows_r
                     self.w[f"{key}_r"] = self.w[key] + rank * rows * 6144
                     self.w[f"{key}_r.s"] = self.w[f"{key}.s"] + 4 * rank * rows
+        if self.engram_layers and engram == "host":
+            self._load_host_tables()
         self._buffers()
         self.capacity: int | None = None
         if not defer_cache:
@@ -675,6 +681,90 @@ class DeepSeekV41Gaudi:
         for first, data, rs in engram_table(self.src, layer, rows):
             dev.h2d(table + 256 * first, data)
             dev.h2d(scales + 4 * first, rs)
+
+    # ------------------------------------------------------------------ host-Engram tables
+    def _load_host_tables(self) -> None:
+        """Host-Engram: hold the lookup tables in host RAM as a file-backed MAP_SHARED mmap of the
+        checkpoint shards (one physical copy shared by the ranks through the page cache), in FILE
+        format (256 OCP E4M3 codes + 8 E8M0 scale bytes per row). Prewarm them resident, check
+        residency with mincore and log it (report if low — never silently fall back), reject e8m0
+        0xFF scales at load, and keep numpy views of each layer's weight (rows,256) u8 and scale
+        (rows,8) u8. The Rust fill gathers and dequantizes these per step; nothing is uploaded here."""
+        import ctypes
+        import json
+        import mmap
+        import os
+        import struct
+
+        from resin_models_gaudi.deepseek_v41.weights import (
+            _reject_nan_engram_scales,
+            reader,
+        )
+
+        src = reader(self.checkpoint)
+        shards = {
+            layer: src.weight_map[f"layers.{layer}.engram.embed.weight"]
+            for layer in self.engram_layers
+        }
+        # prewarm each distinct shard once (a sequential read pulls it into the page cache)
+        if self.engram_prewarm:
+            for shard in sorted(set(shards.values())):
+                self._prewarm_shard(self.checkpoint / shard)
+        page = os.sysconf("SC_PAGE_SIZE")
+        libc = ctypes.CDLL(None, use_errno=True)
+        for layer, shard in shards.items():
+            path = self.checkpoint / shard
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                header_bytes = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+                header = json.loads(os.pread(fd, header_bytes, 8))
+                base = 8 + header_bytes
+                name = f"layers.{layer}.engram.embed"
+                # Python's mmap defaults to MAP_SHARED: the ranks share one physical copy
+                mapping = mmap.mmap(fd, path.stat().st_size, prot=mmap.PROT_READ)
+            finally:
+                os.close(fd)
+            raw = np.frombuffer(mapping, np.uint8)
+            woff = base + header[f"{name}.weight"]["data_offsets"][0]
+            soff = base + header[f"{name}.scale"]["data_offsets"][0]
+            rows = header[f"{name}.weight"]["shape"][0]
+            weight = raw[woff : woff + rows * 256].reshape(rows, 256)
+            scale = raw[soff : soff + rows * 8].reshape(rows, 8)
+            _reject_nan_engram_scales(scale)
+            # mincore over the whole mapping (raw starts at the page-aligned mmap base)
+            pages = (raw.nbytes + page - 1) // page
+            vec = (ctypes.c_ubyte * pages)()
+            if libc.mincore(ctypes.c_void_p(raw.ctypes.data), ctypes.c_size_t(raw.nbytes), vec) != 0:
+                raise OSError(ctypes.get_errno(), f"mincore {shard}")
+            resident = sum(1 for v in vec if v & 1) / pages
+            self.log(
+                f"ds41 host-Engram layer {layer}: {rows} rows from {shard}, {resident:.1%} resident"
+            )
+            if resident < 0.95:
+                self.log(
+                    f"WARNING: host-Engram layer {layer} ({shard}) is only {resident:.1%} resident "
+                    "after prewarm; the per-step gather will fault pages (no fallback is taken)"
+                )
+            self.eg_host[layer] = (weight, scale)
+            # hold the mapping and its views alive for the model's lifetime (the views export buffers)
+            self._eg_host_maps.append((mapping, raw, weight, scale))
+
+    @staticmethod
+    def _prewarm_shard(path) -> None:
+        """Read a shard once, sequentially, into the page cache so the mmap gather is RAM-resident."""
+        import os
+
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            view = memoryview(bytearray(1 << 30))
+            offset, size = 0, path.stat().st_size
+            while offset < size:
+                read = os.preadv(fd, [view], offset)
+                if read <= 0:
+                    break
+                offset += read
+        finally:
+            os.close(fd)
 
     # ------------------------------------------------------------------ buffers and graphs
     def _buffers(self) -> None:
@@ -1408,8 +1498,19 @@ class DeepSeekV41Gaudi:
                 "DeepSeek-V4.1 steps run in the native executor: resin must be built with the gaudi feature"
             ) from error
         cfg, geo = self.cfg, self.geo
+        # host-Engram: the fill gathers + dequantizes the rows from the shared mmap tables in Rust.
+        # One (weight, scale) pair per Engram layer index e (a dummy empty pair for a layer this rank
+        # does not run, which no shape's engram_emb descriptor references).
+        engram_host = None
         if self.engram == "host" and self.engram_layers:
-            raise ValueError("the native fill hashes the Engram rows on the cards (engram='card')")
+            engram_host = []
+            for layer in cfg.engram_layer_ids:
+                if layer in self.eg_host:
+                    engram_host.append(self.eg_host[layer])
+                else:
+                    engram_host.append(
+                        (np.zeros((0, 256), np.uint8), np.zeros((0, 8), np.uint8))
+                    )
         engram = None
         if self.engram_layers:
             h = self._engram_hash()
@@ -1447,6 +1548,7 @@ class DeepSeekV41Gaudi:
             prefilter=(PREFILTER_BLOCKS, PREFILTER_MIN),
             dense_keys=DENSE_KEYS,
             geometry=(PAGE_TOKENS, HISTORY_TOKENS, PAGE_ROWS, INDEX_ROWS, INDEX_KEYS, PENDING_SLOTS),
+            engram_host=engram_host,
         )
         for s, tb in self.tables.items():
             off = tb.off
@@ -1470,7 +1572,13 @@ class DeepSeekV41Gaudi:
                         (off[f"eg.{layer}"], cfg.engram_layer_ids.index(layer))
                         for layer in self.engram_layers
                     ]
-                    if not self.hashed(s)
+                    if self.engram == "card" and not self.hashed(s)
+                    else [],
+                    "engram_emb": [
+                        (off[f"eg.{layer}"], cfg.engram_layer_ids.index(layer))
+                        for layer in self.engram_layers
+                    ]
+                    if self.engram == "host"
                     else [],
                     "ix_slots": s.ix_slots,
                     "nbytes": tb.nbytes,

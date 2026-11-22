@@ -43,6 +43,77 @@ pub struct Engram {
     pub offsets: Vec<i64>,
 }
 
+/// One Engram layer's host-resident lookup table, in checkpoint format: `weight` is `rows x 256`
+/// E4M3 codes and `scale` is `rows x 8` E8M0 bytes (one scale per 32 codes). Borrowed from the mmap
+/// numpy views the fill holds for the step; never owned by the (cloned) `Model`, which would copy
+/// the 188.8 GiB table. An empty slice means card mode (the device gathers from its own shard).
+#[derive(Clone, Copy)]
+pub struct HostTable<'a> {
+    pub weight: &'a [u8],
+    pub scale: &'a [u8],
+}
+
+/// The OCP E4M3 (bias 7) value of a code, as f64, exactly as the host oracle (`weights.py:OCP`):
+/// `0x7F` / `0xFF` read as 0; the magnitudes reach 448 on the host (the device's 240 saturation is a
+/// separate contract — the gather reproduces the host oracle, not the device decode).
+fn ocp_e4m3(code: u8) -> f64 {
+    let e = i32::from((code >> 3) & 15);
+    let m = f64::from(code & 7);
+    let mut mag = if e > 0 {
+        (8.0 + m) * 2f64.powi(e - 10)
+    } else {
+        m * 2f64.powi(-9)
+    };
+    if (code & 0x7F) == 0x7F {
+        mag = 0.0;
+    }
+    if code & 0x80 != 0 { -mag } else { mag }
+}
+
+/// `2^(s - 127)` formed in f32, exactly as the host oracle forms it
+/// (`np.exp2(np.arange(256, f32) - 127)`): exact powers of two, the subnormal `2^-127` at s=0, and
+/// overflow to inf at s=255. One documented deviation: numpy's f32 `exp2` ufunc rounds `2^127`
+/// (s=254) UP by one ulp to `0x7F000001` (libc `exp2f` and the exact power give `0x7F000000`); the
+/// oracle uses `np.exp2`, so the LUT reproduces that to be bit-identical at all 65536 pairs. Scale
+/// 254 never occurs in a valid checkpoint (its ~2^127 block magnitude is rejected at load).
+fn engram_scale_f32(s: usize) -> f32 {
+    let e = s as i32 - 127;
+    if e == 128 {
+        f32::INFINITY
+    } else if e == 127 {
+        f32::from_bits(0x7F00_0001) // numpy exp2(f32(127)) = 2^127 + 1 ulp
+    } else if e == -127 {
+        f32::from_bits(0x0040_0000) // 2^-127, the smallest normal's half (subnormal)
+    } else {
+        f32::from_bits(((e + 127) as u32) << 23)
+    }
+}
+
+fn build_engram_lut() -> [[f32; 256]; 256] {
+    let mut ocp = [0f64; 256];
+    for (c, value) in ocp.iter_mut().enumerate() {
+        *value = ocp_e4m3(c as u8);
+    }
+    let mut lut = [[0f32; 256]; 256];
+    for (s, row) in lut.iter_mut().enumerate() {
+        // OCP (f64) times the f32 exponent promoted to f64, rounded once to f32 — the oracle's
+        // `(OCP[None, :] * exp2_f32[:, None]).astype(f32)`.
+        let scale = f64::from(engram_scale_f32(s));
+        for (c, value) in row.iter_mut().enumerate() {
+            *value = (ocp[c] * scale) as f32;
+        }
+    }
+    lut
+}
+
+/// `LUT[scale][code] = OCP_E4M3[code] * 2^(scale - 127)` (f32), built once. Bit-identical to the host
+/// gather oracle at all 65536 (scale, code) pairs; f32 output scope (scale 255 overflows to inf/NaN,
+/// which a valid checkpoint never carries — E8M0 255 is NaN, rejected at load).
+pub fn engram_lut() -> &'static [[f32; 256]; 256] {
+    static LUT: std::sync::OnceLock<[[f32; 256]; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(build_engram_lut)
+}
+
 /// What every step's tables depend on besides the step itself.
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -118,6 +189,10 @@ pub struct Tables {
     pub engram: Vec<(usize, usize, usize)>,
     /// per Engram layer of a step whose hash ids come from the host: (ids table, its Engram index)
     pub engram_ids: Vec<(usize, usize)>,
+    /// per Engram layer of a step that gathers on the host: (f32 embedding table, its Engram index).
+    /// The host reads the row from its mmap table, dequantizes it, and writes `eg_emb[256*j+i, c]`
+    /// here; the device's `engram_graph` reads the embedding directly (no gather/hash kernel).
+    pub engram_emb: Vec<(usize, usize)>,
     /// a prefill shape with the dense compressed attention: per ratio its slots, and per owner its latent pages
     pub cslots: Option<[usize; 2]>,
     pub cmp_lat: Vec<usize>,
@@ -248,6 +323,7 @@ pub fn fill(
     with_tokens: bool,
     floor: Option<i64>,
     cs_all: [&[f32]; 2],
+    host_tables: &[HostTable],
 ) -> Result<Counts, String> {
     rows.validate()?;
     let t = tables.t;
@@ -712,7 +788,7 @@ pub fn fill(
     }
 
     if with_tokens {
-        fill_tokens(model, tables, host, rows, n, tokens)?;
+        fill_tokens(model, tables, host, rows, n, tokens, host_tables)?;
     }
     Ok(counts)
 }
@@ -726,6 +802,7 @@ pub fn fill_tokens(
     rows: &Rows<'_>,
     n: usize,
     tokens: Option<&[i64]>,
+    host_tables: &[HostTable],
 ) -> Result<(), String> {
     rows.validate()?;
     let t = tables.t;
@@ -800,6 +877,79 @@ pub fn fill_tokens(
                         c * width + j,
                         ids[(c * engram.layers + e) * width + j],
                     );
+                }
+            }
+        }
+    }
+    if let Some(engram) = &model.engram
+        && !tables.engram_emb.is_empty()
+    {
+        let tokens = tokens.ok_or("a step that gathers Engram on the host needs its tokens")?;
+        let ids = engram_ids(engram, rows, tokens, t)?;
+        engram_gather_host(engram, tables, &mut w, &ids, host_tables, t)?;
+    }
+    Ok(())
+}
+
+/// The shared host-gather core: dequantize `ids.len()` global rows of one host Engram table into
+/// `out` (row-major `(n, 256)` f32): `out[r*256+i] = LUT[scale[row][i/32]][weight[row][i]]`. Both the
+/// step fill (`engram_gather_host`) and the oracle gate call this, so they dequantize identically.
+pub fn engram_gather_into(
+    weight: &[u8],
+    scale: &[u8],
+    ids: &[i64],
+    out: &mut [f32],
+) -> Result<(), String> {
+    let rows = weight.len() / 256;
+    if weight.len() % 256 != 0 || scale.len() != rows * 8 {
+        return Err("host Engram table is not (rows, 256) codes + (rows, 8) scales".into());
+    }
+    if out.len() != ids.len() * 256 {
+        return Err("the gather output is not ids.len() x 256".into());
+    }
+    let lut = engram_lut();
+    for (r, &id) in ids.iter().enumerate() {
+        let row = usize::try_from(id)
+            .ok()
+            .filter(|&x| x < rows)
+            .ok_or_else(|| format!("Engram row {id} is outside the host table"))?;
+        let codes = &weight[row * 256..row * 256 + 256];
+        let scales = &scale[row * 8..row * 8 + 8];
+        for i in 0..256 {
+            out[r * 256 + i] = lut[usize::from(scales[i / 32])][usize::from(codes[i])];
+        }
+    }
+    Ok(())
+}
+
+/// The host Engram gather: for each `(offset, e)` embedding table, every column `c` and lane `j`,
+/// read global row `ids[(c*layers+e)*width+j]` from the layer's mmap table, dequantize its 256 codes
+/// with the LUT (one E8M0 scale per 32 codes), and write `eg_emb[256*j+i, c]` — the f32 layout the
+/// device's `engram_graph` reads. Runs inside the fill under `py.detach` (no GIL, no per-step Python).
+fn engram_gather_host(
+    engram: &Engram,
+    tables: &Tables,
+    w: &mut Words<'_>,
+    ids: &[i64],
+    host_tables: &[HostTable],
+    t: usize,
+) -> Result<(), String> {
+    let width = (engram.n - 1) * engram.heads;
+    let mut col_ids = vec![0i64; width];
+    let mut scratch = vec![0f32; width * 256];
+    for &(offset, e) in &tables.engram_emb {
+        let ht = host_tables
+            .get(e)
+            .ok_or_else(|| format!("no host Engram table for layer index {e}"))?;
+        for c in 0..t {
+            for j in 0..width {
+                col_ids[j] = ids[(c * engram.layers + e) * width + j];
+            }
+            engram_gather_into(ht.weight, ht.scale, &col_ids, &mut scratch)?;
+            let base = c * (256 * width);
+            for j in 0..width {
+                for i in 0..256 {
+                    w.set_f32(offset, base + j * 256 + i, scratch[j * 256 + i]);
                 }
             }
         }
@@ -1127,6 +1277,7 @@ mod tests {
             true,
             None,
             [&cs, &cs],
+            &[],
         );
         assert!(error.is_err());
     }
@@ -1173,5 +1324,173 @@ mod tests {
         );
         assert!(!replays(false, 256, 2044, false), "no cut");
         assert!(!replays(true, 0, 2044, false), "no replay span");
+    }
+
+    /// An independent transcription of the OCP E4M3 (bias 7) decode, for the LUT oracle (not the
+    /// production helper): sign first, 0x7F/0xFF read as 0, subnormal exponent 0, magnitude to 448.
+    fn ref_ocp(code: u8) -> f64 {
+        let sign = if code & 0x80 != 0 { -1.0 } else { 1.0 };
+        let exp = i32::from((code >> 3) & 0xF);
+        let mant = f64::from(code & 0x7);
+        let mag = if (code & 0x7F) == 0x7F {
+            0.0
+        } else if exp == 0 {
+            mant * 2f64.powi(-9)
+        } else {
+            (8.0 + mant) * 2f64.powi(exp - 10)
+        };
+        // sign * mag (not an early return): numpy zeros 0x7F/0xFF then negates, so OCP[0xFF] = -0.0
+        sign * mag
+    }
+
+    /// The oracle the LUT must match: `OCP[code] * 2^(scale-127)`, the exponent formed in f32 (as
+    /// `np.exp2(np.arange(256, f32) - 127)`), the product in f64, rounded once to f32.
+    fn ref_lut(scale: usize, code: u8) -> f32 {
+        let e = scale as i32 - 127;
+        // numpy's f32 exp2 ufunc rounds 2^127 up by 1 ulp (the oracle's np.exp2(f32)); match it
+        let exp = if e == 127 {
+            f32::from_bits(0x7F00_0001)
+        } else {
+            2f32.powi(e)
+        };
+        (ref_ocp(code) * f64::from(exp)) as f32
+    }
+
+    #[test]
+    fn engram_lut_matches_ocp_times_pow2_at_every_pair() {
+        let lut = engram_lut();
+        for s in 0..256 {
+            for c in 0..256u16 {
+                let got = lut[s][c as usize];
+                let want = ref_lut(s, c as u8);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "LUT[{s}][{c:#04x}] = {got} ({:#010x}), oracle {want} ({:#010x})",
+                    got.to_bits(),
+                    want.to_bits()
+                );
+            }
+        }
+        // the f32 output scope: scale 255 overflows (inf, or NaN where OCP is 0), never a finite repair
+        assert!(lut[255][1].is_infinite());
+        assert!(lut[255][0x7F].is_nan());
+        assert!(lut[254][0x7E].is_infinite()); // OCP[0x7E]=448, 448*2^127 overflows f32
+    }
+
+    /// A small synthetic host table and a naive reference gather, to check the production gather on
+    /// the required case class: same shape, DIFFERENT data (different ids AND different table bytes).
+    fn synthetic_table(rows: usize, seed: u8) -> (Vec<u8>, Vec<u8>) {
+        let mut weight = vec![0u8; rows * 256];
+        let mut scale = vec![0u8; rows * 8];
+        for (i, b) in weight.iter_mut().enumerate() {
+            *b = ((i as u32 * 31 + u32::from(seed) * 17 + 7) % 256) as u8;
+        }
+        for (i, b) in scale.iter_mut().enumerate() {
+            // keep scales in a real range (no 254/255), varied per row/block
+            *b = (100 + ((i as u32 * 13 + u32::from(seed) * 5) % 40)) as u8;
+        }
+        (weight, scale)
+    }
+
+    fn ref_gather(
+        weight: &[u8],
+        scale: &[u8],
+        ids: &[i64],
+        t: usize,
+        layers: usize,
+        width: usize,
+        e: usize,
+    ) -> Vec<u32> {
+        let mut out = vec![0u32; t * 256 * width];
+        for c in 0..t {
+            for j in 0..width {
+                let row = ids[(c * layers + e) * width + j] as usize;
+                for i in 0..256 {
+                    let code = weight[row * 256 + i];
+                    let s = scale[row * 8 + i / 32];
+                    let val = ref_lut(usize::from(s), code);
+                    out[c * 256 * width + j * 256 + i] = val.to_bits();
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn engram_gather_same_shape_different_data() {
+        let (n, heads, layers) = (4usize, 8usize, 1usize);
+        let width = (n - 1) * heads; // 24
+        let engram = Engram {
+            token_map: vec![],
+            pad_id: 0,
+            multipliers: vec![],
+            n,
+            heads,
+            layers,
+            primes: vec![],
+            offsets: vec![],
+        };
+        let rows = 64usize;
+        for seed in [0u8, 9, 200] {
+            let (weight, scale) = synthetic_table(rows, seed);
+            let ht = HostTable {
+                weight: &weight,
+                scale: &scale,
+            };
+            for t in [1usize, 3, 8] {
+                // three different id sets of the same shape (the required case class)
+                for variant in 0..3 {
+                    let ids: Vec<i64> = (0..t * layers * width)
+                        .map(|k| ((k as u64 * 7 + variant * 11 + u64::from(seed)) % rows as u64) as i64)
+                        .collect();
+                    let nbytes = t * 256 * width * 4;
+                    let mut buf = vec![0u8; nbytes];
+                    let tables = Tables {
+                        t,
+                        engram_emb: vec![(0, 0)],
+                        nbytes,
+                        ..Tables::default()
+                    };
+                    {
+                        let mut w = words(&mut buf, nbytes).unwrap();
+                        engram_gather_host(&engram, &tables, &mut w, &ids, &[ht], t).unwrap();
+                    }
+                    let got: Vec<u32> = buf
+                        .chunks_exact(4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    let want = ref_gather(&weight, &scale, &ids, t, layers, width, 0);
+                    assert_eq!(got, want, "seed {seed}, t {t}, variant {variant}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn engram_gather_rejects_an_out_of_range_row() {
+        let engram = Engram {
+            token_map: vec![],
+            pad_id: 0,
+            multipliers: vec![],
+            n: 4,
+            heads: 8,
+            layers: 1,
+            primes: vec![],
+            offsets: vec![],
+        };
+        let (weight, scale) = synthetic_table(8, 0);
+        let ht = HostTable { weight: &weight, scale: &scale };
+        let width = 24;
+        let nbytes = 256 * width * 4;
+        let mut buf = vec![0u8; nbytes];
+        let tables = Tables { t: 1, engram_emb: vec![(0, 0)], nbytes, ..Tables::default() };
+        let mut ids = vec![0i64; width];
+        ids[5] = 8; // one past the last row
+        let mut w = words(&mut buf, nbytes).unwrap();
+        assert!(engram_gather_host(&engram, &tables, &mut w, &ids, &[ht], 1).is_err());
+        // a missing host table for the layer index is an error too
+        let mut w = words(&mut buf, nbytes).unwrap();
+        assert!(engram_gather_host(&engram, &tables, &mut w, &vec![0i64; width], &[], 1).is_err());
     }
 }

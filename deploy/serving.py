@@ -41,6 +41,7 @@ from deploy.models import (
     create_recipe,
     create_runner,
     default_draft_tokens,
+    engram_table_bytes,
     gaudi_defers_cache,
     gaudi_supports_ranks,
     get_model,
@@ -428,6 +429,14 @@ def _validate(parser, args, spec) -> None:
             assistant=args.assistant_checkpoint,
         )
         resolve_cache_types(spec, args)
+        if (
+            getattr(args, "engram", None) is not None
+            or getattr(args, "engram_gather", None) is not None
+            or getattr(args, "engram_prewarm", None) is not None
+        ) and spec.family != "deepseek_v41":
+            raise ValueError(
+                "--engram/--engram-gather/--engram-prewarm are DeepSeek-V4.1 only"
+            )
     except ValueError as error:
         parser.error(str(error))
     if (
@@ -796,9 +805,11 @@ def _one_card_model(
         logger.error(f"{spec.name}: {error}")
         raise SystemExit(1) from None
     ranks = 1 if native_ranks is None else native_ranks.size
-    estimate_kv_pool(
-        current_device_free(), checkpoint_weight_bytes(spec, checkpoint), ranks
-    )
+    engram = getattr(args, "engram", None) or spec.engram
+    weight_bytes = checkpoint_weight_bytes(spec, checkpoint)
+    if engram == "host":  # the Engram tables stay in host RAM, not on the cards
+        weight_bytes -= engram_table_bytes(spec, checkpoint)
+    estimate_kv_pool(current_device_free(), weight_bytes, ranks)
     _remember_load(
         spec,
         checkpoint,
@@ -822,6 +833,9 @@ def _one_card_model(
         defer_cache=defer_cache,
         native_ranks=native_ranks,
         cache_types=resolve_cache_types(spec, args),
+        engram=getattr(args, "engram", None),
+        engram_gather=getattr(args, "engram_gather", None),
+        engram_prewarm=getattr(args, "engram_prewarm", None),
     )
     loaded = SimpleNamespace(
         runner=runner, recipe=None, checkpoint=checkpoint, engine=None
@@ -1153,7 +1167,21 @@ def serve_gaudi_ranks(parser, args, spec, replicated: list[dict] | None = None) 
         num_layers=args.num_layers,
         numa=args.numa,
         checkpoint=str(checkpoint),
-        weight_bytes=checkpoint_weight_bytes(spec, checkpoint),
+        weight_bytes=(
+            checkpoint_weight_bytes(spec, checkpoint)
+            - (
+                engram_table_bytes(spec, checkpoint)
+                if (getattr(args, "engram", None) or spec.engram) == "host"
+                else 0
+            )
+        ),
+        engram=getattr(args, "engram", None) or spec.engram,
+        engram_gather=getattr(args, "engram_gather", None) or spec.engram_gather,
+        engram_prewarm=(
+            spec.engram_prewarm
+            if getattr(args, "engram_prewarm", None) is None
+            else args.engram_prewarm
+        ),
         tokenizer=None if args.tokenizer is None else str(args.tokenizer),
         alias=args.alias,
         assistant=(
@@ -1770,6 +1798,9 @@ def _serve_claimed_rank(rank: int, options: dict, claim, replica=None) -> None:
         num_layers=options["num_layers"],
         defer_cache=shared_kv,
         cache_types=tuple(options["cache_types"]),
+        engram=options.get("engram"),
+        engram_gather=options.get("engram_gather"),
+        engram_prewarm=options.get("engram_prewarm"),
     )
     engine = None
     try:
