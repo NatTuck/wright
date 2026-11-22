@@ -1123,7 +1123,8 @@ def index_select_graph(
         masked = lg.tensor((K, T), F32)
         lg.node(
             "rg_ix_cmask_f32",
-            [score, vis, lg.input("cand_bmax", (KB, T), F32), lg.input("cand_thr", (64, T), I32)],
+            [score, vis, lg.input("cand_bmax", (KB, T), F32), lg.input("cand_thr", (64, T), I32),
+             lg.input("ix_gbase", (1,), I32)],
             [masked],
         )  # fmt: skip
         score = masked

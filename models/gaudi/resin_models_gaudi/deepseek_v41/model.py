@@ -100,7 +100,12 @@ _R_COLUMN = 7  # the column whose logits a one-column head gathers
 _R_DENSE = {1: 8, 2: 9}
 _R_PF = {1: 10, 2: 11}
 _REGISTERS = 12
-WORKSPACE_RESERVE = 5 << 30
+# Bytes kept out of the arena for the step tables and the recipes' workspaces. A recipe compiles with its own
+# workspace on the card and keeps it: after the 281 graphs of this model compile, 6.3 GiB of a card's free memory
+# is gone (measured: 20.2 GiB free at attach, 13.9 GiB left after the compile), and it stays gone for the process.
+# So the reserve has to cover that 6.3 GiB as well as the step's own scratch; at 5 GiB a cold recipe cache sizes
+# the arena into memory the compile is holding and the arena allocation fails. 7 GiB leaves ~1.3 GiB of slack.
+WORKSPACE_RESERVE = 7 << 30
 # the sampler's outputs for up to MAX_T columns: tokens, logprobs, top ids, top logprobs (256-byte aligned)
 _SAMPLED = {
     "tok_out": 0,
@@ -284,10 +289,15 @@ class _Tables:
         self.layers = layers
         self.v: list[dict[str, np.ndarray]] = []
         # byte ranges _fill zeroes: all but the tables it writes whole
+        # tables written whole, so the fill does not zero them: the compressed-page tables, and the index
+        # chain's per-group records and group bases (ds_ix_gslot writes every group of both on the device)
         whole = sorted(
             (self.off[n], self.off[n] + 4 * int(np.prod(self.spec[n][1])))
-            for n in ("cmp_blocks1", "cmp_blocks2")
-        )
+            for n in (
+                "cmp_blocks1", "cmp_blocks2",
+                "ix1.rec", "ix2.rec", "ix1.gb", "ix2.gb",
+            )
+        )  # fmt: skip
         self.zero, a = [], 0
         for lo, hi in whole:
             self.zero.append((a, lo))
@@ -468,22 +478,19 @@ class DeepSeekV41Gaudi:
         if slab_rows is not None:
             self.geo = self.geo.with_slab_rows(slab_rows)
         device, log = self.device, self.log
+        free = device.memory_info()[0]
         if callable(capacity):
-            capacity = capacity(device.memory_info()[0] - self.workspace_reserve)
+            capacity = capacity(free - self.workspace_reserve)
         self.capacity = capacity
         self.arena_blocks = self.geo.arena_blocks(capacity)
-        if arena is None:
-            self.arena = self._malloc(self.arena_blocks * 1024 * 512)
-            device.memset32(self.arena, 0, self.arena_blocks * 1024 * 128)
-        else:
-            self.arena = arena
+        # the pending state's size and rows are graph shapes too; only its memory is allocated below
         state = self.geo.state_bytes(capacity)
-        self.state = self._malloc(state)
-        device.memset32(self.state, 0, state // 4)
         self.state_rows = state // (4 * STATE_FLOATS)
-        log(
-            f"ds41: cache {capacity} slabs, {self.arena_blocks / 1024 * 0.5:.1f} GiB per card"
-        )
+        # The arena's block count is a graph shape, so the capacity is fixed here -- but the arena itself is
+        # allocated *after* the recipes compile. A recipe compiles with its own workspace on the card (the
+        # largest is 6.6 GiB), and with the arena already resident a cold recipe cache has nowhere to put it:
+        # ``synDeviceMalloc ... status=26``. Compiling first gives every compile the card's free memory, and
+        # the arena is then sized from what is actually left.
         self.tables = {s: _Tables(s, self) for s in self.shapes}
         size = max(t.nbytes for t in self.tables.values())
         self.table = self._malloc(size)
@@ -506,6 +513,26 @@ class DeepSeekV41Gaudi:
         # device event slots: the sampler's staging copies, and the pinned tables' uploads
         self._stage_event, self._host_event = device.event_slots(2), device.event_slots(2)
         self._compile()
+        # the arena and its pending state, from the memory the compiles left
+        arena_bytes = self.arena_blocks * 1024 * 512
+        left = device.memory_info()[0]
+        if arena is None and left < arena_bytes + state:
+            raise RuntimeError(
+                f"ds41: the cache arena of {capacity} slabs needs {arena_bytes / 2**30:.1f} GiB and its "
+                f"state {state / 2**30:.1f} GiB, but {left / 2**30:.1f} GiB is left after the recipes "
+                f"compiled ({free / 2**30:.1f} GiB free at attach): lower the cache or warm the recipe cache"
+            )
+        if arena is None:
+            self.arena = self._malloc(arena_bytes)
+            device.memset32(self.arena, 0, self.arena_blocks * 1024 * 128)
+        else:
+            self.arena = arena
+        self.state = self._malloc(state)
+        device.memset32(self.state, 0, state // 4)
+        log(
+            f"ds41: cache {capacity} slabs, {self.arena_blocks / 1024 * 0.5:.1f} GiB per card "
+            f"({free / 2**30:.1f} GiB free at attach, {left / 2**30:.1f} GiB after the recipes compiled)"
+        )
 
     def _replay_cut(self) -> int:
         """The first ratio-1 layer, when every later layer reads its compressed KV and index keys: the layers
@@ -751,6 +778,9 @@ class DeepSeekV41Gaudi:
                             "ix_slots": t(f"ixc.{j}"),
                             "ix_score": self.io["ix_score_sparse"],
                             "ix_cpos": self.io["ix_cpos"],
+                            # the candidate-entry gather reads the step's page table and the owner's offset
+                            # (tail carries cmp_blocks already; cmp_loff is the sparse launch's own)
+                            "cmp_loff": self.loff[owner],
                         },
                     )
                     for j in range(self.ixc_launches(s))

@@ -135,8 +135,9 @@ def test_native_fill_matches_numpy(far):
             for with_tokens in (True, False):
                 # the device's tokens (None) only for rows of one column
                 for given in (tokens, None) if single else (tokens,):
+                    noise = rng.integers(0, 256, m.host[0].size, dtype=np.uint8)
                     for h in m.host:
-                        h[:] = rng.integers(0, 256, h.size, dtype=np.uint8)
+                        h[:] = noise
                     want = m._fill_positions(0, tb, positions, rows)
                     if with_tokens:
                         m._fill_tokens(0, tb, given, len(positions), rows)
@@ -213,8 +214,9 @@ def test_native_prefill_fill_matches_numpy(span):
             positions = pos0 + np.arange(n)
             tokens = rng.integers(0, m.cfg.vocab_size, n)
             floor = int(rng.integers(max(0, pos0 - 300), pos0 + 1)) if case % 2 else None
+            noise = rng.integers(0, 256, m.host[0].size, dtype=np.uint8)
             for h in m.host:
-                h[:] = rng.integers(0, 256, h.size, dtype=np.uint8)
+                h[:] = noise
             want = m._fill_positions(0, tb, positions, [row])
             m._fill_tokens(0, tb, tokens, n, [row])
             if floor is not None:
@@ -243,8 +245,9 @@ def test_native_tokens_of_a_prepared_step_match_numpy():
         tb = m.tables[Shape(t, False)]
         for case in range(6):
             rows, positions, tokens = plan(m, t, rng, far=bool(case % 2))
+            noise = rng.integers(0, 256, m.host[0].size, dtype=np.uint8)
             for h in m.host:
-                h[:] = rng.integers(0, 256, h.size, dtype=np.uint8)
+                h[:] = noise
             m._fill_positions(0, tb, positions, rows)
             m.host[1][:] = m.host[0]
             m._fill_tokens(0, tb, tokens, len(positions), rows)
@@ -266,8 +269,9 @@ def test_native_draft_fill_matches_numpy():
         for case in range(8):
             rows = [prefill_row(m, rng, 1, int(rng.integers(0, 30_000) if case else 0)) for _ in range(B)]
             anchors = rng.integers(0, m.cfg.vocab_size, B)
+            noise = rng.integers(0, 256, m.host[0].size, dtype=np.uint8)
             for h in m.host:
-                h[:] = rng.integers(0, 256, h.size, dtype=np.uint8)
+                h[:] = noise
             m._fill_draft(0, tb, anchors, rows)
             from resin_models_gaudi.deepseek_v41.model import _native_rows
 
