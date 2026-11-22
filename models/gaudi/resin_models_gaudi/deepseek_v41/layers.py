@@ -996,12 +996,14 @@ def index_score_graph(
     cand_top: int = 0,
     pages: int = 0,
     parts: int = 1,
+    cpages: int = 0,
 ) -> Graph:
     """An index source's scores: each slot is a query block's index queries against a chunk of ``keys`` index keys
-    (``ix_pages`` (keys / 128, S): first rows of the index pages; ``ix_slots`` (8, S) with the compress ratio in
-    field 6) -> ``ix_score`` (scores, T), written in place; ``ix_sink`` is its sink. With ``cand_top``, a slot's
-    keys are those of 256 of the column's ``cand_top`` candidate blocks (``cand_list``, ``cand_slots``; the
-    column's ``cmp_blocks`` (pages, T) and ``cmp_loff``), and their positions go to ``ix_cpos`` (scores, T)."""
+    (``ix_slots`` (8, S), the compress ratio in field 6, the tile's first index page in field 7) -> ``ix_score``
+    (scores, T), written in place; ``ix_sink`` is its sink. The slot's page rows come from the step's own
+    compressed-page table (``cmp_blocks`` (cpages, T)) plus its owner's latent offset (``cmp_loff``), so no
+    per-slot page table exists. With ``cand_top``, a slot's keys are those of 256 of the column's ``cand_top``
+    candidate blocks (``cand_list``, ``cand_slots``), and their positions go to ``ix_cpos`` (scores, T)."""
     d, T, S, C = dims, tokens, slots, keys
     qb = query_block or T
     # prefill slots: each member reads its tokens' head weights once for 1024 keys, and the slots run in parts
@@ -1046,11 +1048,13 @@ def index_score_graph(
                 "rg_ds_ix_gather_f32",
                 [
                     lg.arena(blocks),
-                    lg.input("ix_pages" + sfx[p], (C // PAGE, Sp), I32),
+                    lg.input("cmp_blocks", (cpages, T), I32),
                     table,
                     lg.dep(),
+                    lg.input("cmp_loff", (64,), I32),
                 ],
                 [ks2, sk],
+                struct.pack("i", PAGE_ROWS),
             )
         inputs.append((table, qs, sq, lg.view(ks2, (INDEX_DIM, C, Sp)), sk))
     scs = []
@@ -1216,8 +1220,10 @@ def index_merge_graph(
     lg = LayerGraph(device, f"ix_merge_T{T}_R{run}_{rows}", d, T)
     K = run + rows
     score = lg.input("ix_merge", (K, T), F32)
-    vis, exact = lg.input("ix_gvis", (T,), I32), lg.input("ix_gcnt", (T,), I32)
-    pos, base = lg.input("ix_pos", (run, T), I32), lg.input("ix_gbase", (1,), I32)
+    seen, base = lg.input("ix_vis", (T,), I32), lg.input("ix_gbase", (1,), I32)
+    vis, exact = lg.tensor((T,), I32), lg.tensor((T,), I32)
+    lg.node("rg_ix_gvis_f32", [seen, base], [vis, exact], struct.pack("iii", run, rows, run))
+    pos = lg.input("ix_pos", (run, T), I32)
     thr = lg.input("ix_thr", (64, T), I32)
     lg.node("rg_ix_thr_f32", [score, vis], [thr], struct.pack("i", run))
     cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
@@ -1238,6 +1244,37 @@ def index_merge_graph(
     return lg.g
 
 
+def index_gslot_graph(
+    device: Device,
+    dims: Dims,
+    tokens: int,
+    slots: int,
+    lpg: int,
+    tp: int,
+    nblk: int,
+    qb: int,
+    ratio: int,
+    groups: int,
+    keys: int,
+    run: int,
+    page: int,
+) -> Graph:
+    """The tiled index chain's *group* tables, built on the device: every merge group's slot records (``ix_rec``
+    (8, groups * lpg * slots); lane 7 is the tile's first index page, which ds_ix_gather reads instead of a
+    per-slot page table) and the groups' first keys (``ix_gbase`` (groups,)), from the step's O(T) ``blk``.
+    One launch per ratio per step whatever the number of groups: the host fill writes no per-group value."""
+    d, T = dims, tokens
+    S2 = lpg * slots
+    lg = LayerGraph(device, f"ix_gslot_T{T}_S{slots}_L{lpg}_P{tp}_r{ratio}", d, T)
+    lg.node(
+        "rg_ds_ix_gslot_f32",
+        [lg.input("blk", (2, T), I32)],
+        [lg.input("ix_rec", (8, groups * S2), I32), lg.input("ix_gbase", (groups,), I32)],
+        struct.pack("iiiiiiiii", S2, nblk, qb, INDEX_HEADS, ratio, keys, run, tp, page),
+    )
+    return lg.g
+
+
 def index_blocks_graph(device: Device, dims: Dims, tokens: int, rows: int) -> Graph:
     """A tile group's candidate blocks: the maxima of the group's blocks of 8 entries (``ix_bmax``, which the
     caller binds to the group's slice of the published block maxima) with the column's ``ix_pin`` (T,) block (its
@@ -1248,8 +1285,8 @@ def index_blocks_graph(device: Device, dims: Dims, tokens: int, rows: int) -> Gr
         "rg_ds_ix_bmax_f32",
         [
             lg.input("ix_tile", (rows, T), F32),
-            lg.input("ix_tvis", (T,), I32),
-            lg.input("ix_pin", (T,), I32),
+            lg.input("ix_vis", (T,), I32),
+            lg.input("ix_gbase", (1,), I32),
         ],
         [lg.input("ix_bmax", (rows // 8, T), F32)],
     )
@@ -1266,9 +1303,10 @@ def index_mask_graph(device: Device, dims: Dims, tokens: int, rows: int) -> Grap
         "rg_ix_cmask_f32",
         [
             lg.input("ix_tile", (rows, T), F32),
-            lg.input("ix_tvis", (T,), I32),
+            lg.input("ix_vis", (T,), I32),
             lg.input("ix_bmax", (rows // 8, T), F32),
             lg.input("cand_thr", (64, T), I32),
+            lg.input("ix_gbase", (1,), I32),
         ],
         [lg.input("ix_tile_out", (rows, T), F32)],
     )

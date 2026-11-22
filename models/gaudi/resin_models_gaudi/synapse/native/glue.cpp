@@ -213,6 +213,22 @@ static bool geom_pairs16(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_mk_add(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, false, 0, 0) + 63) / 64; is[1] = sz(p, true, 0, 1); is[2] = sz(p, false, 0, 2); *rank = 3; return true;
 }
+// ds_ix_gslot: one member per (merge group, slot of that group); params: S2 (lpg*slots), nblk, qb, heads,
+// ratio, keys, run, tp, page. rec (8, groups*S2) -> [groups, S2]
+static bool geom_ix_gslot(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    const int32_t* prm = (const int32_t*)p->nodeParams.nodeParams;
+    const uint64_t S2 = prm[0] > 0 ? uint64_t(prm[0]) : 1;
+    is[0] = (sz(p, true, 0, 1) + S2 - 1) / S2;
+    is[1] = S2;
+    *rank = 2;
+    return true;
+}
+// ix_gvis: one member per column (its outputs are (T,) vectors)
+static bool geom_ix_gvis(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 0, 0);
+    *rank = 1;
+    return true;
+}
 // ix_list
 static bool geom_ix_list(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     const int n = p->nodeParams.nodeParams && p->nodeParams.nodeParamsSize >= 4 ? *(const int*)p->nodeParams.nodeParams : 1;
@@ -400,6 +416,8 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_ix_bmax")) return geom_k512;
     if (is("ds_ix_pin")) return geom_columns;
     if (is("ds_ix_gather")) return geom_pairs16;
+    if (is("ds_ix_gslot")) return geom_ix_gslot;
+    if (is("ix_gvis")) return geom_ix_gvis;
     return nullptr;
 }
 

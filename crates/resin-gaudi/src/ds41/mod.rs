@@ -19,7 +19,6 @@ pub const INDEX_KEYS: i64 = 2048;
 pub const INDEX_RUN: i64 = 512;
 /// pending-state rows per (WINDOW block, ratio-2 owner): slot (position / 2) % PENDING_SLOTS (cache.PENDING_SLOTS)
 pub const PENDING_SLOTS: i64 = 4;
-const LANES: usize = (INDEX_KEYS / PAGE_TOKENS) as usize;
 const ROPE: usize = 128;
 
 /// Env-gated (`RESIN_DS41_FILL_PROF=1`) per-section fill timers (stderr, once per fill). Off: one branch.
@@ -196,19 +195,13 @@ pub struct Tables {
     pub ix_tp: usize,
     pub ix_lpg: usize,
     pub ix_rows: usize,
-    pub ix_groups: [usize; 2],
-    /// per ratio and merge group: the group's visible rows (`ixg`), the column's visible entries (`ixn`) and the
-    /// group's first key (`ixs`); decoding also the group's visible keys (`ixt`), its candidate blocks' rows and
-    /// counts (`ixb`, `ixbc`) and the block it pins (`ixp`)
-    pub ixg: [usize; 2],
-    pub ixn: [usize; 2],
-    pub ixs: [usize; 2],
-    pub ixt: [usize; 2],
-    pub ixb: [usize; 2],
-    pub ixbc: [usize; 2],
-    pub ixp: [usize; 2],
-    /// (T,) the score rows of a group plus one: ix_bmax reads it so that it pins nothing
-    pub ix_vis1: usize,
+    /// (2, T): per query block its first column's position and the entries its last column sees. The merge, the
+    /// block kernels and `ds_ix_gslot` derive every per-group value from this and `ix_vis` on the device.
+    pub blk: usize,
+    /// per ratio: every merge group's slot records (8, groups * lpg * ix_slots) and the groups' first keys
+    /// (groups,), both written on the device by `ds_ix_gslot`
+    pub ix_rec: [usize; 2],
+    pub ix_gb: [usize; 2],
     pub nbytes: usize,
     /// byte ranges zeroed before a fill (all but the tables written whole)
     pub zero: Vec<(usize, usize)>,
@@ -235,10 +228,6 @@ pub struct Tables {
     pub ixc: Vec<usize>,
     pub ix_vis: [usize; 2],
     pub cmp_blocks: [usize; 2],
-    /// per ratio and launch
-    pub ix: [Vec<usize>; 2],
-    /// per ratio, launch and owner of that ratio (in owner order)
-    pub ix_owner: [Vec<Vec<usize>>; 2],
     /// per Engram layer of a step that hashes on the device: (hi table, lo table, its index among the
     /// checkpoint's Engram layers)
     pub engram: Vec<(usize, usize, usize)>,
@@ -628,10 +617,10 @@ pub fn fill(
     }
 
     prof.mark("compressor");
-    // indexer: the tiled chain's groups, its per-group tables and its launches. A group covers `ix_tp` tiles of
-    // INDEX_KEYS keys: the score buffer holds the group's own rows (from INDEX_RUN, or 0 for the first group) and
-    // the running candidates' in the rows before them, so the score rows are tile-local and the buffer never
-    // grows with the context.
+    // indexer: the tiled chain's *group* tables are built on the device (``ds_ix_gslot``), not here: the fill
+    // publishes only what the step itself fixes, each O(T) -- the columns' visible entries, each query block's
+    // position and seen count, and the group count -- so its index work no longer grows with the number of
+    // groups (it was groups x T entries per ratio, per layer).
     let mut counts = Counts {
         sparse: false,
         cand: false,
@@ -645,16 +634,21 @@ pub fn fill(
             w.set(tables.ix_vis[ri], c, value);
         }
         let most = vis.iter().copied().max().unwrap_or(0);
-        // each query block: its row, first column, position and visible keys (its last column's)
-        let nblk = t / qb;
-        let mut blk: Vec<Option<(usize, i64, i64, i64)>> = vec![None; nblk];
+        // each query block: its first column's position and the entries its last column sees. ds_ix_gslot turns
+        // these into every group's slot records on the device.
+        let mut chunks = 0i64;
         for k in 0..r_count {
             let (pos0, real) = (rows.pos0[k], rows.real[k]);
             let seen_all = (pos0 + real) / ratio;
             for b0 in (0..real).step_by(qb) {
                 let q = pos0 + b0;
                 let seen = ((q + qb as i64) / ratio).min(seen_all);
-                blk[(b0 / qb as i64) as usize] = Some((k, rows.column[k] + b0, q, seen));
+                // the block is the one its columns fall in: b0 / qb inside a prefill chunk's single row, and
+                // the column itself in a decode step (where every row is one column)
+                let b = ((rows.column[k] + b0) / qb as i64) as usize;
+                w.set(tables.blk, 2 * b, q);
+                w.set(tables.blk, 2 * b + 1, seen);
+                chunks = chunks.max((seen + INDEX_KEYS - 1) / INDEX_KEYS);
             }
         }
         let candidate_ratio = model.candidate.is_none_or(|(r, _)| r == ratio);
@@ -782,106 +776,11 @@ pub fn fill(
             let k = col_row[c] as usize;
             w.copy_words(blocks, c * pages_n, &row_bufs[k]);
         }
-        // the tiled chain: how many groups this step needs, and each group's tables
+        // the tiled chain: how many merge groups this step needs, and so how many of each arm's launches it takes
         let tp = tables.ix_tp as i64;
-        let mut chunks = 0i64;
-        for b in blk.iter().flatten() {
-            chunks = chunks.max((b.3 + INDEX_KEYS - 1) / INDEX_KEYS);
-        }
         let used = ((chunks + tp - 1) / tp) as usize;
         counts.ix[ri] = used * (tables.ix_lpg + 1);
         counts.pf[ri] = used * (tables.ix_lpg + 2);
-        for g in 0..tables.ix_groups[ri] {
-            let first = g as i64 * tp * INDEX_KEYS;
-            w.set(tables.ixs[ri], g, first);
-            for c in 0..t {
-                let seen = vis[c];
-                let keys = (seen - first).clamp(0, tp * INDEX_KEYS);
-                w.set(
-                    tables.ixg[ri],
-                    g * t + c,
-                    keys + if g == 0 { 0 } else { INDEX_RUN },
-                );
-                w.set(tables.ixn[ri], g * t + c, seen.min(INDEX_RUN));
-                if !tables.prefill {
-                    w.set(tables.ixt[ri], g * t + c, keys);
-                    let newest = if seen > 0 {
-                        (seen - 1) / 8 - first / 8
-                    } else {
-                        -1
-                    };
-                    w.set(
-                        tables.ixp[ri],
-                        g * t + c,
-                        if newest >= 0 && newest < tp * (INDEX_KEYS / 8) {
-                            newest
-                        } else {
-                            -1
-                        },
-                    );
-                }
-            }
-        }
-        let owners: Vec<&Owner> = model.owners.iter().filter(|o| o.ratio == ratio).collect();
-        for g in 0..tables.ix_groups[ri] {
-            for l in 0..tables.ix_lpg {
-                let launch = tables.ix[ri][g * tables.ix_lpg + l];
-                for s in 0..tables.ix_slots {
-                    let rg = l * tables.ix_slots + s;
-                    let tile = g as i64 * tp + (rg / nblk) as i64;
-                    let b = rg % nblk;
-                    let first = tile * INDEX_KEYS;
-                    let entry = blk[b].filter(|e| e.3 > first);
-                    let Some((k, column, q, seen)) = entry else {
-                        w.set(launch, s * 8, -1);
-                        for lane in 1..8 {
-                            w.set(launch, s * 8 + lane, 0);
-                        }
-                        for &pages in &tables.ix_owner[ri][g * tables.ix_lpg + l] {
-                            w.fill(pages + s * LANES * 4, LANES, -1);
-                        }
-                        continue;
-                    };
-                    let len = (seen - first).min(INDEX_KEYS);
-                    let key0 = if tile == 0 {
-                        0
-                    } else {
-                        INDEX_RUN + (tile - g as i64 * tp) * INDEX_KEYS
-                    };
-                    let values = [
-                        0,
-                        model.index_heads * column,
-                        q,
-                        key0,
-                        key0 + len,
-                        column,
-                        ratio,
-                        0,
-                    ];
-                    for (lane, value) in values.into_iter().enumerate() {
-                        w.set(launch, s * 8 + lane, value);
-                    }
-                    let valid = (LANES as i64).min((len + page - 1) / page);
-                    for (owner, &pages) in owners
-                        .iter()
-                        .zip(&tables.ix_owner[ri][g * tables.ix_lpg + l])
-                    {
-                        for lane in 0..LANES {
-                            let p = first / page + lane as i64;
-                            let value = if (lane as i64) < valid {
-                                padded(history(k), history_width, p / owner.pages, -1)?
-                                    + owner.offset
-                                    + PAIR_ROWS * (p % owner.pages)
-                                    + PAGE_ROWS
-                            } else {
-                                -1
-                            };
-                            w.set(pages, s * LANES + lane, value);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     prof.mark("index");

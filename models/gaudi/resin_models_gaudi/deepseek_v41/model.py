@@ -262,32 +262,17 @@ class _Tables:
         add("ix_visc", i32, T)
         for j in range(model.ixc_launches(shape)):
             add(f"ixc.{j}", i32, shape.ix_slots, 8)
-        add("ix_vis1", i32, T)
+        # (T, 2): each query block's first position and the entries its last column sees (the graph tensor is
+        # (2, T): lane 0 the position, lane 1 the count). Everything the tiled index chain needs per *group* is
+        # derived from this and ix_vis on the device (ds_ix_gslot, ix_gvis, ds_ix_bmax, ix_cmask, ds_ix_merge),
+        # so the fill's index work is O(T) rather than groups x T.
+        add("blk", i32, T, 2)
         for r in (1, 2):
             add(f"ix_vis{r}", i32, T)
             add(f"cmp_blocks{r}", i32, T, model.pages)
-            # the tiled index chain: per merge group the visible rows, the column's visible entries and the
-            # group's first key (and, decoding, the group's visible keys, the candidate blocks' rows and counts,
-            # and the block the group pins)
-            groups = model.ix_groups(shape, r)
-            add(f"ixg{r}", i32, groups, T)
-            add(f"ixn{r}", i32, groups, T)
-            add(f"ixs{r}", i32, groups)
-            if not shape.prefill:
-                add(f"ixt{r}", i32, groups, T)
-                add(f"ixb{r}", i32, groups, T)
-                add(f"ixbc{r}", i32, groups, T)
-                add(f"ixp{r}", i32, groups, T)
-            for j in range(model.ix_launches(shape, r)):
-                add(f"ix{r}.{j}", i32, shape.ix_slots, 8)
-                for o in geo.owners:
-                    if model.cfg.compress_ratios[o] == r:
-                        add(
-                            f"ix{r}.{j}.{o}",
-                            i32,
-                            shape.ix_slots,
-                            INDEX_KEYS // PAGE_TOKENS,
-                        )
+            # every merge group's slot records (lane 7: the tile's first index page) and the groups' first keys
+            add(f"ix{r}.rec", i32, shape.ix_slots * model.ix_launches(shape, r), 8)
+            add(f"ix{r}.gb", i32, model.ix_groups(shape, r))
         for layer in model.engram_layers:
             if model.engram == "host":
                 add(f"eg.{layer}", f32, T, 256 * J)
@@ -351,6 +336,8 @@ class _Program:
 
     def __init__(self) -> None:
         self.embed: _Op | None = None
+        # the tiled index chain's group tables, one launch per ratio, run once per step before the layers
+        self.ixg: list[_Op] = []
         self.layers: list[dict] = []
         self.head: _Op | None = None
         self.inject: _Op | None = None
@@ -596,18 +583,23 @@ class DeepSeekV41Gaudi:
         tile buffer (a (rows, T) tensor, which is what a score launch writes); the merge op's copy places
         copies each column's rows to their own rows of the group's merge buffer, and a candidate layer's mask
         writes the group's rows there in place."""
-        base = self.table + self.tables[s].off[f"ix{ratio}.{j}"]
-        pages = self.table + self.tables[s].off[f"ix{ratio}.{j}.{owner}"]
+        base = (
+            self.table
+            + self.tables[s].off[f"ix{ratio}.rec"]
+            + 4 * 8 * s.ix_slots * j
+        )
+        pages = self.table + self.tables[s].off[f"cmp_blocks{ratio}"]
         tile = self.ix_tile
         recipe = self.r["ix", s]
+        off = {"cmp_blocks": pages, "cmp_loff": self.loff[owner]}
         if "ix_slots" in recipe.persistent:
-            return {**head, "ix_slots": base, "ix_pages": pages, "ix_score": tile}
-        names = dict(head, ix_score=tile)
+            return {**head, **off, "ix_slots": base, "ix_pages": pages, "ix_score": tile}
+        names = dict(head, **off, ix_score=tile)
         P = sum(n.startswith("ix_slots.p") for n in recipe.persistent)
         Sp = s.ix_slots // P
         for p in range(P):
             names[f"ix_slots.p{p}"] = base + 4 * 8 * Sp * p
-            names[f"ix_pages.p{p}"] = pages + 4 * (INDEX_KEYS // PAGE_TOKENS) * Sp * p
+            names[f"ix_pages.p{p}"] = pages
             names[f"ix_sink.p{p}"] = self.io["ix_sink"] + 256 * p
         return names
 
@@ -661,29 +653,32 @@ class DeepSeekV41Gaudi:
         tb, T, run = self.tables[s], s.T, L.INDEX_RUN
         first = g * self.ix_tp(s) * L.BLOCK_TILE
         names = dict(head)
+        # the group's first key and the column's visible entries: the kernels derive the group's visible rows,
+        # counts and pin from these (the fill writes neither)
+        base = {
+            "ix_vis": self.table + tb.off[f"ix_vis{ratio}"],
+            "ix_gbase": self.table + tb.off[f"ix{ratio}.gb"] + 4 * g,
+        }
         if kind == "b":
             names.update(
+                base,
                 ix_tile=self.ix_tile,
                 ix_bmax=self.io["cand_bmax"] + 4 * T * first,
-                ix_pin=self.table + tb.off[f"ixp{ratio}"] + 4 * T * g,
-                ix_tvis=self.table + tb.off[f"ixt{ratio}"] + 4 * T * g,
             )
         elif kind == "k":  # the mask reads the score launches' tile and writes the group's rows in place
             names.update(
+                base,
                 ix_tile=self.ix_tile,
                 ix_tile_out=self.ix_tile,
-                ix_tvis=self.table + tb.off[f"ixt{ratio}"] + 4 * T * g,
                 ix_bmax=self.io["cand_bmax"] + 4 * T * first,
                 cand_thr=self.io["cand_thr"],
             )
         else:
             names.update(
+                base,
                 ix_merge=self.ix_merge[g % 2],
-                ix_gvis=self.table + tb.off[f"ixg{ratio}"] + 4 * T * g,
-                ix_gcnt=self.table + tb.off[f"ixn{ratio}"] + 4 * T * g,
                 ix_pos=self.ix_pos[g % 2],
                 ix_pos_out=self.ix_pos[1 - g % 2],
-                ix_gbase=self.table + tb.off[f"ixs{ratio}"] + 4 * g,
                 ix_thr=self.io["ix_thr"] if g == 0 else self.io["ix_thr2"],
                 ix_lslots=self.io["ix_lslots"],
                 ix_list=self.io["ix_list"],
@@ -1134,8 +1129,14 @@ class DeepSeekV41Gaudi:
                 rows, top = self.ix_rows(s), cfg.candidate_topk_blocks
                 graphs["ix", s] = L.index_score_graph(
                     dev, d, T, s.ix_slots, INDEX_KEYS, nb, rows, query_block=qb,
-                    parts=self.ix_parts(s),
+                    parts=self.ix_parts(s), cpages=self.pages,
                 )  # fmt: skip
+                for r in (1, 2):
+                    graphs["ixg", s, r] = L.index_gslot_graph(
+                        dev, d, T, s.ix_slots, self.ix_lpg(s), self.ix_tp(s),
+                        s.blocks, s.qb, r, self.ix_groups(s, r), INDEX_KEYS,
+                        L.INDEX_RUN, PAGE_TOKENS,
+                    )  # fmt: skip
                 graphs["ixm", s] = L.index_merge_graph(dev, d, T, rows, L.INDEX_RUN)
                 if not s.prefill:  # decoding: the candidate blocks the source layer publishes
                     graphs["ixb", s] = L.index_blocks_graph(dev, d, T, rows)
@@ -1290,6 +1291,19 @@ class DeepSeekV41Gaudi:
         prog.embed = self._op(
             self.r["embed", s], None, {**head, "X": x[1], "c": c[1], "X_out": x[0]}
         )
+        if ("ixg", s, 1) in self.r:
+            prog.ixg = [
+                self._op(
+                    self.r["ixg", s, r],
+                    None,
+                    {
+                        "blk": t("blk"),
+                        "ix_rec": t(f"ix{r}.rec"),
+                        "ix_gbase": t(f"ix{r}.gb"),
+                    },
+                )
+                for r in (1, 2)
+            ]
         cur, cin, pin = (
             0,
             self.c_identity[s.T],
@@ -1642,6 +1656,12 @@ class DeepSeekV41Gaudi:
 
         native.section("embed")
         launch(prog.embed)
+        # the tiled index chain's group tables: one launch per ratio for the whole step, whatever the number of
+        # merge groups (ds_ix_gslot derives each group's slot records from the step's positions)
+        if prog.ixg:
+            native.section("ix groups")
+            for op in prog.ixg:
+                launch(op)
         for layer, ops in enumerate(prog.layers):
             native.section(f"layer {layer}")
             ratio = self.cfg.compress_ratios[layer]
@@ -1779,18 +1799,12 @@ class DeepSeekV41Gaudi:
                     if self.engram == "host"
                     else [],
                     "ix_slots": s.ix_slots,
-                    "ix_vis1": off["ix_vis1"],
                     "ix_tp": self.ix_tp(s),
                     "ix_lpg": self.ix_lpg(s),
                     "ix_rows": self.ix_rows(s),
-                    "ix_groups": (self.ix_groups(s, 1), self.ix_groups(s, 2)),
-                    "ixg": (off["ixg1"], off["ixg2"]),
-                    "ixn": (off["ixn1"], off["ixn2"]),
-                    "ixs": (off["ixs1"], off["ixs2"]),
-                    "ixt": (off["ixt1"], off["ixt2"]) if not s.prefill else (0, 0),
-                    "ixb": (off["ixb1"], off["ixb2"]) if not s.prefill else (0, 0),
-                    "ixbc": (off["ixbc1"], off["ixbc2"]) if not s.prefill else (0, 0),
-                    "ixp": (off["ixp1"], off["ixp2"]) if not s.prefill else (0, 0),
+                    "blk": off["blk"],
+                    "ix_rec": (off["ix1.rec"], off["ix2.rec"]),
+                    "ix_gb": (off["ix1.gb"], off["ix2.gb"]),
                     "nbytes": tb.nbytes,
                     "zero": [(int(a), int(b)) for a, b in tb.zero],
                     "tok": off["tok"],
@@ -1810,21 +1824,6 @@ class DeepSeekV41Gaudi:
                     "ixc": [off[f"ixc.{j}"] for j in range(self.ixc_launches(s))],
                     "ix_vis": (off["ix_vis1"], off["ix_vis2"]),
                     "cmp_blocks": (off["cmp_blocks1"], off["cmp_blocks2"]),
-                    "ix": tuple(
-                        [off[f"ix{r}.{j}"] for j in range(self.ix_launches(s, r))]
-                        for r in (1, 2)
-                    ),
-                    "ix_owner": tuple(
-                        [
-                            [
-                                off[f"ix{r}.{j}.{o}"]
-                                for o in geo.owners
-                                if cfg.compress_ratios[o] == r
-                            ]
-                            for j in range(self.ix_launches(s, r))
-                        ]
-                        for r in (1, 2)
-                    ),
                     "engram": [
                         (
                             off[f"eg_xh.{layer}"],

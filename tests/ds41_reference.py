@@ -400,9 +400,10 @@ class Reference(_Model):
             store[g, 6] = e
             store[g, 3] = page + PAGE_TOKENS
             store[g, 4] = e
-        # indexer: the tiled chain's groups, its per-group tables and its launches
+        # indexer: the tiled chain's launches and the O(T) tables the device builds its group tables from. The
+        # per-group tables themselves (slot records, group bases, visible rows, pins) are derived on the device
+        # (ds_ix_gslot, ix_gvis, ds_ix_bmax, ix_cmask, ds_ix_merge), so nothing here is per group.
         counts = {"sparse": False, "cand": False}
-        v["ix_vis1"][:] = self.ix_rows(s) + 1
         lanes = np.arange(INDEX_KEYS // PAGE_TOKENS)
         tp, lpg = self.ix_tp(s), self.ix_lpg(s)
         for ratio in (1, 2):
@@ -417,7 +418,10 @@ class Reference(_Model):
                 for b0 in range(0, r.real, s.qb):
                     q = r.pos0 + b0
                     seen = min((q + s.qb) // ratio, seen_all)
-                    blk[b0 // s.qb] = (k, r.column + b0, q, seen)
+                    b = (r.column + b0) // s.qb
+                    blk[b] = (k, r.column + b0, q, seen)
+                    v["blk"][b, 0] = q
+                    v["blk"][b, 1] = seen
             nb = -(-vis // 8)
             v[self._visb(ratio)][:] = np.minimum(-(-nb // 64) * 64, self.kmax // 8)
             counts["cand"] = bool(
@@ -491,7 +495,7 @@ class Reference(_Model):
                 blocks[cols] = pr.reshape(R, -1)[0, : self.pages]
             else:
                 blocks[cols] = pr.reshape(R, -1)[cr, : self.pages]
-            # the tiled chain: how many groups this step needs, and each group's tables
+            # the tiled chain: how many merge groups this step needs (each group's tables are the device's)
             chunks = 0
             for b in blk:
                 if b is not None:
@@ -499,60 +503,6 @@ class Reference(_Model):
             used = -(-chunks // tp)
             counts[ratio] = used * (lpg + 1)
             counts["pf", ratio] = used * (lpg + 2)
-            owners = [o for o in geo.owners if cfg.compress_ratios[o] == ratio]
-            for g in range(self.ix_groups(s, ratio)):
-                first = g * tp * INDEX_KEYS
-                keys = np.clip(vis - first, 0, tp * INDEX_KEYS)
-                v[f"ixs{ratio}"][g] = first
-                v[f"ixg{ratio}"][g] = keys + (0 if g == 0 else L.INDEX_RUN)
-                v[f"ixn{ratio}"][g] = np.minimum(vis, L.INDEX_RUN)
-                if not s.prefill:
-                    v[f"ixt{ratio}"][g] = keys
-                    newest = np.where(vis > 0, (vis - 1) // 8 - first // 8, -1)
-                    v[f"ixp{ratio}"][g] = np.where(
-                        (newest >= 0) & (newest < tp * (INDEX_KEYS // 8)), newest, -1
-                    )
-            for g in range(self.ix_groups(s, ratio)):
-                for l in range(lpg):
-                    table = np.zeros((s.ix_slots, 8), np.int64)
-                    table[:, 0] = -1
-                    pages = {o: np.full((s.ix_slots, len(lanes)), -1, np.int64) for o in owners}
-                    for si in range(s.ix_slots):
-                        rg = l * s.ix_slots + si
-                        tile = g * tp + rg // nblk
-                        b = rg % nblk
-                        first = tile * INDEX_KEYS
-                        if blk[b] is None or blk[b][3] <= first:
-                            continue
-                        k, col, q, seen = blk[b]
-                        ln = min(seen - first, INDEX_KEYS)
-                        key0 = 0 if tile == 0 else L.INDEX_RUN + (tile - g * tp) * INDEX_KEYS
-                        table[si] = [
-                            0,
-                            L.INDEX_HEADS * col,
-                            q,
-                            key0,
-                            key0 + ln,
-                            col,
-                            ratio,
-                            0,
-                        ]
-                        P = first // PAGE_TOKENS + lanes
-                        ok = lanes < min(len(lanes), -(-ln // PAGE_TOKENS))
-                        for o in owners:
-                            op, ooff = geo.owner_pages(o), geo.owner_offset(o)
-                            pages[o][si] = np.where(
-                                ok,
-                                hist[k, np.where(ok, P // op, 0)]
-                                + ooff
-                                + PAIR_ROWS * (P % op)
-                                + PAGE_ROWS,
-                                -1,
-                            )
-                    j = g * lpg + l
-                    v[f"ix{ratio}.{j}"][:] = table
-                    for o in owners:
-                        v[f"ix{ratio}.{j}.{o}"][:] = pages[o]
         return counts
 
     def _engram_ids(

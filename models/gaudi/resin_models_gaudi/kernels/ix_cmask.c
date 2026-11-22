@@ -3,7 +3,10 @@
 // DeepSeek-V4.1 candidate blocks, level two: a column's scores with every visible entry outside its candidate
 // blocks set to -3e38. Entry i is in a candidate block when mkey(bmax of block i / 8) >= cthr[c] (ix_bmax's
 // block order; cthr from ix_thr over the blocks). Vectors past the visible entries are not written.
-// tensors: 0 score (K, T) f32  1 vis (T) i32  2 bmax (K / 8, T) f32  3 cthr (64, T) i32 | 4 out (K, T) f32
+// The group's tile-local visible keys are derived here from the column's visible entries (``ixvis``, the step's
+// O(T) table) and the group's first key (``gbase``): vis = clamp(seen - base, 0, K). No per-group host table.
+// tensors: 0 score (K, T) f32  1 ixvis (T) i32  2 bmax (K / 8, T) f32  3 cthr (64, T) i32 | 4 out (K, T) f32
+//        | 5 gbase (1,) i32
 // index space: [K / 512, T]
 #include "common.h"
 
@@ -22,8 +25,11 @@ static inline uchar256 ctl_of(int64 e)
     return __builtin_bit_cast(uchar256, c);
 }
 
-void main(tensor score, tensor vis, tensor bmax, tensor cthr, tensor out)
+void main(tensor score, tensor ixvis, tensor bmax, tensor cthr, tensor out, tensor gbase)
 {
+    int5 zc = {0, 0, 0, 0, 0};
+    const int base = s_i32_ld_g(gen_addr(zc, gbase));
+    const int K = (int)get_dim_size(score, 0);
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
     const int64 lane = (int64)read_lane_id_4b_b();
@@ -36,7 +42,10 @@ void main(tensor score, tensor vis, tensor bmax, tensor cthr, tensor out)
     scalar_cache_reset();
     for (int c = off[1]; c < end[1]; c++) {
         int5 vc = {c, 0, 0, 0, 0};
-        const int lim = s_i32_ld_g(gen_addr(vc, vis));
+        const int seen = s_i32_ld_g(gen_addr(vc, ixvis));
+        int keys = seen - base;
+        keys = keys < 0 ? 0 : (keys > K ? K : keys);
+        const int lim = keys;
         int5 tc = {0, c, 0, 0, 0};
         const uint64 th = v_u32_ld_tnsr_b(tc, cthr);
         for (int g = off[0]; g < end[0]; g++) {

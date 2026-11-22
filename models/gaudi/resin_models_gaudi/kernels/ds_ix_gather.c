@@ -4,16 +4,22 @@
 // index pages into a dense FP8 slab, and each key's scale. An index page holds 128 keys of 128 FP8 bytes, four
 // per row from its first row, then a row of their f32 scales. Keys at or past the slot's klen (slots[4, s], from
 // key0 = slots[3, s]) and pages of -1 get zeros and scale 0.
-// tensors: 0 arena (512, PR, NB) u8  1 pages (C / 128, S) i32 (first row of each index page)  2 slots (8, S) i32
-//          3 after (unread) | 4 out (256, C / 2, S) fp8 (the (128, C, S) slab: keys 2 i, 2 i + 1 in row i)
-//          5 scales (C, S) f32
-// index space: [1, C / 32, S] (32 keys of a page per member)
+//
+// The slot's page rows come from the step's own compressed-page table (``cmp_blocks``, per column), not from a
+// per-slot table the host built: slot s's tile starts at page slots[7, s] of column slots[5, s], and the arena
+// row of its page p is cmp_blocks[slots[7, s] + p, col] + off (``off``: the owner's arena offset and the index
+// pages' row offset), or -1 when that page has no row.
+// tensors: 0 arena (512, PR, NB) u8  1 cmp_blocks (npages, T) i32  2 slots (8, S) i32
+//          3 after (unread)  4 loff (64,) i32 [the owner's latent offset, ...]
+//        | 5 out (256, C / 2, S) fp8 (the (128, C, S) slab: keys 2 i, 2 i + 1 in row i)  6 scales (C, S) f32
+// params: page_rows (rows of a latent page).  index space: [1, C / 32, S] (32 keys of a page per member)
 #include "common.h"
 
 #define KEYS 32
 #define ROW(r) (r) & pm, (r) >> psh
 
-void main(tensor arena, tensor pages, tensor slots, tensor after, tensor out, tensor scales)
+void main(tensor arena, tensor pages, tensor slots, tensor after, tensor loff, tensor out, tensor scales,
+          int page_rows)
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
@@ -26,15 +32,22 @@ void main(tensor arena, tensor pages, tensor slots, tensor after, tensor out, te
     const float64 zero = 0.0f;
     const float64 lanef = v_convert_i32_to_f32_b((int64)read_lane_id_4b_b(), SW_RHNE, 0, 1, 0);
     scalar_cache_reset();
+    int5 lc = {0, 0, 0, 0, 0};
+    const int ioff = s_i32_ld_g(gen_addr(lc, loff)) + page_rows;
     for (int s = off[2]; s < end[2]; s++) {
         int5 kc = {3, s, 0, 0, 0};
         const int key0 = s_i32_ld_g(gen_addr(kc, slots));
         kc[0] = 4;
         const int klen = s_i32_ld_g(gen_addr(kc, slots));
+        kc[0] = 5;
+        const int col = s_i32_ld_g(gen_addr(kc, slots));
+        kc[0] = 7;
+        const int pbase = s_i32_ld_g(gen_addr(kc, slots));
         for (int j = off[1]; j < end[1]; j++) {
             const int page = j / (128 / KEYS);
-            int5 pc = {page, s, 0, 0, 0};
-            const int row0 = s_i32_ld_g(gen_addr(pc, pages));
+            int5 pc = {pbase + page, col, 0, 0, 0};
+            const int row = s_i32_ld_g(gen_addr(pc, pages));
+            const int row0 = row >= 0 ? row + ioff : -1;
             const int cnt = row0 >= 0 ? klen - key0 - page * 128 : 0;  // live keys of the page
             const int q0 = (j % (128 / KEYS)) * KEYS;
             #pragma unroll 4

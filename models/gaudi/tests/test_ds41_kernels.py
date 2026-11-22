@@ -2133,25 +2133,13 @@ def test_tiled_index_selection_matches_full(device, recipes, T):
                         merge[g % 2] + 4 * (t * (run + rows) + row0),
                         np.ascontiguousarray(scores[t, g * rows : (g + 1) * rows]),
                     )
-                device.h2d(
-                    one["vis"],
-                    np.array(
-                        [
-                            (0 if g == 0 else run)
-                            + max(0, min(int(vis[t]) - g * rows, rows))
-                            for t in range(T)
-                        ],
-                        np.int32,
-                    ),
-                )
-                device.h2d(
-                    one["exact"], np.array([min(int(v), run) for v in vis], np.int32)
-                )
+                # the group's visible rows and the column's count are derived by ix_gvis from the column's
+                # visible entries and the group's first key: the test feeds those two, as the model does
+                device.h2d(one["vis"], vis)
                 device.h2d(base, np.array([g * rows], np.int32))
                 bind = {
                     "ix_merge": merge[g % 2],
-                    "ix_gvis": one["vis"],
-                    "ix_gcnt": one["exact"],
+                    "ix_vis": one["vis"],
                     "ix_pos": pos[g % 2],
                     "ix_gbase": base,
                     "ix_thr": thr,
@@ -2247,7 +2235,6 @@ def test_tiled_index_selection_pads_the_running_set(device, recipes):
     recipe = recipes.compile(g)
     try:
         device.h2d(one["vis"], np.array([seen], np.int32))
-        device.h2d(one["exact"], np.array([seen], np.int32))
         device.h2d(base, np.array([0], np.int32))
         device.h2d(merge[0], np.ascontiguousarray(score[:, :rows]))
         for name in recipe.persistent:
@@ -2255,8 +2242,7 @@ def test_tiled_index_selection_pads_the_running_set(device, recipes):
                 name,
                 {
                     "ix_merge": merge[0],
-                    "ix_gvis": one["vis"],
-                    "ix_gcnt": one["exact"],
+                    "ix_vis": one["vis"],
                     "ix_pos": pos[0],
                     "ix_gbase": base,
                     "ix_thr": thr,
@@ -2278,5 +2264,94 @@ def test_tiled_index_selection_pads_the_running_set(device, recipes):
         print("the running set pads slots", seen, "..", run - 1, "with NINF / -1")
     finally:
         for a in [*merge, *pos, *one.values(), base, thr, *out.values(), slots]:
+            device.free(a)
+        g.destroy()
+
+
+@pytest.mark.parametrize("prefill", [True, False], ids=["prefill", "decode"])
+def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
+    """ds_ix_gslot derives every merge group's slot records and its first key from the step's O(T) ``blk``, so
+    the host fill builds no per-group table. The records must equal the arithmetic the fill used to do: group g's
+    launch j, slot rg = j*slots + s is query block b = rg % nblk of tile g*tp + rg / nblk, with key0 the tile's
+    first key in the group's merge buffer (0 for tile 0, else run + (tile - g*tp) * keys), key1 = key0 + len,
+    len = clamp(seen - tile*keys, 0, keys) from the block's last column, lane 7 the tile's first index page, and
+    a slot whose tile holds no visible key is lane 0 = -1. RED-first: one block's seen count moves and the
+    records must change with it."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.synapse.runtime import I32
+
+    d = L.Dims(
+        hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+        experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+        route_scale=1.5, ranks=1,
+    )  # fmt: skip
+    T, qb = 64, (8 if prefill else 1)
+    nblk = T // qb
+    slots, lpg, tp, ratio, groups = 4, (1 if prefill else 2), 2, 1, 3
+    keys, run, page = L.INDEX_TILE, L.INDEX_RUN, 128
+    S2 = lpg * slots
+    rng = np.random.default_rng(11)
+    # every block's first position and the entries its last column sees: some blocks see nothing of a tile
+    # the table's view is (T, 2) -- the graph tensor is (2, T), lane 0 the position, lane 1 the count
+    blk = np.zeros((T, 2), np.int32)
+    blk[:nblk, 0] = rng.integers(0, 4096, nblk)
+    blk[:nblk, 1] = rng.integers(0, 5000, nblk)
+
+    def want(block: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        rec = np.zeros((groups * S2, 8), np.int64)
+        rec[:, 0] = -1
+        gb = np.zeros(groups, np.int64)
+        for g in range(groups):
+            gb[g] = g * tp * keys
+            for rg in range(S2):
+                b, tile = rg % nblk, g * tp + rg // nblk
+                first, c0 = tile * keys, b * qb
+                ln = min(max(int(block[c0, 1]) - first, 0), keys)
+                if ln <= 0:
+                    continue
+                key0 = 0 if tile == 0 else run + (tile - g * tp) * keys
+                rec[g * S2 + rg] = [
+                    0, L.INDEX_HEADS * c0, int(block[c0, 0]), key0, key0 + ln, c0, ratio,
+                    first // page,
+                ]  # fmt: skip
+        return rec, gb
+
+    g = L.index_gslot_graph(device, d, T, slots, lpg, tp, nblk, qb, ratio, groups, keys, run, page)
+    addr = {
+        "blk": device.malloc(8 * T),
+        "ix_rec": device.malloc(4 * 8 * groups * S2),
+        "ix_gbase": device.malloc(4 * groups),
+    }
+    recipe = recipes.compile(g)
+    try:
+
+        def go(block: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            device.h2d(addr["blk"], np.ascontiguousarray(block))
+            for name in recipe.persistent:
+                recipe.bind(name, addr[name])
+            recipe.launch()
+            device.sync()
+            return (
+                device.d2h(addr["ix_rec"], (groups * S2, 8), np.int32),
+                device.d2h(addr["ix_gbase"], (groups,), np.int32),
+            )
+
+        got, got_gb = go(blk)
+        rec, gb = want(blk)
+        np.testing.assert_array_equal(got, rec)
+        np.testing.assert_array_equal(got_gb, gb)
+        # every group's slot records carry their own tile's keys, and a slot past a column's visible entries is
+        # the padding record (lane 0 = -1) the launches read as "no keys"
+        assert (got[:, 0] == -1).any() and (got[:, 0] == 0).any()
+        # RED: move one block's seen count and the records must follow
+        moved = blk.copy()
+        moved[0, 1] += 3 * keys
+        got2, _ = go(moved)
+        rec2, _ = want(moved)
+        np.testing.assert_array_equal(got2, rec2)
+        assert not np.array_equal(got2, got), "the gate cannot see a block's seen count change"
+        print("ds_ix_gslot built", groups * S2, "slot records of", groups, "groups on the device")
+    finally:
+        for a in addr.values():
             device.free(a)
         g.destroy()
