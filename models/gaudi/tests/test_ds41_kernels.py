@@ -2085,8 +2085,8 @@ def test_tiled_index_selection_matches_full(device, recipes):
             full_recipe.bind(name, full_addr[name])
         full_recipe.launch()
         device.sync()
-        want = device.d2h(full_addr["list"], (run, T), np.int32)
-        want_slots = device.d2h(full_addr["lslots"], (8, T), np.int32)
+        want = device.d2h(full_addr["list"], (T, run), np.int32)
+        want_slots = device.d2h(full_addr["lslots"], (T, 8), np.int32)
 
         def run_tiled(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             recipe = recipes.compile(tiled)
@@ -2125,30 +2125,31 @@ def test_tiled_index_selection_matches_full(device, recipes):
                 recipe.launch()
                 device.sync()
             return (
-                device.d2h(out["list"], (run, T), np.int32),
-                device.d2h(slots, (8, T), np.int32),
+                device.d2h(out["list"], (T, run), np.int32),
+                device.d2h(slots, (T, 8), np.int32),
             )
 
         got, got_slots = run_tiled(score)
         for t in range(T):
-            n = int(want_slots[4, t])
-            assert int(got_slots[4, t]) == n, (t, got_slots[4, t], n)
-            assert got[:n, t].tolist() == want[:n, t].tolist(), (t, got[:n, t], want[:n, t])
-            assert got[:n, t].tolist() == sorted(set(got[:n, t].tolist())), (
+            n = int(want_slots[t, 4])
+            assert int(got_slots[t, 4]) == n, (t, got_slots[t, 4], n)
+            assert got[t, :n].tolist() == want[t, :n].tolist(), (
+                t,
+                got[t, :n].tolist(),
+                want[t, :n].tolist(),
+            )
+            assert got[t, :n].tolist() == sorted(set(got[t, :n].tolist())), (
                 "a key listed twice"
             )
-        assert want_slots[4].tolist() == [512, 512, 512, 0, 512]
-        # RED: drop one listed entry's score and the tiled result must change with the full one
+        assert want_slots[:, 4].tolist() == [512] * T
+        # RED: drop one listed entry's score and both selections must change, identically
         dropped = score.copy()
         victim = int(want[0, 0])
-        dropped[victim, 0] = -3.0e38
-        device.h2d(full_addr["score"], np.ascontiguousarray(dropped))
-        full_recipe.launch()
-        device.sync()
-        want2 = device.d2h(full_addr["list"], (run, T), np.int32)
+        dropped[0, victim] = -3.0e38
+        want2, _ = run_full(dropped)
         got2, _ = run_tiled(dropped)
-        assert got2[:512, 0].tolist() == want2[:512, 0].tolist()
-        assert got2[:512, 0].tolist() != got[:512, 0].tolist(), (
+        assert got2[0, :512].tolist() == want2[0, :512].tolist()
+        assert got2[0, :512].tolist() != got[0, :512].tolist(), (
             "the gate cannot see a selected entry change"
         )
         print("tiled selection == full selection on", T, "columns of", K, "keys")

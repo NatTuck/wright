@@ -414,16 +414,32 @@ def _attention_out(lg: LayerGraph, o: Tensor) -> None:
     lg.gemm8(b8, "wo_b", d.hidden, sb, out=lg.p_out())
 
 
-def _w13(lg: LayerGraph, x: Tensor, ids: Tensor, R: int) -> Tensor:
-    """x (H, M, N) FP8 against N decoded w13 slots (``ids``, ``R`` as in mx4_decs) -> (2w, M, N) f32, each slot's
-    2w rows decoded and multiplied in one part: one ``rg_mx4_decs_f32`` and one ``batch_gemm``, no concat.
+def expert_out_dtype(lg: LayerGraph) -> int:
+    """The routed experts' product dtype: BF16, as in the reference (``fp8_gemm`` ``out_dtype=BF16``, added into
+    an f32 ``y``), except where the activation kernel cannot read a bf16 tile.
+
+    ``rg_ds_xact_*`` loads 128 rows of the product at a time (a bf16 tensor load is 128 elements; there is no
+    64-lane bf16 vector), so the pair of tail rows after ``w0 = w // 128 * 128`` must be exactly 128 rows: that
+    is ``t = w - w0`` of 0 or 64. ``w = 576`` (4 ranks) gives 64; ``w = 288`` (8 ranks) gives 32 and keeps f32.
+    """
+    w = lg.d.expert
+    return BF16 if w - w // 128 * 128 in (0, 64) else F32
+
+
+def _w13(lg: LayerGraph, x: Tensor, ids: Tensor, R: int, dt: int | None = None) -> Tensor:
+    """x (H, M, N) FP8 against N decoded w13 slots (``ids``, ``R`` as in mx4_decs) -> (2w, M, N) of ``dt``, each
+    slot's 2w rows decoded and multiplied in one part: one ``rg_mx4_decs_f32`` and one ``batch_gemm``, no concat.
 
     The split form (two per-half dequant+GEMM pairs and a ``cat``) is what the graph compiler turns into four
     bundles and 30 MB of SRAM; one pair is two bundles and 18 MB, with a bit-identical result and a faster
     launch (``test_expert_product_in_parts_equals_whole`` pins the equivalence). The dequant tile itself is
-    SRAM-resident either way -- see ``cases/wright/notes/moe-dequant-tile-sram.md``."""
+    SRAM-resident either way -- see ``cases/wright/notes/moe-dequant-tile-sram.md``.
+
+    ``dt`` is the product's dtype (``expert_out_dtype``): BF16 halves the product's bytes and is what the
+    reference's ``fp8_gemm`` produces, so it costs no fidelity -- the device accumulates in f32 and rounds once
+    (``test_slot_product_bf16_is_the_rounded_f32``)."""
     H, w = lg.d.hidden, lg.d.expert
-    return _halves(lg, x, ids, R, "x13", 2 * w * H, (H, 2 * w), 1)
+    return _halves(lg, x, ids, R, "x13", 2 * w * H, (H, 2 * w), 1, dt)
 
 
 def _halves(
@@ -435,12 +451,14 @@ def _halves(
     size: int,
     part: tuple[int, int],
     n: int,
+    dt: int | None = None,
 ) -> Tensor:
     """x (K, M, N) against ``n`` consecutive parts (K, rows) of each decoded slot of ``name`` (``size`` elements a
-    slot), each decoded and multiplied apart -> (n rows, M, N) f32."""
+    slot), each decoded and multiplied apart -> (n rows, M, N) of ``dt`` (F32 by default)."""
     E = lg.d.experts
     K, rows = part
     M, N = x.shape[1], x.shape[2]
+    dt = F32 if dt is None else dt
     unit = K * rows // 2048
     outs = []
     for k in range(n):
@@ -452,21 +470,21 @@ def _halves(
             [dec],
             struct.pack("ii", R, k * unit),
         )  # fmt: skip
-        y = lg.tensor((rows, M, N), F32)
+        y = lg.tensor((rows, M, N), dt)
         lg.node("batch_gemm", [x, lg.view(dec, (K, rows, N))], [y], GEMM_NT)
         outs.append(y)
     if n == 1:
         return outs[0]
-    y = lg.tensor((n * rows, M, N), F32)
+    y = lg.tensor((n * rows, M, N), dt)
     lg.node("concat", outs, [y], struct.pack("I", 0))
     return y
 
 
-def _w2(lg: LayerGraph, h: Tensor, ids: Tensor, R: int) -> Tensor:
-    """h (w, M, N) FP8 against N decoded w2 slots -> (H, M, N) f32, one dequant and one ``batch_gemm`` (as in
-    ``_w13``: the two-half form costs two more bundles for the same tile)."""
+def _w2(lg: LayerGraph, h: Tensor, ids: Tensor, R: int, dt: int | None = None) -> Tensor:
+    """h (w, M, N) FP8 against N decoded w2 slots -> (H, M, N) of ``dt``, one dequant and one ``batch_gemm`` (as
+    in ``_w13``: the two-half form costs two more bundles for the same tile)."""
     H, w = lg.d.hidden, lg.d.expert
-    return _halves(lg, h, ids, R, "x2", H * w, (w, H), 1)
+    return _halves(lg, h, ids, R, "x2", H * w, (w, H), 1, dt)
 
 
 def ffn_graph(device: Device, dims: Dims, tokens: int, paged: bool = False) -> Graph:
@@ -502,7 +520,8 @@ def ffn_graph(device: Device, dims: Dims, tokens: int, paged: bool = False) -> G
         _paged_experts(lg, h32, ids, wts, sh, shs)
         lg.site(X, "hcf")
         return lg.g
-    y13 = _w13(lg, xq, ids, K)
+    dt = expert_out_dtype(lg)
+    y13 = _w13(lg, xq, ids, K, dt)
     hq, hsl = lg.tensor((w, 1, S), F8), lg.tensor((1, S), F32)
     lg.node(
         "rg_ds_xact_lin_f32",
@@ -510,7 +529,7 @@ def ffn_graph(device: Device, dims: Dims, tokens: int, paged: bool = False) -> G
         [hq, hsl],
         struct.pack("ifii", K, d.limit, w - w0, 0),
     )
-    y2 = _w2(lg, hq, ids, K)
+    y2 = _w2(lg, hq, ids, K, dt)
     if (
         T > 1
     ):  # the next sub-layer's coefficients, created late
@@ -553,7 +572,8 @@ def _paged_experts(
     lg.node("rg_ds_xq1_lin_f32", [h32], [q1, s1])
     xq, sxr = lg.tensor((H, S), F8), lg.tensor((1, S), F32)
     lg.node("rg_ds_xg_f32", [q1, s1, gidx], [xq, sxr])
-    y13 = _w13(lg, lg.view(xq, (H, PS, P)), pe, 0)
+    dt = expert_out_dtype(lg)
+    y13 = _w13(lg, lg.view(xq, (H, PS, P)), pe, 0, dt)
     yf = lg.view(y13, (2 * w, 1, S))
     hq, hs = lg.tensor((w, 1, S), F8), lg.tensor((1, S), F32)
     if w == 288:  # one member per page
@@ -582,7 +602,7 @@ def _paged_experts(
         [d2],
         struct.pack("ii", 0, 0),
     )
-    y2 = lg.tensor((H, PS, P), F32)
+    y2 = lg.tensor((H, PS, P), dt)
     lg.node(
         "batch_gemm", [lg.view(hq, (w, PS, P)), lg.view(d2, (w, H, P))], [y2], GEMM_NT
     )
@@ -1192,9 +1212,9 @@ def index_merge_graph(
             lg.input("ix_sout", (run, T), F32),
             lg.input("ix_pos_out", (run, T), I32),
         ],
-        # one member per column: a column's list is a single ascending scan, so its slots never straddle the
-        # members ix_list splits a column into (which would need the partial-vector store aligned to each)
-        struct.pack("iiii", 1, run, heads, run),
+        # one member per block of 64 rows, so a member's slots never span two 64-slot vectors (a partial-vector
+        # store writes one vector's lanes, so a member that spans a vector boundary would shift its entries)
+        struct.pack("iiii", max(1, 48 // T), run, heads, run),
     )
     return lg.g
 
