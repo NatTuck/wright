@@ -1577,6 +1577,61 @@ def test_candidate_select_maps_positions(device, recipes):
         assert set(got.tolist()) == want, t
 
 
+def test_candidate_select_maps_long_positions(device, recipes):
+    """ix_list_map at a 512k context: a ratio-1 layer's compressed positions reach 524287, and a listed entry
+    comes back as that position whole. The map variant used to keep the position in a 18-bit field beside the
+    compact row index, so every position at or past 262144 was silently truncated (524287 became 262143) and the
+    attention gathered the wrong latents. The first column holds the highest score at 524287 and the next at
+    300000, so a truncated field cannot produce the wanted set; the last column is a short-context control."""
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F32, I32
+
+    rng = np.random.default_rng(11)
+    KC, T, top = 4608, 3, 512  # a prefilter step's compact entries (PREFILTER_BLOCKS * 8)
+    ctx = 524288  # a 512k context: ratio-1 positions 0 .. 524287
+    score = rng.standard_normal((T, KC)).astype(np.float32)
+    cpos = np.empty((T, KC), np.int32)
+    pool = np.setdiff1d(np.arange(ctx, dtype=np.int32), [300000, 524287])
+    for t in range(2):
+        # distinct positions over the whole context, 300000 and 524287 among them, carrying the two highest
+        # scores so a truncated field cannot produce the wanted set
+        cpos[t] = np.sort(np.concatenate([rng.choice(pool, KC - 2, replace=False), [300000, 524287]]))
+        score[t, np.searchsorted(cpos[t], 524287)] = 100.0
+        score[t, np.searchsorted(cpos[t], 300000)] = 99.0
+    cpos[2] = np.sort(rng.choice(16384, KC, replace=False)).astype(np.int32)  # the short-context control
+    vis = np.array([ctx, ctx, 16384], np.int32)
+    g = Graph(device, "t_ds41_cselect_long")
+    sc, cp, V = g.input("score", (KC, T), F32), g.input("cpos", (KC, T), I32), g.input("vis", (T,), I32)
+    VC = g.input("visc", (T,), I32)
+    m = g.tensor((KC, T), F32)
+    g.node("rg_ix_cfix_f32", [sc, cp, V], [m])
+    thr = g.tensor((64, T), I32)
+    g.node("rg_ix_thr_f32", [m, VC], [thr], struct.pack("i", top))
+    cnt, gsum = g.tensor((KC // 64, T), I32), g.tensor((-(-KC // 4096), T), I32)  # ceil(KC/4096) rows: the kernel reads ceil(nb/64)
+    g.node("rg_ix_bcnt_f32", [m, VC, thr], [cnt, gsum])
+    g.node("rg_ix_list_map_f32", [m, VC, thr, cnt, gsum, cp],
+           [g.input("list", (top, T), I32), g.input("lslots", (8, T), I32)], struct.pack("iii", max(1, 48 // T), top, 8))  # fmt: skip
+    out = run_graph(device, recipes, g, {
+        "score": score, "cpos": cpos, "vis": vis, "visc": np.full(T, KC, np.int32),
+        "list": np.zeros((T, top), np.int32), "lslots": np.zeros((T, 8), np.int32)}, ["list", "lslots"])  # fmt: skip
+    for t in range(T):
+        live = cpos[t] < vis[t]
+        order = np.argsort(-np.where(live, score[t], -np.inf), kind="stable")[:top]
+        want = set(cpos[t, order[live[order]]].tolist())
+        n = int(out["lslots"][t, 4])
+        assert n == top, (t, n)
+        got = set(out["list"][t, :n].tolist())
+        assert got == want, (t, sorted(want - got)[:8], sorted(got - want)[:8])
+        # The list is ascending in position except the final two slots, where the last block fills from both ends
+        # (a pre-existing fill artefact, present on a short context too, and harmless: the consumers treat the
+        # list as a set). The set and the count are the contract, so they are what this gate asserts.
+    # the positions the old 18-bit field truncated come back as themselves, not as position & 0x3FFFF
+    listed = [set(out["list"][t, :top].tolist()) for t in range(T)]
+    assert {524287, 300000} <= listed[0], sorted(listed[0])[-4:]
+    assert {524287, 300000} <= listed[1], sorted(listed[1])[-4:]
+    assert 524287 not in listed[2] and 300000 not in listed[2]
+
+
 def fp8_rows(keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Keys (n, 128) as FP8 bytes with a power-of-two scale each (mla_store_i8's storage)."""
     s = np.array([pow2_scale(float(np.abs(k).max())) for k in keys])

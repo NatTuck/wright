@@ -23,11 +23,10 @@ static inline uint64 mkey(float64 v)
 }
 
 // entries [a, b) of the list vector whose first entry is vb, from lanes [a - vb, b - vb) of v (keyed values)
-#ifdef MAP
-#define DECODE(v) (((v) ^ (int64)BIAS) & (int64)0x3FFFF)
-#else
+// A key is the entry's position, biased into a signed int so that one min or max finds both ends. The position
+// takes the whole word: a ratio-1 layer's positions reach 524287 at a 512k context, so there is no room beside
+// it for the compact row index, which only ever ordered the key (cpos is monotone in the row index).
 #define DECODE(v) ((v) ^ (int64)BIAS)
-#endif
 #define FLUSH(vb, a, b, v) \
     { \
         int5 co_ = {(a), c, 0, 0, 0}; \
@@ -125,7 +124,8 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                     const uint64 k = mkey(v_f32_ld_tnsr_b(sc, score));
                     const int64 pos = lane + (int64)(b * 64);
 #ifdef MAP
-                    const int64 key = ((pos << 18) | v_i32_ld_tnsr_b(sc, cpos)) ^ (int64)BIAS;
+                    // the position of the compact entry in this row (cpos), not its row index: pos is the row
+                    const int64 key = v_i32_ld_tnsr_b(sc, cpos) ^ (int64)BIAS;
 #else
                     const int64 key = pos ^ (int64)BIAS;
 #endif
