@@ -1198,21 +1198,32 @@ BLOCK_TILE = INDEX_TILE // 8  # blocks of 8 entries in a tile
 def index_merge_graph(
     device: Device, dims: Dims, tokens: int, rows: int, run: int, heads: int = 0
 ) -> Graph:
-    """A tile group's merge: the top ``run`` of the running candidates (rows 0 .. run of ``ix_merge``) and the
-    group's own scores (rows run .. run + rows, written by ``index_score_graph``) -> the compacted running set
-    (``ix_sout``, ``ix_pos_out``) and the column's list (``ix_list``, ``ix_lslots``).
+    """A tile group's merge: the top ``run`` of the running candidates (``ix_run``, the running set of the groups
+    before it) and the group's own scores (``ix_tile``, written by ``index_score_graph``) -> the compacted
+    running set (``ix_sout``, ``ix_pos_out``) and the column's list (``ix_list``, ``ix_lslots``).
 
     ``ix_gvis`` (T,) is the group's visible rows (``run`` plus the group's visible keys), ``ix_gcnt`` (T,) the
     column's visible entries (at most ``run``) and ``ix_gbase`` (1,) the group's first key: the merge lists the
     top ``run`` exactly as one pass over every key would (see ds_ix_merge.c), so the tiling leaves the full
-    selection unchanged. With ``heads`` 0 the list is a block list (the candidate blocks of 8 entries)."""
+    selection unchanged. With ``heads`` 0 the list is a block list (the candidate blocks of 8 entries).
+
+    The merge reads one (run + rows, T) score buffer whose rows 0 .. run - 1 are the running candidates (its
+    visible-rows count is a prefix of the row index), and neither part can be written straight into it: a
+    (rows, T) tile's column stride is ``rows``, not ``run + rows``. So the running set (``ix_run``) and the
+    group's own scores (``ix_tile``) are two inputs and ds_ix_mcat concatenates them into the merge's buffer
+    (``ix_sout`` is the next group's ``ix_run``, so a group's output is the next group's input unchanged)."""
     d, T = dims, tokens
     lg = LayerGraph(device, f"ix_merge_T{T}_R{run}_{rows}", d, T)
     K = run + rows
-    score = lg.input("ix_merge", (K, T), F32)
     vis, exact = lg.input("ix_gvis", (T,), I32), lg.input("ix_gcnt", (T,), I32)
     pos, base = lg.input("ix_pos", (run, T), I32), lg.input("ix_gbase", (1,), I32)
     thr = lg.input("ix_thr", (64, T), I32)
+    score = lg.tensor((K, T), F32)
+    lg.node(
+        "rg_ds_ix_mcat_f32",
+        [lg.input("ix_run", (run, T), F32), lg.input("ix_tile", (rows, T), F32), base],
+        [score],
+    )
     lg.node("rg_ix_thr_f32", [score, vis], [thr], struct.pack("i", run))
     cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
     lg.node("rg_ix_bcnt_f32", [score, vis, thr], [cnt, gsum])
