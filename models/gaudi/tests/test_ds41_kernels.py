@@ -2024,3 +2024,138 @@ def test_direct_slot_merge_equals_the_scan(device, recipes, S):
     for out in outs[:-1]:
         for k in ("out", "m", "lc"):
             np.testing.assert_array_equal(out[k], outs[-1][k])
+
+
+def test_tiled_index_selection_matches_full(device, recipes):
+    """The tiled index selection lists exactly what one pass over every key does.
+
+    ``index_merge_graph`` merges a group's own 2048-key rows with the running top entries of the groups before
+    it (ds_ix_merge), so a column's 512 positions, their order and its count must equal ix_thr / ix_bcnt /
+    ix_list over the whole (kmax, T) score buffer. RED-first: the same comparison is made after one listed
+    entry's score is dropped, and the tiled result must then differ from the first one (the gate sees a change
+    of a single selected index)."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F32, I32
+
+    d = L.Dims(
+        hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+        experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+        route_scale=1.5, ranks=1,
+    )  # fmt: skip
+    rng = np.random.default_rng(7)
+    T, run, rows, groups = 5, L.INDEX_RUN, L.INDEX_TILE, 4
+    K = rows * groups
+    # columns that see everything, most of it, little, nothing, and a middle amount
+    vis = np.array([K, 5000, 900, 0, 3000], np.int32)
+    score = rng.standard_normal((K, T)).astype(np.float32)
+    for t in range(T):
+        score[vis[t] :, t] = -3.0e38  # past a column's visible entries
+    full = Graph(device, "t_ds41_ix_full")
+    sc, V = full.input("score", (K, T), F32), full.input("vis", (T,), I32)
+    fthr = full.tensor((64, T), I32)
+    full.node("rg_ix_thr_f32", [sc, V], [fthr], struct.pack("i", run))
+    fcnt, fgsum = full.tensor((K // 64, T), I32), full.tensor((K // 4096, T), I32)
+    full.node("rg_ix_bcnt_f32", [sc, V, fthr], [fcnt, fgsum])
+    full.node(
+        "rg_ix_list_f32",
+        [sc, V, fthr, fcnt, fgsum],
+        [full.input("list", (run, T), I32), full.input("lslots", (8, T), I32)],
+        struct.pack("iii", max(1, 48 // T), run, d.heads),
+    )
+    tiled = L.index_merge_graph(device, d, T, rows, run, heads=d.heads)
+    merge = [device.malloc(4 * (run + rows) * T) for _ in range(2)]
+    pos = [device.malloc(4 * run * T) for _ in range(2)]
+    one = {n: device.malloc(4 * T) for n in ("vis", "exact")}
+    base, thr = device.malloc(4), device.malloc(4 * 64 * T)
+    out = {n: device.malloc(4 * run * T) for n in ("list", "sout")}
+    slots = device.malloc(4 * 8 * T)
+    full_addr = {
+        "score": device.malloc(4 * K * T),
+        "vis": device.malloc(4 * T),
+        "list": device.malloc(4 * run * T),
+        "lslots": device.malloc(4 * 8 * T),
+    }
+    try:
+        device.h2d(full_addr["score"], np.ascontiguousarray(score))
+        device.h2d(full_addr["vis"], vis)
+        full_recipe = recipes.compile(full)
+        for name in full_recipe.persistent:
+            full_recipe.bind(name, full_addr[name])
+        full_recipe.launch()
+        device.sync()
+        want = device.d2h(full_addr["list"], (run, T), np.int32)
+        want_slots = device.d2h(full_addr["lslots"], (8, T), np.int32)
+
+        def run_tiled(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            recipe = recipes.compile(tiled)
+            for g in range(groups):
+                tile = np.ascontiguousarray(scores[g * rows : (g + 1) * rows, :])
+                device.h2d(merge[g % 2] + 4 * T * (0 if g == 0 else run), tile)
+                device.h2d(
+                    one["vis"],
+                    np.array(
+                        [run + max(0, min(int(vis[t]) - g * rows, rows)) for t in range(T)],
+                        np.int32,
+                    ),
+                )
+                device.h2d(
+                    one["exact"], np.array([min(int(v), run) for v in vis], np.int32)
+                )
+                device.h2d(base, np.array([g * rows], np.int32))
+                bind = {
+                    "ix_merge": merge[g % 2],
+                    "ix_gvis": one["vis"],
+                    "ix_gcnt": one["exact"],
+                    "ix_pos": pos[g % 2],
+                    "ix_gbase": base,
+                    "ix_thr": thr,
+                    "ix_lslots": slots,
+                    "ix_list": out["list"],
+                    "ix_sout": merge[1 - g % 2],
+                    "ix_pos_out": pos[1 - g % 2],
+                }
+                for name in recipe.persistent:
+                    recipe.bind(name, bind[name])
+                recipe.launch()
+                device.sync()
+            return (
+                device.d2h(out["list"], (run, T), np.int32),
+                device.d2h(slots, (8, T), np.int32),
+            )
+
+        got, got_slots = run_tiled(score)
+        for t in range(T):
+            n = int(want_slots[4, t])
+            assert int(got_slots[4, t]) == n, (t, got_slots[4, t], n)
+            assert got[:n, t].tolist() == want[:n, t].tolist(), (t, got[:n, t], want[:n, t])
+            assert got[:n, t].tolist() == sorted(set(got[:n, t].tolist())), (
+                "a key listed twice"
+            )
+        assert want_slots[4].tolist() == [512, 512, 512, 0, 512]
+        # RED: drop one listed entry's score and the tiled result must change with the full one
+        dropped = score.copy()
+        victim = int(want[0, 0])
+        dropped[victim, 0] = -3.0e38
+        device.h2d(full_addr["score"], np.ascontiguousarray(dropped))
+        full_recipe.launch()
+        device.sync()
+        want2 = device.d2h(full_addr["list"], (run, T), np.int32)
+        got2, _ = run_tiled(dropped)
+        assert got2[:512, 0].tolist() == want2[:512, 0].tolist()
+        assert got2[:512, 0].tolist() != got[:512, 0].tolist(), (
+            "the gate cannot see a selected entry change"
+        )
+        print("tiled selection == full selection on", T, "columns of", K, "keys")
+    finally:
+        for a in [
+            *merge,
+            *pos,
+            *one.values(),
+            base,
+            thr,
+            *out.values(),
+            slots,
+            *full_addr.values(),
+        ]:
+            device.free(a)

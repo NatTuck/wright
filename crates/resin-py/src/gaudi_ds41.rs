@@ -564,7 +564,7 @@ impl Ds41Executor {
         for ratio in 0..2 {
             r[R_RADIX[ratio]] = u64::from(counts.radix[ratio]);
             r[R_IX[ratio]] = counts.ix[ratio] as u64;
-            r[R_PF[ratio]] = u64::from(counts.pf[ratio]);
+            r[R_PF[ratio]] = counts.pf[ratio] as u64;
             r[R_DENSE[ratio]] = u64::from(counts.dense[ratio]);
         }
     }

@@ -109,11 +109,13 @@ def model(nranks: int):
             layer["attn_dense"] = op("x", "d")
             if out:
                 layer["out_dense"] = op("o", "d")
-        if ix:
-            layer["ix"] = ops(ix)
-            layer["sel"] = {key: op("s") for key in sel}
-        if ixc:
-            layer["ixc"] = ops(ixc)
+        if ix:  # the tiled chain: each group's score launches, its block maxima or mask, then its merge
+            layer["ixp"] = ops(ix)
+            layer["ixc2"] = ops(ix + 1)
+            layer["ixc_tail"] = [op("s")]
+        if ixc:  # the sparse reindex path
+            layer["ixsp"] = ops(ixc)
+            layer["ixsp_tail"] = [op("s")]
         return layer
 
     prog = SimpleNamespace(
@@ -255,13 +257,11 @@ def test_bounded_replay_makes_the_launch_loops_calls():
 
 def test_a_missing_selection_fails_like_the_launch_loop():
     M, m, prog = model(2)
-    del prog.layers[1]["sel"][
-        "sparse"
-    ]  # a sparse step then has no selection for layer 1
+    del prog.layers[1]["ixc2"]  # a candidate step then has no selection for layer 1
     s = M.Shape(1, False)
     program = m._step_program(s, prog)
     counts = {flag: False for flag in FLAGS} | {
-        "sparse": True,
+        "sparse": False,
         "cand": True,
         "ixc": 1,
         1: 1,
@@ -272,7 +272,7 @@ def test_a_missing_selection_fails_like_the_launch_loop():
         program.calls(registers(M, m, counts, None), m._sections(0, m.n_layers, None))
     # the embedding, layer 0 and layer 1's attention launch and partial collectives came first
     assert getattr(raised.value, "issued") > 0
-    counts["sparse"] = False
+    counts["cand"] = False
     expected = legacy(m, prog, s, counts)
     assert (
         program.calls(registers(M, m, counts, None), m._sections(0, m.n_layers, None))

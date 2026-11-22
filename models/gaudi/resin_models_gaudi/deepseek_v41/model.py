@@ -100,7 +100,7 @@ _R_COLUMN = 7  # the column whose logits a one-column head gathers
 _R_DENSE = {1: 8, 2: 9}
 _R_PF = {1: 10, 2: 11}
 _REGISTERS = 12
-WORKSPACE_RESERVE = 3 << 30
+WORKSPACE_RESERVE = 5 << 30
 # the sampler's outputs for up to MAX_T columns: tokens, logprobs, top ids, top logprobs (256-byte aligned)
 _SAMPLED = {
     "tok_out": 0,
@@ -172,9 +172,16 @@ class Shape:
         return 384 if self.prefill else 256
 
     @property
+    def blocks(self) -> int:
+        """query blocks of the step: one per row when decoding, ``qb`` columns each when prefilling"""
+        return self.T // self.qb
+
+    @property
     def ix_slots(self) -> int:
-        """index slots per launch (decode: fewer launches for wider steps)"""
-        return PREFILL_IX_SLOTS if self.prefill else 32 if self.T >= 4 else 16
+        """index slots per launch (decode: fewer launches for wider steps); at most eight blocks' worth, so a
+        launch covers whole tiles of a merge group and the group stays inside ix_thr's vector window"""
+        slots = PREFILL_IX_SLOTS if self.prefill else 32 if self.T >= 4 else 16
+        return min(slots, 8 * self.blocks)
 
     @property
     def groups2(self) -> int:
@@ -255,9 +262,22 @@ class _Tables:
         add("ix_visc", i32, T)
         for j in range(model.ixc_launches(shape)):
             add(f"ixc.{j}", i32, shape.ix_slots, 8)
+        add("ix_vis1", i32, T)
         for r in (1, 2):
             add(f"ix_vis{r}", i32, T)
             add(f"cmp_blocks{r}", i32, T, model.pages)
+            # the tiled index chain: per merge group the visible rows, the column's visible entries and the
+            # group's first key (and, decoding, the group's visible keys, the candidate blocks' rows and counts,
+            # and the block the group pins)
+            groups = model.ix_groups(shape, r)
+            add(f"ixg{r}", i32, groups, T)
+            add(f"ixn{r}", i32, groups, T)
+            add(f"ixs{r}", i32, groups)
+            if not shape.prefill:
+                add(f"ixt{r}", i32, groups, T)
+                add(f"ixb{r}", i32, groups, T)
+                add(f"ixbc{r}", i32, groups, T)
+                add(f"ixp{r}", i32, groups, T)
             for j in range(model.ix_launches(shape, r)):
                 add(f"ix{r}.{j}", i32, shape.ix_slots, 8)
                 for o in geo.owners:
@@ -509,10 +529,17 @@ class DeepSeekV41Gaudi:
 
     @property
     def workspace_reserve(self) -> int:
-        """Bytes kept out of the arena for the step tables and the shared workspace. The workspace grows with
-        the context: a prefill index selection over candidate blocks (index_select_graph, cand "user") holds
-        the masked scores (kmax, TMAX) and the block maxima (kb, TMAX) as f32."""
-        return max(WORKSPACE_RESERVE, 4 * TMAX * (self.kmax + self.kb) + (1 << 30))
+        """Bytes kept out of the arena for the step tables and the shared workspace. The indexer's scores are
+        tiled (index_merge_graph: one group's running candidates and its own keys), so the only term that grows
+        with the context is the published block maxima (kb, TMAX) as f32, which the candidate blocks and the
+        layers that read them share."""
+        pairs = max((L.INDEX_RUN + self.ix_rows(s)) * s.T for s in self.shapes)
+        decode = [s for s in self.shapes if not s.prefill]
+        bpairs = max((L.INDEX_BLOCKS + self.ix_tp(s) * L.BLOCK_TILE) * s.T for s in decode)
+        return max(
+            WORKSPACE_RESERVE,
+            4 * TMAX * self.kb + 8 * pairs + 8 * L.INDEX_RUN * TMAX + 4 * bpairs + (1 << 30),
+        )
 
     def _malloc(self, nbytes: int) -> int:
         address = self.device.malloc(nbytes)
@@ -548,15 +575,22 @@ class DeepSeekV41Gaudi:
         return "ix_visb" if cand else "ix_visb2"
 
     def _ix_names(
-        self, s: Shape, ratio: int, j: int, owner: int, head: dict
+        self, s: Shape, ratio: int, j: int, owner: int, head: dict, scratch: bool = False
     ) -> dict[str, int]:
-        """an index launch's tables: its slots and pages, or each part's rows of them"""
+        """an index launch's tables: its slots and pages, or each part's rows of them; ``scratch``: its scores go
+        to the scratch tile (a candidate layer's mask then writes the group's rows)"""
         base = self.table + self.tables[s].off[f"ix{ratio}.{j}"]
         pages = self.table + self.tables[s].off[f"ix{ratio}.{j}.{owner}"]
+        g = j // self.ix_lpg(s)
+        tile = (
+            self.ix_tile
+            if scratch
+            else self.ix_merge[g % 2] + 4 * s.T * (0 if g == 0 else L.INDEX_RUN)
+        )
         recipe = self.r["ix", s]
         if "ix_slots" in recipe.persistent:
-            return {**head, "ix_slots": base, "ix_pages": pages}
-        names = dict(head)
+            return {**head, "ix_slots": base, "ix_pages": pages, "ix_score": tile}
+        names = dict(head, ix_score=tile)
         P = sum(n.startswith("ix_slots.p") for n in recipe.persistent)
         Sp = s.ix_slots // P
         for p in range(P):
@@ -565,11 +599,153 @@ class DeepSeekV41Gaudi:
             names[f"ix_sink.p{p}"] = self.io["ix_sink"] + 256 * p
         return names
 
+    def ix_tp(self, shape: Shape) -> int:
+        """tiles (of ``INDEX_KEYS`` index keys) one merge group covers: a whole number of launches, at most eight,
+        and at most 4 M score floats (the group's merge buffer stays small and its threshold inside ix_thr's
+        vector window)"""
+        q = max(1, shape.ix_slots // max(1, shape.blocks))
+        tp = q
+        while tp * 2 <= 8 and (tp * 2) * INDEX_KEYS * shape.T <= 4 << 20:
+            tp *= 2
+        return tp
+
+    def ix_rows(self, shape: Shape) -> int:
+        """the score rows of one merge group (its tiles)"""
+        return self.ix_tp(shape) * INDEX_KEYS
+
+    def ix_lpg(self, shape: Shape) -> int:
+        """index launches per merge group"""
+        per_tile = max(1, -(-shape.blocks // shape.ix_slots))
+        return max(1, self.ix_tp(shape) * per_tile // max(1, shape.ix_slots // max(1, shape.blocks)))
+
+    def ix_groups(self, shape: Shape, ratio: int) -> int:
+        """merge groups a step of ``shape`` may need for ratio-``ratio`` keys"""
+        chunks = -(-self.kmax // ratio // INDEX_KEYS)
+        return -(-chunks // self.ix_tp(shape))
+
     def ix_launches(self, shape: Shape, ratio: int) -> int:
         """index launches a step of ``shape`` may need for ratio-``ratio`` keys"""
-        chunks = -(-self.kmax // ratio // INDEX_KEYS)
-        blocks = shape.T // shape.qb
-        return -(-blocks * chunks // shape.ix_slots)
+        return self.ix_groups(shape, ratio) * self.ix_lpg(shape)
+
+    def _ix_group_names(
+        self, s: Shape, ratio: int, g: int, head: dict, kind: str
+    ) -> dict:
+        """A merge group's tables: kind "m" the group's merge (its visible rows, the column's visible entries,
+        the group's first key, the running positions and the buffers it reads and writes), "b" its block maxima
+        (at its slice of the published array) with its pin, or "k" its candidate mask."""
+        tb, T, run = self.tables[s], s.T, L.INDEX_RUN
+        first = g * self.ix_tp(s) * L.BLOCK_TILE
+        tile = self.ix_merge[g % 2] + 4 * T * (0 if g == 0 else run)
+        names = dict(head)
+        if kind == "b":
+            names.update(
+                ix_tile=tile,
+                ix_bmax=self.io["cand_bmax"] + 4 * T * first,
+                ix_pin=self.table + tb.off[f"ixp{ratio}"] + 4 * T * g,
+                ix_tvis=self.table + tb.off[f"ixt{ratio}"] + 4 * T * g,
+            )
+        elif kind == "k":  # the mask reads the score launches' scratch and writes the group's rows
+            names.update(
+                ix_tile=self.ix_tile,
+                ix_tile_out=tile,
+                ix_tvis=self.table + tb.off[f"ixt{ratio}"] + 4 * T * g,
+                ix_bmax=self.io["cand_bmax"] + 4 * T * first,
+                cand_thr=self.io["cand_thr"],
+            )
+        else:
+            names.update(
+                ix_merge=self.ix_merge[g % 2],
+                ix_gvis=self.table + tb.off[f"ixg{ratio}"] + 4 * T * g,
+                ix_gcnt=self.table + tb.off[f"ixn{ratio}"] + 4 * T * g,
+                ix_pos=self.ix_pos[g % 2],
+                ix_pos_out=self.ix_pos[1 - g % 2],
+                ix_gbase=self.table + tb.off[f"ixs{ratio}"] + 4 * g,
+                ix_thr=self.io["ix_thr"] if g == 0 else self.io["ix_thr2"],
+                ix_lslots=self.io["ix_lslots"],
+                ix_list=self.io["ix_list"],
+                ix_sout=self.ix_merge[1 - g % 2],
+            )
+        return names
+
+    def _ix_ops(
+        self, s: Shape, ratio: int, layer: int, owner: int, head: dict, tail: dict, t
+    ) -> dict:
+        """The tiled index chain's launches of one index source layer: the plain arm (each group's score launches
+        and its merge), the candidate arm (with the group's block maxima, or its candidate mask, and the tail that
+        publishes the blocks), and the sparse reindex path's launches and selection."""
+        cfg = self.cfg
+        groups, per = self.ix_groups(s, ratio), self.ix_lpg(s)
+        cs = cfg.candidate_source_layer
+        cand = "" if cs < 0 or layer < cs else "source" if layer == cs else "user"
+        plain: list = []
+        cnd: list = []
+        for g in range(groups):
+            acc = [
+                self._op(
+                    self.r["ix", s],
+                    layer,
+                    self._ix_names(
+                        s, ratio, g * per + l, owner, head, scratch=cand == "user"
+                    ),
+                )
+                for l in range(per)
+            ]
+            plain.extend(acc)
+            cnd.extend(acc)
+            if not s.prefill:
+                kind = "k" if cand == "user" else "b"
+                cnd.append(
+                    self._op(
+                        self.r[f"ix{kind}", s],
+                        layer,
+                        self._ix_group_names(s, ratio, g, head, kind),
+                    )
+                )
+            merge = self._op(
+                self.r["ixm", s], layer, self._ix_group_names(s, ratio, g, head, "m")
+            )
+            plain.append(merge)
+            cnd.append(merge)
+        ops: dict = {"ixp": plain, "ixc2": cnd}
+        if not s.prefill:
+            sel = {
+                "ix_visb": self.table + self.tables[s].off["ix_visb"],
+                "cand_bmax": self.io["cand_bmax"],
+                "cand_thr": self.io["cand_thr"],
+                "cand_list": self.io["cand_list"],
+                "cand_slots": self.io["cand_slots"],
+            }
+            ops["ixc_tail"] = (
+                [self._op(self.r["ixbl", s], layer, sel)] if cand == "source" else []
+            )
+            if cand == "user" and self.ixc_launches(s):
+                ops["ixsp"] = [
+                    self._op(
+                        self.r["ixc", s],
+                        layer,
+                        {
+                            **head,
+                            **tail,
+                            "ix_slots": t(f"ixc.{j}"),
+                            "ix_score": self.io["ix_score_sparse"],
+                            "ix_cpos": self.io["ix_cpos"],
+                        },
+                    )
+                    for j in range(self.ixc_launches(s))
+                ]
+                ops["ixsp_tail"] = [
+                    self._op(
+                        self.r["sel", s, "user", "sparse"],
+                        layer,
+                        {
+                            "ix_score": self.io["ix_score_sparse"],
+                            "ix_cpos": self.io["ix_cpos"],
+                            "ix_vis": t(f"ix_vis{ratio}"),
+                            "ix_visc": t("ix_visc"),
+                        },
+                    )
+                ]
+        return ops
 
     # ------------------------------------------------------------------ weights
     def _load(self, barrier) -> dict[str, int]:
@@ -812,10 +988,12 @@ class DeepSeekV41Gaudi:
             "ix_q8": buf(L.INDEX_DIM * L.INDEX_HEADS * T),
             "ix_qs": buf(4 * L.INDEX_HEADS * T),
             "ix_w": buf(4 * L.INDEX_HEADS * T),
-            "ix_score": buf(4 * self.kmax * T),
+            "ix_thr2": buf(4 * 64 * T),
             "ix_list": buf(4 * L.INDEX_TOP * T),
             "ix_lslots": buf(4 * 8 * T),
             "cand_bmax": buf(4 * self.kb * T),
+            "ix_score_sparse": buf(4 * max(1, self.kc) * MAX_T),
+            "ix_cpos": buf(4 * max(1, self.kc) * MAX_T),
             "cand_thr": buf(4 * 64 * T),
             "cand_list": buf(4 * max(1, self.cfg.candidate_topk_blocks) * T),
             "cand_slots": buf(4 * 8 * T),
@@ -835,6 +1013,12 @@ class DeepSeekV41Gaudi:
             self.io["dsp_out"] = buf(4 * self.block * MAX_T)
             for k in range(self.stages):
                 self.io[f"dsp_sink{k}"] = buf(256)
+        # the tiled indexer: a merge group's running candidates and its own keys, alternating between the group
+        # that reads and the group that writes, and the running candidates' positions
+        pairs = max((L.INDEX_RUN + self.ix_rows(s)) * s.T for s in self.shapes)
+        self.ix_merge = [buf(4 * pairs), buf(4 * pairs)]
+        self.ix_pos = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
+        self.ix_tile = buf(4 * max(self.ix_rows(s) * s.T for s in self.shapes))
         self.logits = buf(4 * d.vocab * TMAX)
         self.logits_all = (
             buf(4 * d.vocab * TMAX * self.nranks) if self.nranks > 1 else self.logits
@@ -920,36 +1104,33 @@ class DeepSeekV41Gaudi:
                         capture=capture,
                     )  # fmt: skip
             if any(cfg.compress_ratios[i] for i in range(self.n_layers)):
+                rows, top = self.ix_rows(s), cfg.candidate_topk_blocks
                 graphs["ix", s] = L.index_score_graph(
-                    dev, d, T, s.ix_slots, INDEX_KEYS, nb, self.kmax, query_block=qb,
+                    dev, d, T, s.ix_slots, INDEX_KEYS, nb, rows, query_block=qb,
                     parts=PREFILL_IX_PARTS if s.prefill else 1,
                 )  # fmt: skip
-                cands = (
-                    ("", "source", "user") if cfg.candidate_source_layer >= 0 else ("",)
-                )
-                top = cfg.candidate_topk_blocks
-                for cand in cands:
-                    for radix in (False,) if s.prefill else (False, True):
-                        graphs["sel", s, cand, radix] = L.index_select_graph(
-                            dev, d, T, self.kmax, cand, top, radix,
-                            sparse=cand == "source" and not s.prefill, cand_blocks=self.kb,
-                        )  # fmt: skip
-                    if s.prefill and PREFILTER_BLOCKS:
-                        graphs["sel", s, cand, "pf"] = L.index_select_graph(
-                            dev, d, T, self.kmax, cand, top, cand_blocks=self.kb, prefilter=PREFILTER_BLOCKS
-                        )  # fmt: skip
-                if self.ixc_launches(s):
-                    graphs["ixc", s] = L.index_score_graph(
-                        dev, d, T, s.ix_slots, INDEX_KEYS, nb, self.kc, query_block=qb,
-                        cand_top=top, pages=self.pages,
-                    )  # fmt: skip
-                    graphs["sel", s, "user", "sparse"] = L.index_select_graph(
-                        dev, d, T, self.kc, "user", top, sparse=True
+                graphs["ixm", s] = L.index_merge_graph(dev, d, T, rows, L.INDEX_RUN)
+                if not s.prefill:  # decoding: the candidate blocks the source layer publishes
+                    graphs["ixb", s] = L.index_blocks_graph(dev, d, T, rows)
+                    graphs["ixk", s] = L.index_mask_graph(dev, d, T, rows)
+                    graphs["ixbs", s] = L.index_block_select_graph(
+                        dev, d, T, self.kb, top, False
                     )
+                    graphs["ixbl", s] = L.index_block_select_graph(
+                        dev, d, T, self.kb, top, True
+                    )
+                    if self.ixc_launches(s):
+                        graphs["ixc", s] = L.index_score_graph(
+                            dev, d, T, s.ix_slots, INDEX_KEYS, nb, self.kc, query_block=qb,
+                            cand_top=top, pages=self.pages,
+                        )  # fmt: skip
+                        graphs["sel", s, "user", "sparse"] = L.index_select_graph(
+                            dev, d, T, self.kc, "user", top, sparse=True
+                        )
                 graphs["out", s] = L.attention_out_graph(dev, d, T, nb, self.pages)
                 if self.dense(s):
                     graphs["out", s, "dense"] = L.attention_out_graph(
-                        dev, d, T, nb, self.pages, dense=DENSE_KEYS, scores=self.kmax
+                        dev, d, T, nb, self.pages, dense=DENSE_KEYS, scores=L.INDEX_TILE
                     )
             for layer in self.engram_layers:
                 if self.eg_sharded(s):
@@ -1168,54 +1349,20 @@ class DeepSeekV41Gaudi:
                         ops["attn_dense"] = self._op(
                             self.r[(*key, "dense")],
                             layer,
-                            {**common, **attn_io, **dense},
+                            {
+                                **common,
+                                **attn_io,
+                                **dense,
+                                "ix_score": self.ix_merge[0],
+                                "ix_thr": self.io["ix_thr"],
+                            },
                         )
                 else:
                     ops["attn"] = self._op(self.r[key], layer, {**common, **attn_io})
                     if layer in cfg.index_source_layers:
-                        ops["ix"] = [
-                            self._op(self.r["ix", s], layer, self._ix_names(s, ratio, j, owner, head))
-                            for j in range(self.ix_launches(s, ratio))
-                        ]  # fmt: skip
-                        cs = cfg.candidate_source_layer
-                        cand = (
-                            ""
-                            if cs < 0 or layer < cs
-                            else "source"
-                            if layer == cs
-                            else "user"
+                        ops.update(
+                            self._ix_ops(s, ratio, layer, owner, head, tail, t)
                         )
-                        names = {"ix_vis": t(f"ix_vis{ratio}"), "ix_visb": t("ix_visb")}
-                        ops["sel"] = {
-                            radix: self._op(self.r["sel", s, cand, radix], layer, names)
-                            for radix in ((False,) if s.prefill else (False, True))
-                        }
-                        if cand:  # steps where every column's blocks are all candidates
-                            ops["sel"]["all"] = self._op(
-                                self.r["sel", s, "", False], layer, names
-                            )
-                        if ("sel", s, cand, "pf") in self.r:
-                            pf = {
-                                **names,
-                                "ix_visb": t(self._visb(ratio)),
-                                "ix_visc": t("ix_visc"),
-                            }
-                            ops["sel"]["pf"] = self._op(
-                                self.r["sel", s, cand, "pf"], layer, pf
-                            )
-                            if cand:
-                                ops["sel"]["pf_all"] = self._op(
-                                    self.r["sel", s, "", "pf"], layer, pf
-                                )
-                        if cand == "user" and self.ixc_launches(s):
-                            ops["ixc"] = [
-                                self._op(self.r["ixc", s], layer, {**head, **tail, "ix_slots": t(f"ixc.{j}")})
-                                for j in range(self.ixc_launches(s))
-                            ]  # fmt: skip
-                            ops["sel"]["sparse"] = self._op(
-                                self.r["sel", s, "user", "sparse"], layer,
-                                {"ix_vis": t(f"ix_vis{ratio}"), "ix_visc": t("ix_visc")},
-                            )  # fmt: skip
                     ops["out"] = self._op(
                         self.r["out", s], layer, {**common, **tail, "p_out": p[pnext]}
                     )
@@ -1223,7 +1370,13 @@ class DeepSeekV41Gaudi:
                         ops["out_dense"] = self._op(
                             self.r["out", s, "dense"],
                             layer,
-                            {**common, **dense, "p_out": p[pnext]},
+                            {
+                                **common,
+                                **dense,
+                                "p_out": p[pnext],
+                                "ix_score": self.ix_merge[0],
+                                "ix_thr": self.io["ix_thr"],
+                            },
                         )
             if layer == self.cut and s.prefill:
                 prog.store = self._op(self.r["store", s], layer, {**common, **attn_io})
@@ -1405,42 +1558,36 @@ class DeepSeekV41Gaudi:
                 launch(ops[name])
 
         def index(ratio: int, ops: dict) -> None:
-            """``_run_layer``'s index launches and selection: by candidates in a sparse step, else the first
-            counts[ratio] index launches and the prefiltered, all, or radix selection"""
-            sel, arms = ops["sel"], []
-
-            def arm(register: int, launches: list, select) -> int:
-                arms.append((register, launches, select))
-                return len(arms) - 1
-
-            sparse = arm(_R_IXC, ops["ixc"], sel["sparse"]) if "ixc" in ops and "sparse" in sel else -1
-            every = arm(_R_IX[ratio], ops["ix"], sel["all"]) if "all" in sel else -1
-            radix = [arm(_R_IX[ratio], ops["ix"], sel[r]) if r in sel else -1 for r in (False, True)]
-            pf = arm(_R_IX[ratio], ops["ix"], sel["pf"]) if "pf" in sel else -1
-            pf_all = arm(_R_IX[ratio], ops["ix"], sel["pf_all"]) if "pf_all" in sel else -1
-
-            def chosen(is_sparse: int, cand: int, by_radix: int, prefiltered: int) -> int:
-                if is_sparse and "ixc" in ops:
-                    return sparse
-                if prefiltered and "pf" in sel:
-                    return pf_all if not cand and "pf_all" in sel else pf
-                if not cand and "all" in sel:
-                    return every
-                return radix[by_radix]
-
-            # keys (sparse, cand, radix, prefiltered), the first the most significant; -1: a step _run_layer
-            # cannot make
-            table = [chosen(*key) for key in np.ndindex(2, 2, 2, 2)]
-            keys = [(_R_SPARSE, 2), (_R_CAND, 2), (_R_RADIX[ratio], 2), (_R_PF[ratio], 2)]
-            native.select(keys, table)
-            for register, launches, select in arms:
+            """The tiled index chain: the plain arm (each group's score launches and its merge), the candidate
+            arm (with each group's block maxima or candidate mask, and the tail that publishes the blocks), and
+            the sparse reindex path (its launches over the candidate blocks and their compact selection). The
+            register of each arm takes its groups' launches, so a step runs only the groups it needs."""
+            plain = ops["ixp"]
+            arms = (
+                (plain, _R_IX[ratio], []),
+                (ops.get("ixc2", plain), _R_PF[ratio], ops.get("ixc_tail", [])),
+                (ops.get("ixsp", plain), _R_IXC, ops.get("ixsp_tail", [])),
+            )
+            # a step that needs an arm the layer does not have is an error, not a silent fallback
+            native.select(
+                [(_R_SPARSE, 2), (_R_CAND, 2)],
+                [
+                    0,
+                    1 if "ixc2" in ops else -1,
+                    2 if "ixsp" in ops else 0,
+                    2 if "ixsp" in ops else 1,
+                ],
+            )
+            for arm, register, tail in arms:
                 native.arm()
                 native.take(register)
-                for op in launches:
+                for op in arm:
                     launch(op)
                 native.end()
-                launch(select)
+                for op in tail:
+                    launch(op)
             native.end()
+
 
         native.section("embed")
         launch(prog.embed)
@@ -1458,7 +1605,7 @@ class DeepSeekV41Gaudi:
                         native.allgather(self.io["eg_kv"], self.io["eg_kv_all"], self.eg_rows_r * T)
                     launch(ops["eg_gate"])
             dense_or(ops, "attn", ratio)
-            if "ix" in ops:
+            if "ixp" in ops:
                 index(ratio, ops)
             if "out" in ops:
                 dense_or(ops, "out", ratio)
@@ -1581,6 +1728,18 @@ class DeepSeekV41Gaudi:
                     if self.engram == "host"
                     else [],
                     "ix_slots": s.ix_slots,
+                    "ix_vis1": off["ix_vis1"],
+                    "ix_tp": self.ix_tp(s),
+                    "ix_lpg": self.ix_lpg(s),
+                    "ix_rows": self.ix_rows(s),
+                    "ix_groups": (self.ix_groups(s, 1), self.ix_groups(s, 2)),
+                    "ixg": (off["ixg1"], off["ixg2"]),
+                    "ixn": (off["ixn1"], off["ixn2"]),
+                    "ixs": (off["ixs1"], off["ixs2"]),
+                    "ixt": (off["ixt1"], off["ixt2"]) if not s.prefill else (0, 0),
+                    "ixb": (off["ixb1"], off["ixb2"]) if not s.prefill else (0, 0),
+                    "ixbc": (off["ixbc1"], off["ixbc2"]) if not s.prefill else (0, 0),
+                    "ixp": (off["ixp1"], off["ixp2"]) if not s.prefill else (0, 0),
                     "nbytes": tb.nbytes,
                     "zero": [(int(a), int(b)) for a, b in tb.zero],
                     "tok": off["tok"],

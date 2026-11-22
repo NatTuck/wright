@@ -396,6 +396,9 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_smean")) return geom_elem64;
     if (is("ds_argmax")) return geom_columns;
     if (is("ds_mk_add")) return geom_mk_add;
+    if (is("ds_ix_merge")) return geom_ix_list;
+    if (is("ds_ix_bmax")) return geom_k512;
+    if (is("ds_ix_pin")) return geom_columns;
     if (is("ds_ix_gather")) return geom_pairs16;
     return nullptr;
 }

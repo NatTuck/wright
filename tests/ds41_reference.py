@@ -92,25 +92,23 @@ class Reference(_Model):
         ratio = self.cfg.compress_ratios[layer]
         dense = counts.get(("dense", ratio), False)
         (ops["attn_dense"] if dense and "attn_dense" in ops else ops["attn"]).run(lib)
-        if "ix" in ops:
+        if "ixp" in ops:
             ratio = self.cfg.compress_ratios[layer]
-            sel = ops["sel"]
-            if counts["sparse"] and "ixc" in ops:
+            plain = ops["ixp"]
+            if counts["sparse"] and "ixsp" in ops:
                 # only the candidate entries
-                for op in ops["ixc"][: counts["ixc"]]:
+                for op in ops["ixsp"][: counts["ixc"]]:
                     op.run(lib)
-                sel["sparse"].run(lib)
+                for op in ops.get("ixsp_tail", []):
+                    op.run(lib)
+            elif counts["cand"]:
+                for op in ops["ixc2"][: counts["pf", ratio]]:
+                    op.run(lib)
+                for op in ops.get("ixc_tail", []):
+                    op.run(lib)
             else:
-                for op in ops["ix"][: counts[ratio]]:
+                for op in plain[: counts[ratio]]:
                     op.run(lib)
-                if counts["pf", ratio] and "pf" in sel:
-                    sel[
-                        "pf_all" if not counts["cand"] and "pf_all" in sel else "pf"
-                    ].run(lib)
-                elif not counts["cand"] and "all" in sel:
-                    sel["all"].run(lib)
-                else:
-                    sel[counts["radix", ratio]].run(lib)
         if "out" in ops:
             (ops["out_dense"] if dense and "out_dense" in ops else ops["out"]).run(lib)
         if ccl:
@@ -402,25 +400,31 @@ class Reference(_Model):
             store[g, 6] = e
             store[g, 3] = page + PAGE_TOKENS
             store[g, 4] = e
-        # indexer: visible entries, compressed pages, index launches
-        counts = {"sparse": False, "cand": True}
+        # indexer: the tiled chain's groups, its per-group tables and its launches
+        counts = {"sparse": False, "cand": False}
+        v["ix_vis1"][:] = self.ix_rows(s) + 1
         lanes = np.arange(INDEX_KEYS // PAGE_TOKENS)
+        tp, lpg = self.ix_tp(s), self.ix_lpg(s)
         for ratio in (1, 2):
             v[f"ix_vis{ratio}"][:] = np.where(live, (pos + 1) // ratio, 0)
-            counts["radix", ratio] = (
-                not s.prefill and int(v[f"ix_vis{ratio}"].max()) > RADIX_MIN
-            )
             vis = v[f"ix_vis{ratio}"]
-            counts["pf", ratio] = bool(
-                s.prefill
-                and PREFILTER_BLOCKS
-                and np.all(vis[live] > max(PREFILTER_MIN, 8 * PREFILTER_BLOCKS))
+            counts["radix", ratio] = False
+            # each query block: its row, first column, position and visible keys (its last column's)
+            nblk = s.T // s.qb
+            blk: list = [None] * nblk
+            for k, r in enumerate(rows):
+                seen_all = (r.pos0 + r.real) // ratio
+                for b0 in range(0, r.real, s.qb):
+                    q = r.pos0 + b0
+                    seen = min((q + s.qb) // ratio, seen_all)
+                    blk[b0 // s.qb] = (k, r.column + b0, q, seen)
+            nb = -(-vis // 8)
+            v[self._visb(ratio)][:] = np.minimum(-(-nb // 64) * 64, self.kmax // 8)
+            counts["cand"] = bool(
+                not s.prefill
+                and cfg.candidate_source_layer >= 0
+                and int(vis.max()) > cfg.candidate_topk_blocks * 8
             )
-            if counts["pf", ratio]:
-                # blocks of 8 entries, in whole groups of 64 for ix_thr; the packed entries
-                nb = -(-vis // 8)
-                v[self._visb(ratio)][:] = np.minimum(-(-nb // 64) * 64, self.kmax // 8)
-                v["ix_visc"][:] = np.where(live, 8 * PREFILTER_BLOCKS, 0)
             counts["dense", ratio] = self.dense(s) and bool(
                 np.all(vis[live] <= DENSE_KEYS)
             )
@@ -450,38 +454,33 @@ class Reference(_Model):
                         + PAIR_ROWS * (pg % op),
                         -1,
                     )
-            if (
-                cfg.candidate_source_layer >= 0
-                and ratio == cfg.compress_ratios[cfg.candidate_source_layer]
-            ):
-                # candidate blocks of 8 entries, in whole groups of 64 for ix_thr
-                vis = v[f"ix_vis{ratio}"]
-                nb = -(-vis // 8)
-                v["ix_visb"][:] = np.minimum(-(-nb // 64) * 64, self.kmax // 8)
-                # every live column sees more than kc entries: index sources after the candidate source score
-                # only their columns' candidate entries
-                counts["cand"] = int(vis.max()) > cfg.candidate_topk_blocks * 8
-                sparse = self.ixc_launches(s) > 0 and bool(np.all(vis[live] > self.kc))
-                counts["sparse"] = sparse
-                if sparse:
-                    v["ix_visc"][:] = np.where(live, self.kc, 0)
-                    lc = np.flatnonzero(live)
-                    chunks = self.kc // INDEX_KEYS
-                    rec = np.zeros((len(lc) * chunks, 8), np.int64)
-                    rec[:, 1] = L.INDEX_HEADS * np.repeat(lc, chunks)
-                    # query position kc - 1: every compact entry is visible to the slot
-                    rec[:, 2] = self.kc - 1
-                    rec[:, 3] = INDEX_KEYS * np.tile(np.arange(chunks), len(lc))
-                    rec[:, 4] = self.kc
-                    rec[:, 5] = np.repeat(lc, chunks)
-                    rec[:, 6] = 1
-                    n = self.ixc_launches(s)
-                    table = np.zeros((n * s.ix_slots, 8), np.int64)
-                    table[:, 0] = -1
-                    table[: len(rec)] = rec
-                    counts["ixc"] = -(-len(rec) // s.ix_slots)
-                    for j in range(n):
-                        v[f"ixc.{j}"][:] = table[j * s.ix_slots : (j + 1) * s.ix_slots]
+            # every live column sees more than kc entries: index sources after the candidate source score
+            # only their columns' candidate entries
+            sparse = (
+                self.ixc_launches(s) > 0
+                and cfg.candidate_source_layer >= 0
+                and bool(np.all(vis[live] > self.kc))
+            )
+            counts["sparse"] = sparse
+            if sparse:
+                v["ix_visc"][:] = np.where(live, self.kc, 0)
+                lc = np.flatnonzero(live)
+                chunks = self.kc // INDEX_KEYS
+                rec = np.zeros((len(lc) * chunks, 8), np.int64)
+                rec[:, 1] = L.INDEX_HEADS * np.repeat(lc, chunks)
+                # query position kc - 1: every compact entry is visible to the slot
+                rec[:, 2] = self.kc - 1
+                rec[:, 3] = INDEX_KEYS * np.tile(np.arange(chunks), len(lc))
+                rec[:, 4] = self.kc
+                rec[:, 5] = np.repeat(lc, chunks)
+                rec[:, 6] = 1
+                n = self.ixc_launches(s)
+                table = np.zeros((n * s.ix_slots, 8), np.int64)
+                table[:, 0] = -1
+                table[: len(rec)] = rec
+                counts["ixc"] = -(-len(rec) // s.ix_slots)
+                for j in range(n):
+                    v[f"ixc.{j}"][:] = table[j * s.ix_slots : (j + 1) * s.ix_slots]
             per = HISTORY_TOKENS // ratio // PAGE_TOKENS  # pages per HISTORY block
             pr = np.where(
                 hist[:, :, None] >= 0, hist[:, :, None] + PAIR_ROWS * np.arange(per), -1
@@ -492,61 +491,68 @@ class Reference(_Model):
                 blocks[cols] = pr.reshape(R, -1)[0, : self.pages]
             else:
                 blocks[cols] = pr.reshape(R, -1)[cr, : self.pages]
-            rec = []  # (row, b0, q0, key0, klen)
-            for k, r in enumerate(rows):
-                seen_all = (r.pos0 + r.real) // ratio
-                for b0 in range(0, r.real, s.qb):
-                    q = r.pos0 + b0
-                    seen = min((q + s.qb) // ratio, seen_all)
-                    rec.extend(
-                        (k, b0, q, key, seen_all) for key in range(0, seen, INDEX_KEYS)
-                    )
-            launches = -(-len(rec) // s.ix_slots)
-            if launches > self.ix_launches(s, ratio):
-                raise ValueError("a step's index launches exceed the table capacity")
-            counts[ratio] = launches
-            if not rec:
-                continue
-            rk, rb, rq, rkey, rlen = np.array(rec, np.int64).T
-            col = np.array([rows[k].column for k in rk], np.int64) + rb
-            table = np.zeros((launches * s.ix_slots, 8), np.int64)
-            table[:, 0] = -1
-            table[: len(rec)] = np.stack(
-                [
-                    np.zeros_like(rk),
-                    L.INDEX_HEADS * col,
-                    rq,
-                    rkey,
-                    rlen,
-                    col,
-                    np.full_like(rk, ratio),
-                    np.zeros_like(rk),
-                ],
-                1,
-            )
-            P = rkey[:, None] // PAGE_TOKENS + lanes
-            ok = (
-                lanes
-                < np.minimum(len(lanes), -(-(rlen - rkey) // PAGE_TOKENS))[:, None]
-            )
+            # the tiled chain: how many groups this step needs, and each group's tables
+            chunks = 0
+            for b in blk:
+                if b is not None:
+                    chunks = max(chunks, -(-b[3] // INDEX_KEYS))
+            used = -(-chunks // tp)
+            counts[ratio] = used * (lpg + 1)
+            counts["pf", ratio] = used * (lpg + 2)
             owners = [o for o in geo.owners if cfg.compress_ratios[o] == ratio]
-            for o in owners:
-                op, ooff = geo.owner_pages(o), geo.owner_offset(o)
-                pages_o = np.full((launches * s.ix_slots, len(lanes)), -1, np.int64)
-                pages_o[: len(rec)] = np.where(
-                    ok,
-                    hist[rk[:, None], np.where(ok, P // op, 0)]
-                    + ooff
-                    + PAIR_ROWS * (P % op)
-                    + PAGE_ROWS,
-                    -1,
-                )
-                for j in range(launches):
-                    v[f"ix{ratio}.{j}.{o}"][:] = pages_o[
-                        j * s.ix_slots : (j + 1) * s.ix_slots
-                    ]
-            for j in range(launches):
-                v[f"ix{ratio}.{j}"][:] = table[j * s.ix_slots : (j + 1) * s.ix_slots]
+            for g in range(self.ix_groups(s, ratio)):
+                first = g * tp * INDEX_KEYS
+                keys = np.clip(vis - first, 0, tp * INDEX_KEYS)
+                v[f"ixs{ratio}"][g] = first
+                v[f"ixg{ratio}"][g] = keys + L.INDEX_RUN
+                v[f"ixn{ratio}"][g] = np.minimum(vis, L.INDEX_RUN)
+                if not s.prefill:
+                    v[f"ixt{ratio}"][g] = keys
+                    newest = np.where(vis > 0, (vis - 1) // 8 - first // 8, -1)
+                    v[f"ixp{ratio}"][g] = np.where(
+                        (newest >= 0) & (newest < tp * (INDEX_KEYS // 8)), newest, -1
+                    )
+            for g in range(self.ix_groups(s, ratio)):
+                for l in range(lpg):
+                    table = np.zeros((s.ix_slots, 8), np.int64)
+                    table[:, 0] = -1
+                    pages = {o: np.full((s.ix_slots, len(lanes)), -1, np.int64) for o in owners}
+                    for si in range(s.ix_slots):
+                        rg = l * s.ix_slots + si
+                        tile = g * tp + rg // nblk
+                        b = rg % nblk
+                        first = tile * INDEX_KEYS
+                        if blk[b] is None or blk[b][3] <= first:
+                            continue
+                        k, col, q, seen = blk[b]
+                        ln = min(seen - first, INDEX_KEYS)
+                        key0 = 0 if tile == 0 else L.INDEX_RUN + (tile - g * tp) * INDEX_KEYS
+                        table[si] = [
+                            0,
+                            L.INDEX_HEADS * col,
+                            q,
+                            key0,
+                            key0 + ln,
+                            col,
+                            ratio,
+                            0,
+                        ]
+                        P = first // PAGE_TOKENS + lanes
+                        ok = lanes < min(len(lanes), -(-ln // PAGE_TOKENS))
+                        for o in owners:
+                            op, ooff = geo.owner_pages(o), geo.owner_offset(o)
+                            pages[o][si] = np.where(
+                                ok,
+                                hist[k, np.where(ok, P // op, 0)]
+                                + ooff
+                                + PAIR_ROWS * (P % op)
+                                + PAGE_ROWS,
+                                -1,
+                            )
+                    j = g * lpg + l
+                    v[f"ix{ratio}.{j}"][:] = table
+                    for o in owners:
+                        v[f"ix{ratio}.{j}.{o}"][:] = pages[o]
         return counts
 
     def _engram_ids(

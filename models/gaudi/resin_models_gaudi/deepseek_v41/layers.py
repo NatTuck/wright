@@ -725,8 +725,16 @@ __all__ = [
     "embed_graph",
     "ffn_graph",
     "head_graph",
+    "index_block_select_graph",
+    "index_blocks_graph",
+    "index_mask_graph",
+    "index_merge_graph",
     "index_score_graph",
     "index_select_graph",
+    "INDEX_TILE",
+    "INDEX_RUN",
+    "INDEX_BLOCKS",
+    "BLOCK_TILE",
 ]
 
 
@@ -1139,6 +1147,107 @@ def index_select_graph(
         [lg.input("ix_list", (INDEX_TOP, T), I32), lg.input("ix_lslots", (8, T), I32)],
         struct.pack("iii", max(1, 48 // T), INDEX_TOP, d.heads),
     )
+    return lg.g
+
+
+INDEX_TILE = 2048  # index keys per tile (one launch's chunk of a slot)
+INDEX_RUN = INDEX_TOP  # the rows of a tile group's running candidates (the top entries so far)
+INDEX_BLOCKS = 2048  # candidate blocks of 8 entries (candidate_topk_blocks)
+BLOCK_TILE = INDEX_TILE // 8  # blocks of 8 entries in a tile
+
+
+def index_merge_graph(
+    device: Device, dims: Dims, tokens: int, rows: int, run: int, heads: int = 0
+) -> Graph:
+    """A tile group's merge: the top ``run`` of the running candidates (rows 0 .. run of ``ix_merge``) and the
+    group's own scores (rows run .. run + rows, written by ``index_score_graph``) -> the compacted running set
+    (``ix_sout``, ``ix_pos_out``) and the column's list (``ix_list``, ``ix_lslots``).
+
+    ``ix_gvis`` (T,) is the group's visible rows (``run`` plus the group's visible keys), ``ix_gcnt`` (T,) the
+    column's visible entries (at most ``run``) and ``ix_gbase`` (1,) the group's first key: the merge lists the
+    top ``run`` exactly as one pass over every key would (see ds_ix_merge.c), so the tiling leaves the full
+    selection unchanged. With ``heads`` 0 the list is a block list (the candidate blocks of 8 entries)."""
+    d, T = dims, tokens
+    lg = LayerGraph(device, f"ix_merge_T{T}_R{run}_{rows}", d, T)
+    K = run + rows
+    score = lg.input("ix_merge", (K, T), F32)
+    vis, exact = lg.input("ix_gvis", (T,), I32), lg.input("ix_gcnt", (T,), I32)
+    pos, base = lg.input("ix_pos", (run, T), I32), lg.input("ix_gbase", (1,), I32)
+    thr = lg.input("ix_thr", (64, T), I32)
+    lg.node("rg_ix_thr_f32", [score, vis], [thr], struct.pack("i", run))
+    cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
+    lg.node("rg_ix_bcnt_f32", [score, vis, thr], [cnt, gsum])
+    lg.node(
+        "rg_ds_ix_merge_f32",
+        [score, vis, thr, cnt, gsum, exact, pos, base],
+        [
+            lg.input("ix_lslots", (8, T), I32),
+            lg.input("ix_list", (run, T), I32),
+            lg.input("ix_sout", (run, T), F32),
+            lg.input("ix_pos_out", (run, T), I32),
+        ],
+        struct.pack("iiii", max(1, 48 // T), run, heads, run),
+    )
+    return lg.g
+
+
+def index_blocks_graph(device: Device, dims: Dims, tokens: int, rows: int) -> Graph:
+    """A tile group's candidate blocks: the maxima of the group's blocks of 8 entries (``ix_bmax``, which the
+    caller binds to the group's slice of the published block maxima) with the column's ``ix_pin`` (T,) block (its
+    newest, or -1 when another group holds it) set to +inf, and ``ix_tvis`` (T,) the group's visible keys."""
+    d, T = dims, tokens
+    lg = LayerGraph(device, f"ix_blocks_T{T}_{rows}", d, T)
+    lg.node(
+        "rg_ds_ix_bmax_f32",
+        [
+            lg.input("ix_tile", (rows, T), F32),
+            lg.input("ix_tvis", (T,), I32),
+            lg.input("ix_pin", (T,), I32),
+        ],
+        [lg.input("ix_bmax", (rows // 8, T), F32)],
+    )
+    return lg.g
+
+
+def index_mask_graph(device: Device, dims: Dims, tokens: int, rows: int) -> Graph:
+    """A tile group's scores masked to the candidate blocks the source layer published (``rg_ix_cmask`` over the
+    group's rows, read from the published block maxima and ``cand_thr``); the caller binds ``ix_tile`` and
+    ``ix_tile_out`` to the same rows."""
+    d, T = dims, tokens
+    lg = LayerGraph(device, f"ix_mask_T{T}_{rows}", d, T)
+    lg.node(
+        "rg_ix_cmask_f32",
+        [
+            lg.input("ix_tile", (rows, T), F32),
+            lg.input("ix_tvis", (T,), I32),
+            lg.input("ix_bmax", (rows // 8, T), F32),
+            lg.input("cand_thr", (64, T), I32),
+        ],
+        [lg.input("ix_tile_out", (rows, T), F32)],
+    )
+    return lg.g
+
+
+def index_block_select_graph(
+    device: Device, dims: Dims, tokens: int, blocks: int, top: int, listed: bool
+) -> Graph:
+    """A column's candidate blocks from the published block maxima ``cand_bmax`` (blocks, T): the threshold
+    ``cand_thr`` (64, T) that keeps the ``top`` largest, and with ``listed`` their list (``cand_list`` (top, T),
+    ``cand_slots`` (8, T))."""
+    d, T = dims, tokens
+    lg = LayerGraph(device, f"ix_bsel_T{T}_K{blocks}" + ("_l" if listed else ""), d, T)
+    bmax, visb = lg.input("cand_bmax", (blocks, T), F32), lg.input("ix_visb", (T,), I32)
+    thr = lg.input("cand_thr", (64, T), I32)
+    lg.node("rg_ix_thr_f32", [bmax, visb], [thr], struct.pack("i", top))
+    if listed:
+        cnt, gsum = lg.tensor((blocks // 64, T), I32), lg.tensor((-(-blocks // 4096), T), I32)
+        lg.node("rg_ix_bcnt_f32", [bmax, visb, thr], [cnt, gsum])
+        lg.node(
+            "rg_ix_list_f32",
+            [bmax, visb, thr, cnt, gsum],
+            [lg.input("cand_list", (top, T), I32), lg.input("cand_slots", (8, T), I32)],
+            struct.pack("iii", max(1, 48 // T), top, 0),
+        )
     return lg.g
 
 

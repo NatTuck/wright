@@ -15,6 +15,8 @@ pub const PAGE_ROWS: i64 = 129;
 pub const INDEX_ROWS: i64 = 33;
 pub const PAIR_ROWS: i64 = PAGE_ROWS + INDEX_ROWS;
 pub const INDEX_KEYS: i64 = 2048;
+/// the rows of a merge group's running candidates (the top index entries; `INDEX_TOP` of the Python side)
+pub const INDEX_RUN: i64 = 512;
 /// pending-state rows per (WINDOW block, ratio-2 owner): slot (position / 2) % PENDING_SLOTS (cache.PENDING_SLOTS)
 pub const PENDING_SLOTS: i64 = 4;
 const LANES: usize = (INDEX_KEYS / PAGE_TOKENS) as usize;
@@ -189,6 +191,24 @@ pub struct Tables {
     /// ratio-2 groups a step can complete (`Shape.groups2`)
     pub groups2: usize,
     pub ix_slots: usize,
+    /// tiles of `INDEX_KEYS` index keys per merge group, launches per group, the group's score rows, and the
+    /// groups a step may need per ratio
+    pub ix_tp: usize,
+    pub ix_lpg: usize,
+    pub ix_rows: usize,
+    pub ix_groups: [usize; 2],
+    /// per ratio and merge group: the group's visible rows (`ixg`), the column's visible entries (`ixn`) and the
+    /// group's first key (`ixs`); decoding also the group's visible keys (`ixt`), its candidate blocks' rows and
+    /// counts (`ixb`, `ixbc`) and the block it pins (`ixp`)
+    pub ixg: [usize; 2],
+    pub ixn: [usize; 2],
+    pub ixs: [usize; 2],
+    pub ixt: [usize; 2],
+    pub ixb: [usize; 2],
+    pub ixbc: [usize; 2],
+    pub ixp: [usize; 2],
+    /// (T,) the score rows of a group plus one: ix_bmax reads it so that it pins nothing
+    pub ix_vis1: usize,
     pub nbytes: usize,
     /// byte ranges zeroed before a fill (all but the tables written whole)
     pub zero: Vec<(usize, usize)>,
@@ -303,9 +323,10 @@ pub struct Counts {
     pub cand: bool,
     pub ixc: usize,
     pub radix: [bool; 2],
+    /// per ratio: the ops a step's plain and candidate index arms take (their groups' launches and merges)
     pub ix: [usize; 2],
-    /// per ratio: a prefill step's prefiltered selection, its dense attention
-    pub pf: [bool; 2],
+    pub pf: [usize; 2],
+    /// per ratio: a prefill step's dense attention
     pub dense: [bool; 2],
 }
 
@@ -607,10 +628,13 @@ pub fn fill(
     }
 
     prof.mark("compressor");
-    // indexer: visible entries, compressed pages, index launches
+    // indexer: the tiled chain's groups, its per-group tables and its launches. A group covers `ix_tp` tiles of
+    // INDEX_KEYS keys: the score buffer holds the group's own rows (from INDEX_RUN, or 0 for the first group) and
+    // the running candidates' in the rows before them, so the score rows are tile-local and the buffer never
+    // grows with the context.
     let mut counts = Counts {
         sparse: false,
-        cand: true,
+        cand: false,
         ..Counts::default()
     };
     for (ri, ratio) in [(0usize, 1i64), (1usize, 2i64)] {
@@ -621,41 +645,30 @@ pub fn fill(
             w.set(tables.ix_vis[ri], c, value);
         }
         let most = vis.iter().copied().max().unwrap_or(0);
-        counts.radix[ri] = !tables.prefill && most > model.radix_min;
-        let visb = |w: &mut Words<'_>, table: usize| {
-            for (c, &value) in vis.iter().enumerate() {
-                let blocks = (value + 7) / 8;
-                w.set(table, c, ((blocks + 63) / 64 * 64).min(model.kmax / 8));
+        // each query block: its row, first column, position and visible keys (its last column's)
+        let nblk = t / qb;
+        let mut blk: Vec<Option<(usize, i64, i64, i64)>> = vec![None; nblk];
+        for k in 0..r_count {
+            let (pos0, real) = (rows.pos0[k], rows.real[k]);
+            let seen_all = (pos0 + real) / ratio;
+            for b0 in (0..real).step_by(qb) {
+                let q = pos0 + b0;
+                let seen = ((q + qb as i64) / ratio).min(seen_all);
+                blk[(b0 / qb as i64) as usize] = Some((k, rows.column[k] + b0, q, seen));
             }
-        };
-        // a prefill step whose every column sees many entries: blocks of 8 entries, in whole groups of 64 for
-        // ix_thr, and the packed entries
-        counts.pf[ri] = tables.prefill
-            && model.prefilter_blocks > 0
-            && cols
-                .iter()
-                .all(|&c| vis[c] > model.prefilter_min.max(8 * model.prefilter_blocks));
-        if counts.pf[ri] {
-            let candidate_ratio = model.candidate.is_none_or(|(r, _)| r == ratio);
-            visb(
-                &mut w,
+        }
+        let candidate_ratio = model.candidate.is_none_or(|(r, _)| r == ratio);
+        for (c, &value) in vis.iter().enumerate() {
+            let blocks_of = (value + 7) / 8;
+            w.set(
                 if candidate_ratio {
                     tables.ix_visb
                 } else {
                     tables.ix_visb2
                 },
+                c,
+                ((blocks_of + 63) / 64 * 64).min(model.kmax / 8),
             );
-            for c in 0..t {
-                w.set(
-                    tables.ix_visc,
-                    c,
-                    if live(c) {
-                        8 * model.prefilter_blocks
-                    } else {
-                        0
-                    },
-                );
-            }
         }
         // a prefill step whose columns see few entries: a slot per query block over entries 0 .. klen - 1 (what
         // its last column sees), and the owners' latent pages of those entries
@@ -698,55 +711,50 @@ pub fn fill(
                 }
             }
         }
-        if let Some((candidate_ratio, topk)) = model.candidate
-            && candidate_ratio == ratio
-        {
-            visb(&mut w, tables.ix_visb);
-            counts.cand = most > topk * 8;
-            let sparse = !tables.ixc.is_empty() && cols.iter().all(|&c| vis[c] > model.kc);
-            counts.sparse = sparse;
-            if sparse {
-                for (c, _) in vis.iter().enumerate() {
-                    w.set(tables.ix_visc, c, if live(c) { model.kc } else { 0 });
+        counts.cand =
+            !tables.prefill && model.candidate.is_some_and(|(_, topk)| most > topk * 8);
+        counts.sparse =
+            !tables.ixc.is_empty() && cols.iter().all(|&c| vis[c] > model.kc);
+        if counts.sparse {
+            for (c, _) in vis.iter().enumerate() {
+                w.set(tables.ix_visc, c, if live(c) { model.kc } else { 0 });
+            }
+            let chunks = (model.kc / INDEX_KEYS) as usize;
+            let total = tables.ixc.len() * tables.ix_slots;
+            let records = cols.len() * chunks;
+            if records > total {
+                return Err("a step's candidate launches exceed the table capacity".into());
+            }
+            let mut table = vec![[0i64; 8]; total];
+            for row in &mut table {
+                row[0] = -1;
+            }
+            for (i, &c) in cols.iter().enumerate() {
+                for chunk in 0..chunks {
+                    table[i * chunks + chunk] = [
+                        0,
+                        model.index_heads * c as i64,
+                        model.kc - 1,
+                        INDEX_KEYS * chunk as i64,
+                        model.kc,
+                        c as i64,
+                        1,
+                        0,
+                    ];
                 }
-                let chunks = (model.kc / INDEX_KEYS) as usize;
-                let total = tables.ixc.len() * tables.ix_slots;
-                let records = cols.len() * chunks;
-                if records > total {
-                    return Err("a step's candidate launches exceed the table capacity".into());
-                }
-                let mut table = vec![[0i64; 8]; total];
-                for row in &mut table {
-                    row[0] = -1;
-                }
-                for (i, &c) in cols.iter().enumerate() {
-                    for chunk in 0..chunks {
-                        table[i * chunks + chunk] = [
-                            0,
-                            model.index_heads * c as i64,
-                            model.kc - 1,
-                            INDEX_KEYS * chunk as i64,
-                            model.kc,
-                            c as i64,
-                            1,
-                            0,
-                        ];
-                    }
-                }
-                counts.ixc = records.div_ceil(tables.ix_slots);
-                for (j, &launch) in tables.ixc.iter().enumerate() {
-                    for (s, row) in table[j * tables.ix_slots..(j + 1) * tables.ix_slots]
-                        .iter()
-                        .enumerate()
-                    {
-                        for (lane, &value) in row.iter().enumerate() {
-                            w.set(launch, s * 8 + lane, value);
-                        }
+            }
+            counts.ixc = records.div_ceil(tables.ix_slots);
+            for (j, &launch) in tables.ixc.iter().enumerate() {
+                for (s, row) in table[j * tables.ix_slots..(j + 1) * tables.ix_slots]
+                    .iter()
+                    .enumerate()
+                {
+                    for (lane, &value) in row.iter().enumerate() {
+                        w.set(launch, s * 8 + lane, value);
                     }
                 }
             }
         }
-    prof.mark("ix_vis");
         // each live column's HISTORY rows, per page of this ratio. A column's row depends only on its
         // sequence's HISTORY (not the column): compute each row's page buffer once, copy to its columns.
         let per = (HISTORY_TOKENS / ratio / page) as usize;
@@ -774,62 +782,98 @@ pub fn fill(
             let k = col_row[c] as usize;
             w.copy_words(blocks, c * pages_n, &row_bufs[k]);
         }
-    prof.mark("cmp_blocks");
-        // index launches: per query column, its keys in chunks of INDEX_KEYS
-        let mut records: Vec<(usize, i64, i64, i64, i64)> = Vec::new();
-        for k in 0..r_count {
-            let (pos0, real) = (rows.pos0[k], rows.real[k]);
-            let seen_all = (pos0 + real) / ratio;
-            for b0 in (0..real).step_by(qb) {
-                let q = pos0 + b0;
-                let seen = ((q + qb as i64) / ratio).min(seen_all);
-                let mut key = 0;
-                while key < seen {
-                    records.push((k, b0, q, key, seen_all));
-                    key += INDEX_KEYS;
+        // the tiled chain: how many groups this step needs, and each group's tables
+        let tp = tables.ix_tp as i64;
+        let mut chunks = 0i64;
+        for b in blk.iter().flatten() {
+            chunks = chunks.max((b.3 + INDEX_KEYS - 1) / INDEX_KEYS);
+        }
+        let used = ((chunks + tp - 1) / tp) as usize;
+        counts.ix[ri] = used * (tables.ix_lpg + 1);
+        counts.pf[ri] = used * (tables.ix_lpg + 2);
+        for g in 0..tables.ix_groups[ri] {
+            let first = g as i64 * tp * INDEX_KEYS;
+            w.set(tables.ixs[ri], g, first);
+            for c in 0..t {
+                let seen = vis[c];
+                let keys = (seen - first).clamp(0, tp * INDEX_KEYS);
+                w.set(tables.ixg[ri], g * t + c, keys + INDEX_RUN);
+                w.set(tables.ixn[ri], g * t + c, seen.min(INDEX_RUN));
+                if !tables.prefill {
+                    w.set(tables.ixt[ri], g * t + c, keys);
+                    let newest = if seen > 0 {
+                        (seen - 1) / 8 - first / 8
+                    } else {
+                        -1
+                    };
+                    w.set(
+                        tables.ixp[ri],
+                        g * t + c,
+                        if newest >= 0 && newest < tp * (INDEX_KEYS / 8) {
+                            newest
+                        } else {
+                            -1
+                        },
+                    );
                 }
             }
         }
-        let launches = records.len().div_ceil(tables.ix_slots);
-        if launches > tables.ix[ri].len() {
-            return Err("a step's index launches exceed the table capacity".into());
-        }
-        counts.ix[ri] = launches;
-        if records.is_empty() {
-            continue;
-        }
         let owners: Vec<&Owner> = model.owners.iter().filter(|o| o.ratio == ratio).collect();
-        for j in 0..launches {
-            let launch = tables.ix[ri][j];
-            for s in 0..tables.ix_slots {
-                let Some(&(k, b0, q, key, len)) = records.get(j * tables.ix_slots + s) else {
-                    w.set(launch, s * 8, -1);
-                    for lane in 1..8 {
-                        w.set(launch, s * 8 + lane, 0);
+        for g in 0..tables.ix_groups[ri] {
+            for l in 0..tables.ix_lpg {
+                let launch = tables.ix[ri][g * tables.ix_lpg + l];
+                for s in 0..tables.ix_slots {
+                    let rg = l * tables.ix_slots + s;
+                    let tile = g as i64 * tp + (rg / nblk) as i64;
+                    let b = rg % nblk;
+                    let first = tile * INDEX_KEYS;
+                    let entry = blk[b].filter(|e| e.3 > first);
+                    let Some((k, column, q, seen)) = entry else {
+                        w.set(launch, s * 8, -1);
+                        for lane in 1..8 {
+                            w.set(launch, s * 8 + lane, 0);
+                        }
+                        for &pages in &tables.ix_owner[ri][g * tables.ix_lpg + l] {
+                            w.fill(pages + s * LANES * 4, LANES, -1);
+                        }
+                        continue;
+                    };
+                    let len = (seen - first).min(INDEX_KEYS);
+                    let key0 = if tile == 0 {
+                        0
+                    } else {
+                        INDEX_RUN + (tile - g as i64 * tp) * INDEX_KEYS
+                    };
+                    let values = [
+                        0,
+                        model.index_heads * column,
+                        q,
+                        key0,
+                        key0 + len,
+                        column,
+                        ratio,
+                        0,
+                    ];
+                    for (lane, value) in values.into_iter().enumerate() {
+                        w.set(launch, s * 8 + lane, value);
                     }
-                    for &pages in &tables.ix_owner[ri][j] {
-                        w.fill(pages + s * LANES * 4, LANES, -1);
-                    }
-                    continue;
-                };
-                let col = rows.column[k] + b0;
-                let values = [0, model.index_heads * col, q, key, len, col, ratio, 0];
-                for (lane, value) in values.into_iter().enumerate() {
-                    w.set(launch, s * 8 + lane, value);
-                }
-                let valid = (LANES as i64).min((len - key + page - 1) / page);
-                for (owner, &pages) in owners.iter().zip(&tables.ix_owner[ri][j]) {
-                    for lane in 0..LANES {
-                        let p = key / page + lane as i64;
-                        let value = if (lane as i64) < valid {
-                            padded(history(k), history_width, p / owner.pages, -1)?
-                                + owner.offset
-                                + PAIR_ROWS * (p % owner.pages)
-                                + PAGE_ROWS
-                        } else {
-                            -1
-                        };
-                        w.set(pages, s * LANES + lane, value);
+                    let valid = (LANES as i64).min((len + page - 1) / page);
+                    for (owner, &pages) in owners
+                        .iter()
+                        .zip(&tables.ix_owner[ri][g * tables.ix_lpg + l])
+                    {
+                        for lane in 0..LANES {
+                            let p = first / page + lane as i64;
+                            let value = if (lane as i64) < valid {
+                                padded(history(k), history_width, p / owner.pages, -1)?
+                                    + owner.offset
+                                    + PAIR_ROWS * (p % owner.pages)
+                                    + PAGE_ROWS
+                            } else {
+                                -1
+                            };
+                            w.set(pages, s * LANES + lane, value);
+                        }
                     }
                 }
             }
