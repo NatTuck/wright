@@ -67,6 +67,7 @@ class DeepSeekV41GaudiRunner:
         draft_tokens: int = 0,
         replay: int | None = None,
         defer_cache: bool = False,
+        prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
         native_ranks=None,
         log=info,
     ) -> None:
@@ -84,6 +85,7 @@ class DeepSeekV41GaudiRunner:
         self.replay = replay
         if max_batch_size > MAX_BATCH:
             raise ValueError(f"max_batch_size exceeds {MAX_BATCH}")
+        self.prefill_chunk_size = prefill_chunk_size
         self.groups = groups
         self.native_ranks = native_ranks
         if native_ranks is not None:
@@ -206,8 +208,8 @@ class DeepSeekV41GaudiRunner:
             self.cache_layout, resource="DeepSeek-V4.1-Flash Gaudi cache"
         )
         self.runner_config = RunnerConfig(
-            max_batch_tokens=PREFILL_CHUNK_SIZE,
-            prefill_chunk_size=PREFILL_CHUNK_SIZE,
+            max_batch_tokens=self.prefill_chunk_size,
+            prefill_chunk_size=self.prefill_chunk_size,
             continuation_prefill=True,
             cache_write_lookahead_tokens=self.lookahead,
             draft_tokens=self.speculative_tokens,

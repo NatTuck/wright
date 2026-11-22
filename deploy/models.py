@@ -694,9 +694,9 @@ def _create_gaudi_runner(
             DeepSeekV41GaudiRunner,
         )
 
-        if prefill_chunk_size != PREFILL_CHUNK_SIZE:
+        if prefill_chunk_size <= 0 or prefill_chunk_size % PREFILL_CHUNK_SIZE != 0:
             raise ValueError(
-                f"{spec.name} prefills in {PREFILL_CHUNK_SIZE}-token chunks"
+                f"{spec.name} prefills in multiples of {PREFILL_CHUNK_SIZE}-token chunks"
             )
         return DeepSeekV41GaudiRunner(
             str(checkpoint),
@@ -710,6 +710,7 @@ def _create_gaudi_runner(
             defer_cache=defer_cache,
             engram=engram,
             engram_prewarm=engram_prewarm,
+            prefill_chunk_size=prefill_chunk_size,
         )
     if spec.family == "qwen4_exp":
         from resin_models_gaudi.qwen4_exp.runner import (
@@ -958,10 +959,12 @@ def validate_gaudi_options(
         raise ValueError(
             f"{spec.name} takes --draft-tokens {', '.join(map(str, drafts))}, got {draft_tokens}"
         )
-    if chunks is not None and prefill_chunk_size not in chunks:
+    if chunks is not None and (
+        prefill_chunk_size <= 0 or prefill_chunk_size % min(chunks) != 0
+    ):
         raise ValueError(
-            f"{spec.name} takes --prefill-chunk-size {', '.join(map(str, chunks))}, "
-            f"got {prefill_chunk_size}"
+            f"{spec.name} takes a --prefill-chunk-size that is a multiple of "
+            f"{', '.join(map(str, chunks))}, got {prefill_chunk_size}"
         )
 
 
