@@ -862,6 +862,8 @@ def _one_card_model(
         progress.phase("warm-up")
         logger.info("warming up")
         warm_engine(loaded.engine, loaded.recipe, spec, rank)
+        if os.environ.get("RESIN_DS41_DUMP") and getattr(runner, "model", None) is not None:
+            runner.model.dump_step(f"warm-up {spec.name}")
         return loaded.engine
 
     loaded.start_engine = start_engine
@@ -1887,6 +1889,8 @@ def _serve_claimed_rank(rank: int, options: dict, claim, replica=None) -> None:
         progress.phase("warm-up")
         logger.info("warming up")
         warm_engine(engine, recipe, spec, rank)
+        if os.environ.get("RESIN_DS41_DUMP") and getattr(runner, "model", None) is not None:
+            runner.model.dump_step(f"warm-up {spec.name}")
         if replica is not None:
             replica.start()  # it joins the router of this process
         for name, router in routers:

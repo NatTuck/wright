@@ -1270,6 +1270,49 @@ class DeepSeekV41Gaudi:
     def compiles_after_start(self) -> int:
         return self.device.compile_count - self.compiles_at_start
 
+    # ------------------------------------------------------------------ diagnostics
+    def dump_step(self, tag: str = "") -> None:
+        """RESIN_DS41_DUMP: after a step, print what the residual stream and the head actually hold.
+
+        The end-to-end symptom is one token repeated, which is what a hidden state dominated by the current
+        token's embedding looks like.  These numbers separate that from a broken head/sampler without any
+        reference: the two residual buffers' magnitudes, whether they are distinct (i.e. the layers are
+        adding something), each column's cosine against the embedding rows, and the logits' shape.
+        """
+        d, dev = self.d, self.device
+        H, nh = d.hidden, d.heads
+        n = 4 * H * 4  # one column of a (4H, T) residual: 4 streams, f32
+        out = {}
+        for k in (0, 1):
+            a = dev.d2h(self.x[k], (4 * H,), np.float32)
+            out[f"x{k}"] = a
+            print(f"[dump {tag}] x[{k}] column 0: norm {np.linalg.norm(a):.4f} "
+                  f"absmax {np.abs(a).max():.4f} finite {np.isfinite(a).all()}")
+        a, b = out["x0"], out["x1"]
+        cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
+        print(f"[dump {tag}] cos(x[0], x[1]) = {cos:.6f}  (1.0 means the layers changed nothing)")
+        logits = dev.d2h(self.logits, (d.vocab,), np.float32)
+        srt = np.sort(logits)[::-1]
+        p = np.exp(logits - logits.max())
+        p /= p.sum()
+        ent = float(-(p * np.log(p + 1e-30)).sum())
+        print(f"[dump {tag}] logits: norm {np.linalg.norm(logits):.3f} top1 {srt[0]:.3f} "
+              f"top2 {srt[1]:.3f} margin {srt[0] - srt[1]:.3f} entropy {ent:.3f} "
+              f"top1 p {p.max():.4f} top5 ids {np.argsort(logits)[::-1][:5].tolist()}")
+        # is the residual (or its mean over the 4 streams) an embedding row?
+        emb = np.asarray(dev.d2h(self.w["emb"], (d.vocab, H), np.float32))
+        h = a.reshape(4, H).mean(0)
+        en = np.linalg.norm(emb, axis=1)
+        num = emb @ h
+        cosr = num / (en * np.linalg.norm(h) + 1e-30)
+        best = int(np.argmax(cosr))
+        print(f"[dump {tag}] |hidden| {np.linalg.norm(h):.4f} vs |emb| median {np.median(en):.4f}: "
+              f"best cosine to any embedding row {cosr[best]:.6f} (row {best})")
+        for k in (0, 1):
+            hk = out[f"x{k}"].reshape(4, H).mean(0)
+            c = emb @ hk / (en * np.linalg.norm(hk) + 1e-30)
+            print(f"[dump {tag}] x[{k}] mean-stream: best embedding cosine {float(c.max()):.6f}")
+
     # ------------------------------------------------------------------ programs
     def _op(
         self, recipe: Recipe, layer: int | None, names: dict[str, int], copy=None
