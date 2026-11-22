@@ -1738,8 +1738,10 @@ def test_index_scores_fp8(device, recipes):
     # the gather reads the compressed-page table (per column, one arena row per page) and the owner's latent
     # offset: cmp_blocks[pbase + page][col] is the page's first arena row less ioff (owner offset + PAGE_ROWS)
     # ioff = loff[0] + PAGE_ROWS: with loff[0] = -PAGE_ROWS the table holds each page's first arena row
-    # directly, which is what this test's `pages` already is
-    cmp_blocks = pages.T.astype(np.int32)
+    # directly, which is what this test's `pages` already is.  The graph tensor is (pages, T) and its element
+    # (page, col) lives at page + pages*col, so the flat order is `pages` (which is (S, pages)) read straight
+    # through -- not its transpose.
+    cmp_blocks = np.ascontiguousarray(pages).reshape(C // 128, S)
     g.node("rg_ds_ix_gather_f32",
            [g.input("arena", (512, PR, NB), U8), g.input("cmp_blocks", (C // 128, S), I32), tab,
             g.input("dep", (64,), I32), g.input("loff", (64,), I32)],
@@ -1890,8 +1892,9 @@ def test_prefilter_selection_lists_the_plain_entries(device, recipes, cand):
     score[:, ::5] = np.round(score[:, ::5], 1)  # ties
     vis = (12000 + 400 * np.arange(T)).astype(np.int32)
     nb = -(-vis // 8)
+    # ix_gbase: the candidate mask (rg_ix_cmask) reads the group's first key as well as the visible counts
     base = {"ix_score": score, "ix_vis": vis, "ix_visb": np.minimum(-(-nb // 64) * 64, K // 8).astype(np.int32),
-            "ix_visc": np.full(T, 8 * PF, np.int32)}  # fmt: skip
+            "ix_visc": np.full(T, 8 * PF, np.int32), "ix_gbase": np.zeros(1, np.int32)}  # fmt: skip
     d = ds41_dims()
     if cand == "user":  # the candidate blocks of a source over other scores
         src = L.index_select_graph(device, d, T, K, "source", top, cand_blocks=KB)

@@ -462,7 +462,46 @@ RG_API int rg_launch(int ri) {
         std::lock_guard<std::mutex> lock(g_mu);
         if (grow_workspace(c, r->workspace_size)) return -1;
     }
-    CHK(synLaunchWithExternalEventsExt(c->stream, r->binds.data(), r->binds.size(), c->ws, r->h, nullptr, 0, 0));
+    synStatus ls = synLaunchWithExternalEventsExt(c->stream, r->binds.data(), r->binds.size(), c->ws, r->h, nullptr, 0, 0);
+    if (ls != synSuccess) {
+        // Name every bound section and its alignment so a sections-validation failure (status=30) identifies
+        // the culprit instead of a bare status code. Diagnostic only; does not change the launch.
+        fprintf(stderr, "RG_LAUNCH_FAIL recipe=%d status=%d nbinds=%zu\n", ri, int(ls), r->binds.size());
+        uint64_t attrs[2] = {0, 0};
+        synRecipeAttribute qa[2] = {RECIPE_ATTRIBUTE_PERSISTENT_TENSORS_SIZE, RECIPE_ATTRIBUTE_DEVICE_MEMORY_SIZE};
+        synRecipeGetAttribute(attrs, qa, 2, r->h);
+        fprintf(stderr, "  persistent_tensors_size=%llu device_memory_size=%llu workspace=%llu\n",
+                (unsigned long long)attrs[0], (unsigned long long)attrs[1], (unsigned long long)r->workspace_size);
+        for (auto& b : r->binds) {
+            fprintf(stderr, "  section %-22s addr=0x%012llx mod128=%3llu mod256=%3llu tsize=[%llu,%llu,%llu,%llu]\n",
+                    b.tensorName, (unsigned long long)b.pTensorAddress,
+                    (unsigned long long)(b.pTensorAddress % 128), (unsigned long long)(b.pTensorAddress % 256),
+                    (unsigned long long)b.tensorSize[0], (unsigned long long)b.tensorSize[1],
+                    (unsigned long long)b.tensorSize[2], (unsigned long long)b.tensorSize[3]);
+        }
+        // Per-tensor declared max dims + section id + offset: identifies a section whose declared size exceeds
+        // its bound buffer, or a bad section grouping/offset (the cause of a sections-validation failure).
+        {
+            std::vector<synRetrievedLaunchTensorInfoExt> infos(r->binds.size());
+            memset(infos.data(), 0, infos.size() * sizeof(infos[0]));
+            for (size_t i = 0; i < r->binds.size(); i++) infos[i].tensorId = r->binds[i].tensorId;
+            synStatus qs = synTensorRetrieveLaunchInfoByIdExt(r->h, (uint32_t)infos.size(), infos.data());
+            fprintf(stderr, "  launchinfo_query_status=%d\n", int(qs));
+            for (size_t i = 0; i < infos.size(); i++) {
+                auto& ti = infos[i];
+                fprintf(stderr, "  tensor %-22s dtype=%d dims=%u max=[%llu,%llu,%llu,%llu,%llu] sect=%u off=%llu addr=0x%012llx\n",
+                        ti.tensorName, int(ti.tensorDataType), ti.tensorDims,
+                        (unsigned long long)ti.tensorMaxSize[0], (unsigned long long)ti.tensorMaxSize[1],
+                        (unsigned long long)ti.tensorMaxSize[2], (unsigned long long)ti.tensorMaxSize[3],
+                        (unsigned long long)ti.tensorMaxSize[4],
+                        ti.tensorSectionId, (unsigned long long)ti.tensorOffsetInSection,
+                        (unsigned long long)r->binds[i].pTensorAddress);
+            }
+        }
+        fflush(stderr);
+        fail(ls, "synLaunchWithExternalEventsExt");
+        return -1;
+    }
     return 0;
 }
 

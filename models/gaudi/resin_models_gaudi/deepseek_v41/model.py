@@ -1147,7 +1147,7 @@ class DeepSeekV41Gaudi:
                     if self.dense(s):
                         graphs[key + ("dense",)] = L.attention_graph(
                             dev, d, T, s.win_slots, s.win_keys, nb, self.pages, ratio=ratio, residual=residual,
-                            query_block=qb, capture=capture, dense=DENSE_KEYS, scores=L.INDEX_TILE,
+                            query_block=qb, capture=capture, dense=DENSE_KEYS, scores=self.ix_rows(s),
                         )  # fmt: skip
                 else:
                     graphs[key] = L.attention_pre_graph(
@@ -1188,7 +1188,7 @@ class DeepSeekV41Gaudi:
                 graphs["out", s] = L.attention_out_graph(dev, d, T, nb, self.pages)
                 if self.dense(s):
                     graphs["out", s, "dense"] = L.attention_out_graph(
-                        dev, d, T, nb, self.pages, dense=DENSE_KEYS, scores=L.INDEX_TILE
+                        dev, d, T, nb, self.pages, dense=DENSE_KEYS, scores=self.ix_rows(s)
                     )
             for layer in self.engram_layers:
                 if self.eg_sharded(s):
