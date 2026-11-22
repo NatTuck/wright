@@ -415,10 +415,15 @@ def _attention_out(lg: LayerGraph, o: Tensor) -> None:
 
 
 def _w13(lg: LayerGraph, x: Tensor, ids: Tensor, R: int) -> Tensor:
-    """x (H, M, N) FP8 against N decoded w13 slots (``ids``, ``R`` as in mx4_decs) -> (2w, M, N) f32. Each slot's
-    rows 0..w-1 and w..2w-1 are decoded and multiplied apart (mx4_decs' unit offset)."""
+    """x (H, M, N) FP8 against N decoded w13 slots (``ids``, ``R`` as in mx4_decs) -> (2w, M, N) f32, each slot's
+    2w rows decoded and multiplied in one part: one ``rg_mx4_decs_f32`` and one ``batch_gemm``, no concat.
+
+    The split form (two per-half dequant+GEMM pairs and a ``cat``) is what the graph compiler turns into four
+    bundles and 30 MB of SRAM; one pair is two bundles and 18 MB, with a bit-identical result and a faster
+    launch (``test_expert_product_in_parts_equals_whole`` pins the equivalence). The dequant tile itself is
+    SRAM-resident either way -- see ``cases/wright/notes/moe-dequant-tile-sram.md``."""
     H, w = lg.d.hidden, lg.d.expert
-    return _halves(lg, x, ids, R, "x13", 2 * w * H, (H, w), 2)
+    return _halves(lg, x, ids, R, "x13", 2 * w * H, (H, 2 * w), 1)
 
 
 def _halves(
@@ -458,11 +463,10 @@ def _halves(
 
 
 def _w2(lg: LayerGraph, h: Tensor, ids: Tensor, R: int) -> Tensor:
-    """h (w, M, N) FP8 against N decoded w2 slots -> (H, M, N) f32; at T <= 4 as two halves of the rows, each
-    decoded and multiplied apart."""
+    """h (w, M, N) FP8 against N decoded w2 slots -> (H, M, N) f32, one dequant and one ``batch_gemm`` (as in
+    ``_w13``: the two-half form costs two more bundles for the same tile)."""
     H, w = lg.d.hidden, lg.d.expert
-    n = 2 if lg.T <= 4 else 1
-    return _halves(lg, h, ids, R, "x2", H * w, (w, H // n), n)
+    return _halves(lg, h, ids, R, "x2", H * w, (w, H), 1)
 
 
 def ffn_graph(device: Device, dims: Dims, tokens: int, paged: bool = False) -> Graph:
