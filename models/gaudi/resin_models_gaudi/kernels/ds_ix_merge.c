@@ -28,10 +28,16 @@ static inline uint64 mkey(float64 v)
     return as_uint64(v_f32_sel_less_f32_b(v, 0.0f, as_float64(~b), as_float64(b | (uint64)0x80000000u)));
 }
 
+// A partial store's first coordinate is the row its first element lands on and its second-from-last argument
+// only selects the source lane: rows co .. co + last come from lanes first .. first + last. So the base is (a)
+// (the first listed slot), not the vector's base row vb — with vb and the lane offset (a - vb) a partial vector
+// is shifted twice and lands at rows vb .. instead of a .. (the final flush of the tie pass, which starts
+// mid-vector whenever the strict count is not a multiple of 64, wrote slot 64 of a 128-entry list and left the
+// last slot untouched).
 #define DECODE(v) ((v) ^ (int64)BIAS)
 #define FLUSH(vb, a, b, v, vp, vs)                                                              \
     {                                                                                           \
-        int5 co_ = {(vb), c, 0, 0, 0};  /* the vector's base row, so a partial vector lands in place */ \
+        int5 co_ = {(a), c, 0, 0, 0};                                                             \
         v_i32_st_tnsr_partial(co_, list, (vp), (b) - (a) - 1, (a) - (vb));                        \
         v_i32_st_tnsr_partial(co_, pos_out, (vp), (b) - (a) - 1, (a) - (vb));                     \
         v_f32_st_tnsr_partial(co_, sout, (vs), (b) - (a) - 1, (a) - (vb));                        \
@@ -217,7 +223,9 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                 const int used = st + tt < KS ? st + tt : KS;
                 for (int i = used & ~63; i < KS; i += 64) {
                     const int first = i < used ? used - i : 0;
-                    int5 oc = {i, c, 0, 0, 0};
+                    // the store's row coordinate is the first element written and `first` only selects the source
+                    // lane, so the vector that starts mid-way begins at row `used` (= i + first)
+                    int5 oc = {i + first, c, 0, 0, 0};
                     if (first) {
                         v_f32_st_tnsr_partial(oc, sout, ninf, 63 - first, first);
                         v_i32_st_tnsr_partial(oc, list, none32, 63 - first, first);

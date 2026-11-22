@@ -331,6 +331,21 @@ class _Tables:
             v[kind] = block[:, : int(np.prod(dims))].reshape(self.layers, *dims)
 
 
+class _IxMergeOp(_Op):
+    """A merge launch, preceded by the copies that place the group's own scores at their rows of the merge buffer.
+
+    The score launches write a (rows, T) tile, whose column stride is ``rows``; the merge buffer's is
+    ``run + rows`` and its rows 0 .. run - 1 are the running candidates. So the tile goes in per column, at rows
+    run .. (rows 0 .. for the first group): T copies of ``rows`` floats, one batched copy on the launch stream,
+    ordered before the merge without a submission of its own."""
+
+    __slots__ = ("copy",)
+
+    def __init__(self, recipe, names, copy) -> None:
+        super().__init__(recipe, names)
+        self.copy = tuple(np.asarray(a, np.uint64) for a in copy)
+
+
 class _Program:
     """Every launch of one step shape, bound once."""
 
@@ -577,16 +592,13 @@ class DeepSeekV41Gaudi:
     def _ix_names(
         self, s: Shape, ratio: int, j: int, owner: int, head: dict, scratch: bool = False
     ) -> dict[str, int]:
-        """an index launch's tables: its slots and pages, or each part's rows of them; ``scratch``: its scores go
-        to the scratch tile (a candidate layer's mask then writes the group's rows)"""
+        """an index launch's tables: its slots and pages, or each part's rows of them. Its scores always go to the
+        tile buffer (a (rows, T) tensor, which is what a score launch writes); the merge op's copy places
+        copies each column's rows to their own rows of the group's merge buffer, and a candidate layer's mask
+        writes the group's rows there in place."""
         base = self.table + self.tables[s].off[f"ix{ratio}.{j}"]
         pages = self.table + self.tables[s].off[f"ix{ratio}.{j}.{owner}"]
-        g = j // self.ix_lpg(s)
-        tile = (
-            self.ix_tile
-            if scratch
-            else self.ix_merge[g % 2] + 4 * s.T * (0 if g == 0 else L.INDEX_RUN)
-        )
+        tile = self.ix_tile
         recipe = self.r["ix", s]
         if "ix_slots" in recipe.persistent:
             return {**head, "ix_slots": base, "ix_pages": pages, "ix_score": tile}
@@ -613,6 +625,19 @@ class DeepSeekV41Gaudi:
         """the score rows of one merge group (its tiles)"""
         return self.ix_tp(shape) * INDEX_KEYS
 
+    def ix_parts(self, shape: Shape) -> int:
+        """Parts of a prefill index launch. Each part's slots table is bound at its own address (``_ix_names``),
+        and a recipe's section base must be 128-byte aligned: a part's table is (8, ix_slots / P) i32, i.e.
+        32 (ix_slots / P) bytes, so P is the largest of PREFILL_IX_PARTS, 2, 1 that leaves a multiple of four
+        slots per part (8 slots per launch with 4 parts is 64 bytes and fails the launch: status=30, "Section is
+        not aligned")."""
+        if not shape.prefill:
+            return 1
+        for p in (PREFILL_IX_PARTS, 2, 1):
+            if shape.ix_slots % p == 0 and (shape.ix_slots // p) % 4 == 0:
+                return p
+        return 1
+
     def ix_lpg(self, shape: Shape) -> int:
         """index launches per merge group"""
         per_tile = max(1, -(-shape.blocks // shape.ix_slots))
@@ -635,19 +660,18 @@ class DeepSeekV41Gaudi:
         (at its slice of the published array) with its pin, or "k" its candidate mask."""
         tb, T, run = self.tables[s], s.T, L.INDEX_RUN
         first = g * self.ix_tp(s) * L.BLOCK_TILE
-        tile = self.ix_merge[g % 2] + 4 * T * (0 if g == 0 else run)
         names = dict(head)
         if kind == "b":
             names.update(
-                ix_tile=tile,
+                ix_tile=self.ix_tile,
                 ix_bmax=self.io["cand_bmax"] + 4 * T * first,
                 ix_pin=self.table + tb.off[f"ixp{ratio}"] + 4 * T * g,
                 ix_tvis=self.table + tb.off[f"ixt{ratio}"] + 4 * T * g,
             )
-        elif kind == "k":  # the mask reads the score launches' scratch and writes the group's rows
+        elif kind == "k":  # the mask reads the score launches' tile and writes the group's rows in place
             names.update(
                 ix_tile=self.ix_tile,
-                ix_tile_out=tile,
+                ix_tile_out=self.ix_tile,
                 ix_tvis=self.table + tb.off[f"ixt{ratio}"] + 4 * T * g,
                 ix_bmax=self.io["cand_bmax"] + 4 * T * first,
                 cand_thr=self.io["cand_thr"],
@@ -702,7 +726,10 @@ class DeepSeekV41Gaudi:
                     )
                 )
             merge = self._op(
-                self.r["ixm", s], layer, self._ix_group_names(s, ratio, g, head, "m")
+                self.r["ixm", s],
+                layer,
+                self._ix_group_names(s, ratio, g, head, "m"),
+                copy=self._ix_tile_copy(s, g),
             )
             plain.append(merge)
             cnd.append(merge)
@@ -1107,7 +1134,7 @@ class DeepSeekV41Gaudi:
                 rows, top = self.ix_rows(s), cfg.candidate_topk_blocks
                 graphs["ix", s] = L.index_score_graph(
                     dev, d, T, s.ix_slots, INDEX_KEYS, nb, rows, query_block=qb,
-                    parts=PREFILL_IX_PARTS if s.prefill else 1,
+                    parts=self.ix_parts(s),
                 )  # fmt: skip
                 graphs["ixm", s] = L.index_merge_graph(dev, d, T, rows, L.INDEX_RUN)
                 if not s.prefill:  # decoding: the candidate blocks the source layer publishes
@@ -1172,7 +1199,11 @@ class DeepSeekV41Gaudi:
     def _compile(self) -> None:
         progress.building_graphs()
         graphs = self._graphs()
-        recipes = self.recipes.compile_many(list(graphs.values()))
+        # Each compile thread gets its own device context, and a context grows to its recipe's workspace — the
+        # largest here is 6.6 GiB (ds41_ffn_paged_T128, 0x1881d0c00) — so two at once already exceed a card's
+        # free memory on a cold recipe cache (synDeviceMalloc ... status=26). One at a time fits; the disk cache
+        # makes this a first-boot cost only.
+        recipes = self.recipes.compile_many(list(graphs.values()), workers=1)
         self.r: dict[tuple, Recipe] = dict(zip(graphs.keys(), recipes, strict=True))
         for g in graphs.values():
             g.destroy()
@@ -1200,7 +1231,9 @@ class DeepSeekV41Gaudi:
         return self.device.compile_count - self.compiles_at_start
 
     # ------------------------------------------------------------------ programs
-    def _op(self, recipe: Recipe, layer: int | None, names: dict[str, int]) -> _Op:
+    def _op(
+        self, recipe: Recipe, layer: int | None, names: dict[str, int], copy=None
+    ) -> _Op:
         bound: dict[str, int] = {}
         for n in recipe.persistent:
             if n in names:
@@ -1215,7 +1248,19 @@ class DeepSeekV41Gaudi:
                 bound[n] = self.consts[n]
             else:
                 raise ValueError(f"{recipe.name}: unbound {n}")
-        return _Op(recipe, bound)
+        return _IxMergeOp(recipe, bound, copy) if copy else _Op(recipe, bound)
+
+    def _ix_tile_copy(self, s: Shape, g: int) -> tuple[list, list, list]:
+        """(src, size, dst) of the per-column copies that place a group's own scores (a (rows, T) tile at
+        ``ix_tile``) at rows ``run`` .. of its merge buffer (a (run + rows, T) tensor), or at rows 0 .. for the
+        first group, which has no running candidates."""
+        T, run = s.T, L.INDEX_RUN
+        rows = self.ix_rows(s)
+        K = run + rows
+        row0 = 0 if g == 0 else run
+        src = [self.ix_tile + 4 * rows * t for t in range(T)]
+        dst = [self.ix_merge[g % 2] + 4 * (K * t + row0) for t in range(T)]
+        return src, [4 * rows] * T, dst
 
     def _program(self, s: Shape) -> _Program:
         if (prog := self._programs.get(s)) is not None:
@@ -1353,7 +1398,7 @@ class DeepSeekV41Gaudi:
                                 **common,
                                 **attn_io,
                                 **dense,
-                                "ix_score": self.ix_merge[0],
+                                "ix_score": self.ix_tile,
                                 "ix_thr": self.io["ix_thr"],
                             },
                         )
@@ -1374,7 +1419,7 @@ class DeepSeekV41Gaudi:
                                 **common,
                                 **dense,
                                 "p_out": p[pnext],
-                                "ix_score": self.ix_merge[0],
+                                "ix_score": self.ix_tile,
                                 "ix_thr": self.io["ix_thr"],
                             },
                         )
@@ -1420,6 +1465,8 @@ class DeepSeekV41Gaudi:
         native.section("draft")
 
         def launch(op) -> None:
+            if isinstance(op, _IxMergeOp):  # the group's own scores, at their rows of the merge buffer
+                self.device.d2d_multi(*op.copy)
             native.launch(op.recipe.handle, op.slots.tolist(), op.addresses.tolist())
 
         def reduce(partial: int) -> None:
@@ -1536,6 +1583,10 @@ class DeepSeekV41Gaudi:
         T, ccl = s.T, self.nranks > 1
 
         def launch(op) -> None:
+            if isinstance(op, _IxMergeOp):  # the group's own scores, at their rows of the merge buffer
+                native.copy_multi(
+                    op.copy[0].tolist(), op.copy[1].tolist(), op.copy[2].tolist()
+                )
             native.launch(op.recipe.handle, op.slots.tolist(), op.addresses.tolist())
 
         def reduce(partial: int) -> None:

@@ -2094,8 +2094,7 @@ def test_tiled_index_selection_matches_full(device, recipes, T):
         struct.pack("iii", max(1, 48 // T), run, d.heads),
     )
     tiled = L.index_merge_graph(device, d, T, rows, run, heads=d.heads)
-    run_buf = [device.malloc(4 * run * T) for _ in range(2)]
-    tile = device.malloc(4 * rows * T)
+    merge = [device.malloc(4 * (run + rows) * T) for _ in range(2)]
     pos = [device.malloc(4 * run * T) for _ in range(2)]
     one = {n: device.malloc(4 * T) for n in ("vis", "exact")}
     base, thr = device.malloc(4), device.malloc(4 * 64 * T)
@@ -2125,9 +2124,15 @@ def test_tiled_index_selection_matches_full(device, recipes, T):
         def run_tiled(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             recipe = recipes.compile(tiled)
             for g in range(groups):
-                # the group's own scores go to the tile (a (rows, T) tensor) and the merge's ds_ix_tile node
-                # copies them to their own rows of the (run + rows, T) merge buffer
-                device.h2d(tile, np.ascontiguousarray(scores[:, g * rows : (g + 1) * rows]))
+                # the merge buffer is a (run + rows, T) tensor, so a column's rows are contiguous and a group's
+                # tile is one block of `rows` floats per column (a whole (T, rows) upload would put column 1's
+                # rows at column 0's — exact at T=1, wrong above it; the model does the same copy on the device)
+                row0 = 0 if g == 0 else run
+                for t in range(T):
+                    device.h2d(
+                        merge[g % 2] + 4 * (t * (run + rows) + row0),
+                        np.ascontiguousarray(scores[t, g * rows : (g + 1) * rows]),
+                    )
                 device.h2d(
                     one["vis"],
                     np.array(
@@ -2144,7 +2149,7 @@ def test_tiled_index_selection_matches_full(device, recipes, T):
                 )
                 device.h2d(base, np.array([g * rows], np.int32))
                 bind = {
-                    "ix_run": run_buf[g % 2],
+                    "ix_merge": merge[g % 2],
                     "ix_gvis": one["vis"],
                     "ix_gcnt": one["exact"],
                     "ix_pos": pos[g % 2],
@@ -2152,8 +2157,7 @@ def test_tiled_index_selection_matches_full(device, recipes, T):
                     "ix_thr": thr,
                     "ix_lslots": slots,
                     "ix_list": out["list"],
-                    "ix_tile": tile,
-                    "ix_sout": run_buf[1 - g % 2],
+                    "ix_sout": merge[1 - g % 2],
                     "ix_pos_out": pos[1 - g % 2],
                 }
                 for name in recipe.persistent:
@@ -2189,7 +2193,7 @@ def test_tiled_index_selection_matches_full(device, recipes, T):
             assert np.all(tie[split:]) and not np.any(tie[:split]), (t, split)
             assert a[:split] == sorted(a[:split]) and a[split:] == sorted(a[split:]), t
         # the last group's running set: each listed entry's score at its slot, and no listed slot past the count
-        sout = device.d2h(run_buf[(groups - 1) % 2 ^ 1], (T, run), np.float32)
+        sout = device.d2h(merge[(groups - 1) % 2 ^ 1], (T, run + rows), np.float32)[:, :run]
         for t in range(T):
             n = int(got_slots[t, 4])
             assert sout[t, :n].tolist() == score[t, got[t, :n]].tolist(), t
@@ -2207,8 +2211,7 @@ def test_tiled_index_selection_matches_full(device, recipes, T):
         print("tiled selection == full selection on", T, "columns of", K, "keys")
     finally:
         for a in [
-            *run_buf,
-            tile,
+            *merge,
             *pos,
             *one.values(),
             base,
@@ -2235,8 +2238,7 @@ def test_tiled_index_selection_pads_the_running_set(device, recipes):
     score = np.zeros((1, run + rows), np.float32)
     score[0, :seen] = -np.arange(seen)
     g = L.index_merge_graph(device, d, 1, rows, run, heads=d.heads)
-    run_buf = [device.malloc(4 * run) for _ in range(2)]
-    tile = device.malloc(4 * rows)
+    merge = [device.malloc(4 * (run + rows)) for _ in range(2)]
     pos = [device.malloc(4 * run) for _ in range(2)]
     one = {n: device.malloc(4) for n in ("vis", "exact")}
     base, thr = device.malloc(4), device.malloc(4 * 64)
@@ -2247,14 +2249,12 @@ def test_tiled_index_selection_pads_the_running_set(device, recipes):
         device.h2d(one["vis"], np.array([seen], np.int32))
         device.h2d(one["exact"], np.array([seen], np.int32))
         device.h2d(base, np.array([0], np.int32))
-        device.h2d(tile, np.ascontiguousarray(score[:, :rows]))
-        device.h2d(run_buf[0], np.zeros(run, np.float32))  # the first group has no running candidates
+        device.h2d(merge[0], np.ascontiguousarray(score[:, :rows]))
         for name in recipe.persistent:
             recipe.bind(
                 name,
                 {
-                    "ix_run": run_buf[0],
-                    "ix_tile": tile,
+                    "ix_merge": merge[0],
                     "ix_gvis": one["vis"],
                     "ix_gcnt": one["exact"],
                     "ix_pos": pos[0],
@@ -2262,7 +2262,7 @@ def test_tiled_index_selection_pads_the_running_set(device, recipes):
                     "ix_thr": thr,
                     "ix_lslots": slots,
                     "ix_list": out["list"],
-                    "ix_sout": run_buf[1],
+                    "ix_sout": merge[1],
                     "ix_pos_out": pos[1],
                 }[name],
             )
@@ -2271,12 +2271,12 @@ def test_tiled_index_selection_pads_the_running_set(device, recipes):
         assert int(device.d2h(slots, (1, 8), np.int32)[0, 4]) == seen
         listed = device.d2h(out["list"], (1, run), np.int32)[0]
         assert listed[:seen].tolist() == list(range(seen))
-        sout = device.d2h(run_buf[1], (1, run), np.float32)[0]
+        sout = device.d2h(merge[1], (1, run + rows), np.float32)[0, :run]
         pout = device.d2h(pos[1], (1, run), np.int32)[0]
         assert np.all(sout[seen:] == np.float32(-3.0e38)), sout[seen - 2 : seen + 2]
         assert np.all(pout[seen:] == -1), pout[seen - 2 : seen + 2]
         print("the running set pads slots", seen, "..", run - 1, "with NINF / -1")
     finally:
-        for a in [*run_buf, tile, *pos, *one.values(), base, thr, *out.values(), slots]:
+        for a in [*merge, *pos, *one.values(), base, thr, *out.values(), slots]:
             device.free(a)
         g.destroy()
