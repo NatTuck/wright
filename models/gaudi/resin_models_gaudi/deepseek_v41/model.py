@@ -22,6 +22,7 @@ Engram hash ids are computed on the host from each row's last tokens (``Row.befo
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -106,6 +107,10 @@ _REGISTERS = 12
 # So the reserve has to cover that 6.3 GiB as well as the step's own scratch; at 5 GiB a cold recipe cache sizes
 # the arena into memory the compile is holding and the arena allocation fails. 7 GiB leaves ~1.3 GiB of slack.
 WORKSPACE_RESERVE = 7 << 30
+# Diagnostic: RESIN_DS41_WINDOW_ONLY=1 makes every layer a window-only layer -- no compressed KV, no index
+# chain, no compressor -- which splits "the answer is garbage" into "the compressed path" vs "everything
+# else" in one boot.  It is a probe, never a serving configuration.
+WINDOW_ONLY = bool(os.environ.get("RESIN_DS41_WINDOW_ONLY"))
 # the sampler's outputs for up to MAX_T columns: tokens, logprobs, top ids, top logprobs (256-byte aligned)
 _SAMPLED = {
     "tok_out": 0,
@@ -1155,7 +1160,7 @@ class DeepSeekV41Gaudi:
                         groups=s.groups2 if ratio > 1 else T, state_rows=R, residual=residual, query_block=qb,
                         capture=capture,
                     )  # fmt: skip
-            if any(cfg.compress_ratios[i] for i in range(self.n_layers)):
+            if not WINDOW_ONLY and any(cfg.compress_ratios[i] for i in range(self.n_layers)):
                 rows, top = self.ix_rows(s), cfg.candidate_topk_blocks
                 graphs["ix", s] = L.index_score_graph(
                     dev, d, T, s.ix_slots, INDEX_KEYS, nb, rows, query_block=qb,
@@ -1210,9 +1215,13 @@ class DeepSeekV41Gaudi:
                 graphs["sample", s, R_] = sample_graph(dev, d, T, R_, self.nranks)  # type: ignore[arg-type]
         return graphs
 
+    def _ratio(self, layer: int) -> int:
+        """A layer's compress ratio; 0 for every layer under the window-only diagnostic."""
+        return 0 if WINDOW_ONLY else self.cfg.compress_ratios[layer]
+
     def _attention_key(self, layer: int, s: Shape) -> tuple:
         cfg = self.cfg
-        ratio = cfg.compress_ratios[layer]
+        ratio = self._ratio(layer)
         residual = layer not in self.engram_layers
         capture = (
             bool(self.stages) and layer in cfg.dspark_target_layer_ids
@@ -1341,7 +1350,7 @@ class DeepSeekV41Gaudi:
         )  # the streams, the incoming coefficients and partial
         cnext, pnext = 0, 0
         for layer in range(self.n_layers):
-            ratio = cfg.compress_ratios[layer]
+            ratio = self._ratio(layer)
             cs = "cs1" if ratio else "cs0"
             ops: dict = {}
             common = {
@@ -1467,7 +1476,7 @@ class DeepSeekV41Gaudi:
                                 "ix_thr": self.io["ix_thr"],
                             },
                         )
-            if layer == self.cut and s.prefill:
+            if not WINDOW_ONLY and layer == self.cut and s.prefill:  # (no compressor under the probe)
                 prog.store = self._op(self.r["store", s], layer, {**common, **attn_io})
                 prog.cut = (attn_io["X"], attn_io["c"], attn_io["p"])
             cin, pin = c[cnext], p[pnext]
@@ -1694,7 +1703,7 @@ class DeepSeekV41Gaudi:
                 launch(op)
         for layer, ops in enumerate(prog.layers):
             native.section(f"layer {layer}")
-            ratio = self.cfg.compress_ratios[layer]
+            ratio = self._ratio(layer)
             if "eg" in ops:
                 if "eg_gather" in ops:
                     launch(ops["eg_gather"])
