@@ -89,8 +89,9 @@ CASES = {
 }
 
 
-def slot_product(device, recipes, which, H, w, E, R, T, n, *, act=None, weights=None):
-    """One ``_halves`` of ``which`` with ``n`` parts, launched on ``act`` against ``weights``."""
+def slot_product(device, recipes, which, H, w, E, R, T, n, *, act=None, weights=None, dt=None):
+    """One ``_halves`` of ``which`` with ``n`` parts of dtype ``dt`` (F32 by default), launched on ``act``
+    against ``weights``."""
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.synapse.runtime import F8, F32, I32
 
@@ -100,11 +101,11 @@ def slot_product(device, recipes, which, H, w, E, R, T, n, *, act=None, weights=
         hidden=H, heads=8, head_dim=512, q_lora=1024, o_lora=1024, groups=1, expert=w, experts=E,
         top=R, vocab=16160, eps=1e-6, hc_iters=20, hc_eps=1e-6, limit=10.0, route_scale=1.5, ranks=1,
     )  # fmt: skip
-    g = L.LayerGraph(device, f"t_whole_{which}_{n}", d, T)
+    g = L.LayerGraph(device, f"t_whole_{which}_{n}_{dt}", d, T)
     h = g.input("h", act.shape, F8)
     ids = g.input("ids", (64, T), I32)
-    y = L._halves(g, h, ids, R, which, size_of(H, w), part, n)
-    g.node("memcpy", [y], [g.input("y", y.shape, F32)])
+    y = L._halves(g, h, ids, R, which, size_of(H, w), part, n, dt)
+    g.node("memcpy", [y], [g.input("y", y.shape, y.dtype)])
     out = Run(device, recipes, g.g)(
         {
             "h": act,
@@ -135,6 +136,81 @@ def test_slot_product_whole_equals_halves(device, recipes, which):
     halves = slot_product(device, recipes, which, H, w, E, R, T, 2, act=act, weights=weights)
     assert np.isfinite(whole).all() and np.isfinite(halves).all()
     np.testing.assert_array_equal(whole, halves)
+
+
+def bf16_to_f32(u):
+    """bf16 bits -> f32 values (the upper half of the f32 word)."""
+    return (np.asarray(u, np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
+def f32_to_bf16(x):
+    """f32 -> bf16 bits, round half to even."""
+    u = np.asarray(x, np.float32).view(np.uint32).astype(np.uint64)
+    u = u + 0x7FFF + ((u >> 16) & 1)
+    return (u >> 16).astype(np.uint16)
+
+
+@pytest.mark.parametrize("which", ["x2", "x13"])
+def test_slot_product_bf16_is_the_rounded_f32(device, recipes, which):
+    """The BF16 product is the f32 product rounded once to bf16 -- the paired differential against the f32 arm.
+
+    The reference's expert GEMM is ``fp8_gemm(..., out_dtype=BF16)`` added into an f32 accumulator, so this
+    rounding is what the model already does; the claim this test pins is that the bf16 arm is *the same
+    product* (one rounding of it), not a different accumulation.  It fails on a mis-declared tensor, a changed
+    accumulation order, or a kernel that reads the tile as something other than bf16.
+    """
+    from resin_models_gaudi.synapse.runtime import BF16, F32
+
+    rng = np.random.default_rng(12)
+    H, w, E, R, T = 5120, 576, 384, 6, 2
+    size_of = CASES[which][0]
+    act = rng.integers(0, 0x70, (H, 1, R * T) if which == "x13" else (w, 1, R * T)).astype(np.uint8)
+    weights = (
+        rng.integers(0, 256, (E, size_of(H, w) // 2), dtype=np.uint8),
+        rng.integers(118, 124, (E, size_of(H, w) // 32), dtype=np.uint8),
+    )
+    f32 = slot_product(device, recipes, which, H, w, E, R, T, 1, act=act, weights=weights, dt=F32)
+    b16 = bf16_to_f32(
+        slot_product(device, recipes, which, H, w, E, R, T, 1, act=act, weights=weights, dt=BF16)
+    )
+    assert np.isfinite(b16).all(), "the bf16 product overflowed"
+    np.testing.assert_array_equal(b16, bf16_to_f32(f32_to_bf16(f32)))
+    rel = np.abs(b16 - f32) / np.maximum(np.abs(f32), 1e-30)
+    assert rel.max() <= 2.0**-8, f"bf16 rounding exceeded 2**-8: {rel.max():.3e}"
+    print(
+        f"{which}: bf16 is the f32 product rounded to bf16, max rel {rel.max():.3e}, "
+        f"mean {rel.mean():.3e} over {rel.size} elements"
+    )
+
+
+def test_expert_product_dtype_and_kernel(device, recipes):
+    """``_w13`` / ``_w2`` emit a BF16 product and the SwiGLU kernel that reads a BF16 tile, for the 4-rank
+    width; the 8-rank width (a 32-row tail, which a 128-element bf16 load cannot address) keeps f32."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.synapse.runtime import BF16, F32
+
+    def dims(w):
+        return L.Dims(
+            hidden=5120, heads=8, head_dim=512, q_lora=1024, o_lora=1024, groups=1, expert=w,
+            experts=384, top=6, vocab=16160, eps=1e-6, hc_iters=20, hc_eps=1e-6, limit=10.0,
+            route_scale=1.5, ranks=1,
+        )  # fmt: skip
+
+    for w, want in ((576, BF16), (288, F32)):
+        d = dims(w)
+        g = L.LayerGraph(device, f"t_prod_dtype_{w}", d, 2)
+        xq, ids = g.input("x", (5120, 1, 12), 8192), g.input("ids", (64, 2), 16)
+        before = g.g._nodes
+        y13 = L._w13(g, xq, ids, 6, L.expert_out_dtype(g))
+        assert y13.dtype == want, (w, y13.dtype)
+        hq = g.input("h", (w, 1, 12), 8192)
+        y2 = L._w2(g, hq, ids, 6, L.expert_out_dtype(g))
+        assert y2.dtype == want, (w, y2.dtype)
+        assert g.g._nodes - before == 6
+        assert L._xact_lin(want) == (
+            "rg_ds_xact_lin_b16_f32" if want == BF16 else "rg_ds_xact_lin_f32"
+        )
+        g.g.destroy()
 
 
 def test_w13_and_w2_are_one_call(device, recipes):

@@ -244,6 +244,27 @@ def kernel_k(scales: np.ndarray) -> int:
     return hi - 132
 
 
+EVEN_ODD_BLOCK = 128
+
+
+def even_odd_rows(n: int) -> np.ndarray:
+    """The row order that a BF16 tensor load's widening inverts.
+
+    ``ds_xsum`` / ``ds_xcomb`` read the routed product 128 rows at a time, and a bf16 tensor load is 128 elements
+    whose widening puts the even ones in one vector and the odd ones in the other (a bf16 value is packed two to a
+    32-bit lane).  Row ``j`` of a block therefore holds result row ``j // 2`` for even ``j`` and
+    ``64 + (j - 1) // 2`` for odd ``j``, which makes the widened pair the block's rows in natural order.  Applied
+    to the two weights whose *output* rows are the hidden dimension, so the consumer needs no lane shuffle.
+
+    The routed ``x2``'s row factor (``x2.c``) is one value per expert repeated over the rows, so it needs no
+    permutation; the block scales (``x2.s``) and the shared expert's row scales do.
+    """
+    if n % EVEN_ODD_BLOCK:
+        raise ValueError(f"{n} rows is not a whole number of {EVEN_ODD_BLOCK}-row blocks")
+    off = np.arange(n) % EVEN_ODD_BLOCK
+    return np.arange(n) - off + np.where(off % 2 == 0, off // 2, 64 + (off - 1) // 2)
+
+
 def expert_slots(
     src: Safetensors, prefix: str, experts: int, width: slice, hidden: int
 ) -> ExpertSlots:
@@ -271,11 +292,12 @@ def expert_slots(
         scales2[e] = src.read(f"{name}.w2.scale")[:, s2]
 
     list(POOL.map(one, range(experts)))
+    order = even_odd_rows(hidden)  # the w2 product's rows, in the order its BF16 reader inverts
     return ExpertSlots(
         codes13.reshape(experts, -1),
         scales13.reshape(experts, -1),
-        codes2.reshape(experts, -1),
-        scales2.reshape(experts, -1),
+        np.ascontiguousarray(codes2[:, order]).reshape(experts, -1),
+        np.ascontiguousarray(scales2[:, order]).reshape(experts, -1),
         expert_k(scales13),
         expert_k(scales2),
     )
@@ -389,7 +411,19 @@ def prepare_layer(
         "sh_w13",
         [_mx8(src, f"{sh}.w1", rows=sl.expert), _mx8(src, f"{sh}.w3", rows=sl.expert)],
     )
-    _put_mx8(out, "sh_w2", [_mx8(src, f"{sh}.w2", cols=sl.expert)])
+    down = _mx8(src, f"{sh}.w2", cols=sl.expert)
+    order = even_odd_rows(down.bytes.shape[0])  # the shared expert's product is read the same way as w2's
+    _put_mx8(
+        out,
+        "sh_w2",
+        [
+            Mx8Rows(
+                np.ascontiguousarray(down.bytes[order]),
+                down.row_scales[order],
+                down.inexact,
+            )
+        ],
+    )
     E = experts or cfg.num_routed_experts
     slots = expert_slots(src, f"{p}.ffn", E, sl.expert, H)
     out["x13"], out["x13.s"], out["x2"], out["x2.s"] = (

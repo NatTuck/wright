@@ -169,13 +169,19 @@ class LayerGraph(GlmLayerGraph):
         M: int,
         s: Tensor | None = None,
         out: Tensor | None = None,
+        dt: int = F32,
     ) -> Tensor:
-        """FP8 x FP8 -> f32 with the weight's row scales, times the per-token scale ``s`` (1, T) of q if given."""
-        y = out if out is not None else self.tensor((M, q.shape[1]), F32)
+        """FP8 x FP8 -> ``dt`` (f32 by default) with the weight's row scales, times the per-token scale ``s``
+        (1, T) of q if given.  ``dt`` is BF16 where the reference's own product is (``fp8_gemm out_dtype=BF16``)
+        and the consumer reads a bf16 tile: half the bytes for the same fidelity."""
+        y = out if out is not None else self.tensor((M, q.shape[1]), dt)
         w = self.input(name, (q.shape[0], M), F8)
         sa = s if s is not None else self.input("one", (1,), F32)
         self.node(
-            "fp8_gemm_f32", [q, w, sa, self.input(name + ".s", (M,), F32)], [y], GEMM_NT
+            "fp8_gemm_f32" if dt == F32 else "fp8_gemm_bf16",
+            [q, w, sa, self.input(name + ".s", (M,), F32)],
+            [y],
+            GEMM_NT,
         )
         return y
 
@@ -426,6 +432,12 @@ def expert_out_dtype(lg: LayerGraph) -> int:
     return BF16 if w - w // 128 * 128 in (0, 64) else F32
 
 
+def _xact_lin(dt: int) -> str:
+    """The SwiGLU-and-quantize kernel for an expert product of ``dt`` (``rg_ds_xact_lin_b16_f32`` reads the BF16
+    tile 128 rows at a time, ``rg_ds_xact_lin_f32`` the f32 one)."""
+    return "rg_ds_xact_lin_b16_f32" if dt == BF16 else "rg_ds_xact_lin_f32"
+
+
 def _w13(lg: LayerGraph, x: Tensor, ids: Tensor, R: int, dt: int | None = None) -> Tensor:
     """x (H, M, N) FP8 against N decoded w13 slots (``ids``, ``R`` as in mx4_decs) -> (2w, M, N) of ``dt``, each
     slot's 2w rows decoded and multiplied in one part: one ``rg_mx4_decs_f32`` and one ``batch_gemm``, no concat.
@@ -515,7 +527,8 @@ def ffn_graph(device: Device, dims: Dims, tokens: int, paged: bool = False) -> G
         struct.pack("iif", K, E, d.route_scale),
     )
     a8, shs = lg.q8p(g13, sin=hs, swiglu=True)
-    sh = lg.gemm8(a8, "sh_w2", H)
+    # BF16: the reference's shared expert is a bf16 product too, and rg_ds_xsum reads it 128 rows at a time
+    sh = lg.gemm8(a8, "sh_w2", H, dt=BF16)
     if paged:
         _paged_experts(lg, h32, ids, wts, sh, shs)
         lg.site(X, "hcf")
@@ -524,12 +537,12 @@ def ffn_graph(device: Device, dims: Dims, tokens: int, paged: bool = False) -> G
     y13 = _w13(lg, xq, ids, K, dt)
     hq, hsl = lg.tensor((w, 1, S), F8), lg.tensor((1, S), F32)
     lg.node(
-        "rg_ds_xact_lin_f32",
+        _xact_lin(dt),
         [y13, y13, lg.input("x13.c", (2 * w, E), F32), sx, ids],
         [hq, hsl],
         struct.pack("ifii", K, d.limit, w - w0, 0),
     )
-    y2 = _w2(lg, hq, ids, K, dt)
+    y2 = _w2(lg, hq, ids, K, BF16)  # always BF16: rg_ds_xsum reads it 128 rows at a time
     if (
         T > 1
     ):  # the next sub-layer's coefficients, created late
@@ -585,7 +598,7 @@ def _paged_experts(
         )
     else:
         lg.node(
-            "rg_ds_xact_lin_f32",
+            _xact_lin(dt),
             [yf, yf, lg.input("x13.c", (2 * w, E), F32), sxr, pe],
             [hq, hs],
             struct.pack("ifii", 0, d.limit, w - w0, psh),
@@ -602,7 +615,7 @@ def _paged_experts(
         [d2],
         struct.pack("ii", 0, 0),
     )
-    y2 = lg.tensor((H, PS, P), dt)
+    y2 = lg.tensor((H, PS, P), BF16)  # always BF16: rg_ds_xcomb reads it 128 rows at a time
     lg.node(
         "batch_gemm", [lg.view(hq, (w, PS, P)), lg.view(d2, (w, H, P))], [y2], GEMM_NT
     )
