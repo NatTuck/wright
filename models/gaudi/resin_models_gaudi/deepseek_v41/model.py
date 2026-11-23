@@ -1833,9 +1833,11 @@ class DeepSeekV41Gaudi:
         native.section("embed")
         launch(prog.embed)
         # the tiled index chain's group tables: one launch per ratio for the whole step, whatever the number of
-        # merge groups (ds_ix_gslot derives each group's slot records from the step's positions)
+        # merge groups (ds_ix_gslot derives each group's slot records from the step's positions). These share
+        # the embed section: the executor's `_sections` numbering assumes embed=0, layers=1..n, inject=n+1,
+        # head=n+2, head_column=n+3, so a separate index-group section would shift the head/head_column indices
+        # and the sampler would read the wrong logits (prefill and decode both garbled).
         if prog.ixg:
-            native.section("ix groups")
             for op in prog.ixg:
                 launch(op)
         for layer, ops in enumerate(prog.layers):
