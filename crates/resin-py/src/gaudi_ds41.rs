@@ -567,6 +567,14 @@ impl Ds41Executor {
             r[R_PF[ratio]] = counts.pf[ratio] as u64;
             r[R_DENSE[ratio]] = u64::from(counts.dense[ratio]);
         }
+        if std::env::var("RESIN_DS41_DEBUG_COUNTS").is_ok() {
+            eprintln!(
+                "[counts] sparse={} cand={} ixc={} ix=[{},{}] pf=[{},{}] radix={:?} dense={:?} | regs SPARSE={} CAND={} IXC={} IX0={} IX1={} PF0={} PF1={}",
+                counts.sparse, counts.cand, counts.ixc, counts.ix[0], counts.ix[1],
+                counts.pf[0], counts.pf[1], counts.radix, counts.dense,
+                r[R_SPARSE], r[R_CAND], r[R_IXC], r[R_IX[0]], r[R_IX[1]], r[R_PF[0]], r[R_PF[1]]
+            );
+        }
     }
 
     /// The sampler's table: the rows' parameters, then `last` (`_sample_launch`).

@@ -778,11 +778,19 @@ pub fn fill(
             let k = col_row[c] as usize;
             w.copy_words(blocks, c * pages_n, &row_bufs[k]);
         }
-        // the tiled chain: how many merge groups this step needs, and so how many of each arm's launches it takes
+        // the tiled chain: how many merge groups this step needs, and so how many of each arm's launches it takes.
+        // Each group's merge is a _IxMergeOp that emits TWO native ops (copy_multi + launch), so the plain arm
+        // is ix_lpg score launches + 2 per group; the candidate arm adds one block-max/cand-mask op on decode.
         let tp = tables.ix_tp as i64;
         let used = ((chunks + tp - 1) / tp) as usize;
-        counts.ix[ri] = used * (tables.ix_lpg + 1);
-        counts.pf[ri] = used * (tables.ix_lpg + 2);
+        counts.ix[ri] = used * (tables.ix_lpg + 2);
+        counts.pf[ri] = used * (tables.ix_lpg + if tables.prefill { 2 } else { 3 });
+        if std::env::var("RESIN_DS41_DEBUG_COUNTS").is_ok() {
+            eprintln!(
+                "[fill ri={}] chunks={} tp={} used={} ix_lpg={} ix_tp={} => counts.ix={} counts.pf={}",
+                ri, chunks, tp, used, tables.ix_lpg, tables.ix_tp, counts.ix[ri], counts.pf[ri]
+            );
+        }
     }
 
     prof.mark("index");
