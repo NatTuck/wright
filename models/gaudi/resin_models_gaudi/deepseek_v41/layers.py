@@ -1409,13 +1409,17 @@ def _listed_fused(
 ) -> Tensor:
     """The listed compressed attention as ONE single-pass global-max softmax over the window keys and the
     listed compressed keys (the official sparse_attn formula for <= 64 visible keys): gather the window keys
-    once (``mla_gather``, S slots broadcast to T by batch_gemm), score both key sets, ds_slot_fused casts bf16
-    P at the keys-only global max M and sums FP32 ls, two P.V gemms, then ds_attn_fused adds the parts and the
-    sink in the denominator and removes the rotation -> o (D, W, 1)."""
+    once (``mla_gather``, S query-block slots), score both key sets, ds_slot_fused casts bf16 P at the keys-only
+    global max M and sums FP32 ls, two P.V gemms, then ds_attn_fused adds the parts and the sink in the
+    denominator and removes the rotation -> o (D, W, 1). The window gemms run in the slot layout (M = nh*qb,
+    S) matching the gathered keys and are viewed to (nh, T): column h + nh*t of (nh, T) is column m + M*s of
+    (M, S) for t = qb*s + col, m = h + nh*col, so the flat layouts coincide for any S."""
     d, T = lg.d, lg.T
     D, nh = d.head_dim, d.heads
     W = nh * T
     C, K, S = win_keys, ks_cmp.shape[1], win_slots
+    qb = T // S
+    M = nh * qb
     wtable = lg.input("slots", (8, S), I32)
     lp = lg.input("lat_pages", (C // PAGE, S), I32)
     rp = lg.input("rope_pages", (C // PAGE, S), I32)
@@ -1424,8 +1428,10 @@ def _listed_fused(
         "rg_mla_gather_f32", [lg.arena(arena_blocks), lp, rp, wtable, win_dep if win_dep is not None else lg.dep()], [ksw],
         struct.pack("i", 0),
     )  # fmt: skip
-    scw = lg.tensor((C, nh, T), F32)
-    lg.node("batch_gemm", [qs, ksw], [scw], GEMM_NT)
+    qsb = lg.view(qs, (D, M, S))
+    scwb = lg.tensor((C, M, S), F32)
+    lg.node("batch_gemm", [qsb, ksw], [scwb], GEMM_NT)
+    scw = lg.view(scwb, (C, nh, T))
     scc = lg.tensor((K, nh, T), F32)
     lg.node("batch_gemm", [qs, ks_cmp], [scc], GEMM_NT)
     Mp = -(-nh // 64) * 64
@@ -1433,10 +1439,11 @@ def _listed_fused(
     mx, lsw, lsc = (lg.tensor((Mp, T), F32), lg.tensor((Mp, T), F32), lg.tensor((Mp, T), F32))
     lg.node(
         "rg_ds_slot_fused_f32", [scw, scc, wtable, lslots], [Pw, Pc, mx, lsw, lsc],
-        struct.pack("fii", d.scale, nh, T),
+        struct.pack("fii", d.scale, nh, qb),
     )  # fmt: skip
-    pv1 = lg.tensor((D, nh, T), F32)
-    lg.node("batch_gemm", [Pw, ksw], [pv1], GEMM_NN)
+    pv1b = lg.tensor((D, M, S), F32)
+    lg.node("batch_gemm", [lg.view(Pw, (C, M, S)), ksw], [pv1b], GEMM_NN)
+    pv1 = lg.view(pv1b, (D, nh, T))
     pv2 = lg.tensor((D, nh, T), F32)
     lg.node("batch_gemm", [Pc, ks_cmp], [pv2], GEMM_NN)
     o = o_out if o_out is not None else lg.tensor((D, W, 1), F32)

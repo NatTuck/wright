@@ -289,3 +289,40 @@ def test_attention_graph_one_launch_compiles(device, recipes):
     g = L.attention_graph(device, d, 32, 1, 384, 1, 16, ratio=2, query_block=32)
     recipes.compile(g)
     g.destroy()
+
+
+# (T, qb, ratio, dense) covering every prefill bucket and decode, ratio 1 and 2, listed and dense.
+_COVERAGE = [
+    (32, 32, 1, 0), (32, 32, 2, 0),
+    (128, 128, 1, 0), (128, 128, 2, 0), (128, 128, 2, 2048),
+    (512, 128, 1, 0), (512, 128, 2, 0), (512, 128, 2, 2048),
+    (1024, 128, 1, 0), (1024, 128, 2, 0), (1024, 128, 2, 2048),
+    (2048, 128, 1, 0), (2048, 128, 2, 0), (2048, 128, 2, 2048),
+    (16, 1, 1, 0), (16, 1, 2, 0), (4, 1, 2, 0), (1, 1, 2, 0),
+]
+
+
+@pytest.mark.parametrize("T,qb,ratio,dense", _COVERAGE)
+def test_fused_compile_coverage(device, recipes, T, qb, ratio, dense):
+    """Every serving shape's fused listed attention must compile: the window gemms run in the slot layout
+    (M = nh*qb, S = T/qb) viewed to (nh, T), so any win_slots S works (the S>1 broadcast bug is gone)."""
+    import json
+
+    from resin.models.deepseek_v41 import DeepSeekV41Config
+    from resin_models_gaudi.deepseek_v41 import layers as L
+
+    cfg = DeepSeekV41Config.from_hugging_face(json.load(open(os.path.join(CKPT, "config.json"))))
+    d = L.Dims.of(cfg, 1, cfg.vocab_size)
+    prefill = qb > 1
+    S = T // qb
+    keys = 384 if prefill else 256
+    # one-launch (non-owner/non-source) attention_graph, listed and dense
+    g = L.attention_graph(device, d, T, S, keys, 288, 288, ratio=ratio, query_block=qb,
+                          dense=dense, scores=16384 if dense else 0)
+    recipes.compile(g)
+    g.destroy()
+    # separate owner/source out graph (listed path only; dense uses _dense_part)
+    if not dense:
+        g2 = L.attention_out_graph(device, d, T, 288, 288, win_slots=S, win_keys=keys)
+        recipes.compile(g2)
+        g2.destroy()
