@@ -195,9 +195,11 @@ pub struct Tables {
     pub ix_tp: usize,
     pub ix_lpg: usize,
     pub ix_rows: usize,
-    /// (2, T): per query block its first column's position and the entries its last column sees. The merge, the
-    /// block kernels and `ds_ix_gslot` derive every per-group value from this and `ix_vis` on the device.
-    pub blk: usize,
+    /// per ratio (2, T): per query block its first column's position and the entries its last column sees. The
+    /// merge, the block kernels and `ds_ix_gslot` derive every per-group value from this and `ix_vis` on the
+    /// device. One table PER RATIO: ratio-1 and ratio-2 `seen` differ, and each ratio's gslot launch reads its
+    /// own (a shared table left ratio-1 records with ratio-2 seen/klen, corrupting ratio-1 top-512 at vis>512).
+    pub blk: [usize; 2],
     /// per ratio: every merge group's slot records (8, groups * lpg * ix_slots) and the groups' first keys
     /// (groups,), both written on the device by `ds_ix_gslot`
     pub ix_rec: [usize; 2],
@@ -646,8 +648,8 @@ pub fn fill(
                 // the block is the one its columns fall in: b0 / qb inside a prefill chunk's single row, and
                 // the column itself in a decode step (where every row is one column)
                 let b = ((rows.column[k] + b0) / qb as i64) as usize;
-                w.set(tables.blk, 2 * b, q);
-                w.set(tables.blk, 2 * b + 1, seen);
+                w.set(tables.blk[ri], 2 * b, q);
+                w.set(tables.blk[ri], 2 * b + 1, seen);
                 chunks = chunks.max((seen + INDEX_KEYS - 1) / INDEX_KEYS);
             }
         }
@@ -1281,6 +1283,78 @@ mod tests {
             &[],
         );
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn blk_is_per_ratio() {
+        // The host fill must write each ratio's query-block `seen` to its OWN blk table: ratio-1 gslot reads
+        // blk1, ratio-2 gslot reads blk2. A shared table (ratio-2 written last) left ratio-1 records with
+        // ratio-2 seen/klen, corrupting ratio-1 top-512 selection at vis>512 (the 512k context goal).
+        let model = Model {
+            heads: 8,
+            index_heads: 32,
+            sliding_window: 128,
+            layer_rows: vec![],
+            owners: vec![],
+            pending: vec![],
+            pages: 1,
+            kmax: 4096,
+            kc: 0,
+            candidate: None,
+            engram: None,
+            radix_min: 20480,
+            prefilter_blocks: 0,
+            prefilter_min: 0,
+            dense_keys: 0,
+        };
+        let tables = Tables {
+            t: 32,
+            prefill: true,
+            qb: 32,
+            win_slots: 1,
+            win_pages: 3,
+            groups2: 17,
+            ix_slots: 8,
+            ix_tp: 1,
+            ix_lpg: 1,
+            ix_rows: 2048,
+            nbytes: 200000,
+            meta: 0,
+            cs: [1000, 20000],
+            cs_inv: [40000, 60000],
+            slots: 80000,
+            ix_vis: [81000, 82000],
+            ix_visb: 83000,
+            ix_visb2: 84000,
+            cmp_blocks: [85000, 86000],
+            blk: [90000, 91000],
+            ..Tables::default()
+        };
+        let zero = [0i64];
+        let real = [32i64];
+        let rows = Rows {
+            column: &zero,
+            pos0: &zero,
+            real: &real,
+            window_first: &zero,
+            window_indptr: &[0, 1],
+            window: &[0],
+            window_ids: &[0],
+            history_indptr: &[0, 1],
+            history: &[0],
+            before_indptr: &[0, 0],
+            before: &[],
+        };
+        let cs = vec![0f32; 32 * 128];
+        let mut host = vec![0u8; 200000];
+        fill(&model, &tables, &mut host, &rows, &(0..32).collect::<Vec<i64>>(), None, false, None,
+             [&cs, &cs], &[]).unwrap();
+        let word = |off: usize| i32::from_le_bytes(host[off..off + 4].try_into().unwrap());
+        // block 0: lane 0 the first position (0), lane 1 the entries its last column sees
+        assert_eq!(word(tables.blk[0]), 0);
+        assert_eq!(word(tables.blk[0] + 4), 32); // ratio 1: (0 + 32) / 1
+        assert_eq!(word(tables.blk[1]), 0);
+        assert_eq!(word(tables.blk[1] + 4), 16); // ratio 2: (0 + 32) / 2
     }
 
     #[test]

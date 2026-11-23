@@ -276,7 +276,8 @@ class _Tables:
         # (2, T): lane 0 the position, lane 1 the count). Everything the tiled index chain needs per *group* is
         # derived from this and ix_vis on the device (ds_ix_gslot, ix_gvis, ds_ix_bmax, ix_cmask, ds_ix_merge),
         # so the fill's index work is O(T) rather than groups x T.
-        add("blk", i32, T, 2)
+        add("blk1", i32, T, 2)
+        add("blk2", i32, T, 2)
         for r in (1, 2):
             add(f"ix_vis{r}", i32, T)
             add(f"cmp_blocks{r}", i32, T, model.pages)
@@ -1283,6 +1284,27 @@ class DeepSeekV41Gaudi:
         H, nh = d.hidden, d.heads
         n = 4 * H * 4  # one column of a (4H, T) residual: 4 streams, f32
         out = {}
+        # per-layer partials/residual of the last step (localize the first diverging layer)
+        import os as _os
+        _df = None
+        if _os.environ.get("RESIN_DS41_DUMP_FILE"):
+            _df = open(_os.environ["RESIN_DS41_DUMP_FILE"], "a")
+        for s, prog in self._programs.items():
+            if s.prefill and getattr(prog, "layers", None):
+                print(f"[dump {tag}] per-layer column 0 (T={s.T}):")
+                for i, ops in enumerate(prog.layers):
+                    pa = dev.d2h(ops["p_attn"], (H,), np.float32)
+                    pf = dev.d2h(ops["p_ffn"], (H,), np.float32)
+                    xf = dev.d2h(ops["x_ffn"], (4 * H,), np.float32)
+                    line = (f"[dump {tag}]   L{i}: |p_attn| {np.linalg.norm(pa):.4f} "
+                            f"|p_ffn| {np.linalg.norm(pf):.4f} |x_ffn| {np.linalg.norm(xf):.4f} "
+                            f"finite {np.isfinite(xf).all()}")
+                    print(line)
+                    if _df:
+                        _df.write(line + "\n")
+                break
+        if _df:
+            _df.close()
         for k in (0, 1):
             a = dev.d2h(self.x[k], (4 * H,), np.float32)
             out[f"x{k}"] = a
@@ -1448,7 +1470,7 @@ class DeepSeekV41Gaudi:
                     self.r["ixg", s, r],
                     None,
                     {
-                        "blk": t("blk"),
+                        "blk": t(f"blk{r}"),
                         "ix_rec": t(f"ix{r}.rec"),
                         "ix_gbase": t(f"ix{r}.gb"),
                     },
@@ -1953,7 +1975,7 @@ class DeepSeekV41Gaudi:
                     "ix_tp": self.ix_tp(s),
                     "ix_lpg": self.ix_lpg(s),
                     "ix_rows": self.ix_rows(s),
-                    "blk": off["blk"],
+                    "blk": (off["blk1"], off["blk2"]),
                     "ix_rec": (off["ix1.rec"], off["ix2.rec"]),
                     "ix_gb": (off["ix1.gb"], off["ix2.gb"]),
                     "nbytes": tb.nbytes,

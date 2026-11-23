@@ -328,7 +328,7 @@ impl Ds41Fill {
             ix_tp: item(layout, "ix_tp")?,
             ix_lpg: item(layout, "ix_lpg")?,
             ix_rows: item(layout, "ix_rows")?,
-            blk: item(layout, "blk")?,
+            blk: item::<(usize, usize)>(layout, "blk")?.into(),
             ix_rec: item::<(usize, usize)>(layout, "ix_rec")?.into(),
             ix_gb: item::<(usize, usize)>(layout, "ix_gb")?.into(),
             nbytes: item(layout, "nbytes")?,
