@@ -394,6 +394,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("gx_mask")) return geom_gx_mask;
     if (is("mx4_dec")) return geom_mx4;
     if (is("ds_slot_pw1") || is("ds_slot_p1")) return geom_slot_p1;   // (prefix: before ds_slot_pw)
+    if (is("ds_slot_fused_dense")) return geom_slot_p;
     if (is("ds_slot_fused")) return geom_slot_p1;
     if (is("ds_slot_pw")) return geom_slot_p;
     if (is("ds_slot_pk")) return geom_slot_p;
@@ -407,6 +408,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_slot_mld")) return geom_slot_out;
     if (is("ds_slot_ml")) return geom_slot_out;
     if (is("ds_attn_comb")) return geom_sink2;
+    if (is("ds_attn_fused_dense")) return geom_sink2;
     if (is("ds_attn_fused")) return geom_sink2;
     if (is("ds_ix_slot_acc")) return geom_ix_slot_acc;
     if (is("ds_ix_qacc")) return geom_ix_qacc;

@@ -326,3 +326,117 @@ def test_fused_compile_coverage(device, recipes, T, qb, ratio, dense):
         g2 = L.attention_out_graph(device, d, T, 288, 288, win_slots=S, win_keys=keys)
         recipes.compile(g2)
         g2.destroy()
+
+
+def test_dense_fused_vs_singlepass(device, recipes):
+    """The DENSE fused attention (window + every visible compressed entry, all-visible mask) vs an independent
+    numpy single-pass global-max softmax, random weights, T=128 qb=128 S=1. Verifies the dense kernel's global
+    max over both key sets, bf16 P numerator, FP32 ls denominator, the (M,S) merge layout and the sink."""
+    import json
+    import struct
+
+    import numpy as np
+    from test_ds41_index_composition import _bf16_to_f32, _rope_swap
+    from test_ds41_kernels import bf16_round
+
+    from resin.models.deepseek_v41 import DeepSeekV41Config
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.deepseek_v41.rope import cs_table, layer_frequencies
+    from resin_models_gaudi.glm5_3_flash.layers import GEMM_NN, GEMM_NT
+    from resin_models_gaudi.loading.convert import bf16_rne
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import BF16, F32, I32
+
+    cfg = DeepSeekV41Config.from_hugging_face(json.load(open(os.path.join(CKPT, "config.json"))))
+    d = L.Dims.of(cfg, 1, cfg.vocab_size)
+    T, qb, S = 128, 128, 1
+    nh, D = d.heads, d.head_dim
+    C, K, ratio = 128, 256, 2
+    M, W = nh * qb, nh * T
+    scale = D**-0.5
+    rng = np.random.default_rng(42)
+    freqs = layer_frequencies(cfg, 1)
+    cs_inv = cs_table(np.arange(T), freqs, inverse=True)
+
+    q_all = bf16_rne(rng.standard_normal((W, D)).astype(np.float32) * 0.3)
+    ksw = bf16_rne(rng.standard_normal((S, C, D)).astype(np.float32) * 0.3)
+    ksd = bf16_rne(rng.standard_normal((S, K, D)).astype(np.float32) * 0.3)
+    sink = rng.standard_normal(nh).astype(np.float32) * 0.3
+    wslots = np.array([[0, 0, 0, 0, C, 0, 0, 128]], np.int32)
+    cslots = np.array([[0, 0, 0, 0, K, 0, ratio, 0]], np.int32)
+    score = np.ones((T, K), np.float32)
+    thr = np.full((T, 64), (np.float32(0.5).view(np.uint32) | np.uint32(0x80000000)).view(np.int32), np.int32)
+    lslots = np.zeros((T, 8), np.int32)
+    lslots[:, 7] = 20000000  # cut > 16777216 -> no tie cut
+
+    g = Graph(device, "dense_fused_oracle")
+    qa = g.input("q_all", (D, W), BF16)
+    kw = g.input("ksw", (D, C, S), BF16)
+    kd = g.input("ksd", (D, K, S), BF16)
+    wt = g.input("wslots", (8, S), I32)
+    ct = g.input("cslots", (8, S), I32)
+    sc_in = g.input("score", (K, T), F32)
+    th_in = g.input("thr", (64, T), I32)
+    ls_in = g.input("lslots", (8, T), I32)
+    qs = g.tensor((D, M, S), BF16)
+    g.node("reshape", [qa], [qs])
+    scw = g.tensor((C, M, S), F32)
+    g.node("batch_gemm", [qs, kw], [scw], GEMM_NT)
+    scc = g.tensor((K, M, S), F32)
+    g.node("batch_gemm", [qs, kd], [scc], GEMM_NT)
+    Pw, Pc = g.tensor((C, M, S), BF16), g.tensor((K, M, S), BF16)
+    mx, lsw, lsc = g.tensor((M, S), F32), g.tensor((M, S), F32), g.tensor((M, S), F32)
+    g.node("rg_ds_slot_fused_dense_f32", [scw, scc, wt, ct, sc_in, th_in, ls_in],
+           [Pw, Pc, mx, lsw, lsc], struct.pack("fi", scale, nh))
+    pv1, pv2 = g.tensor((D, M, S), F32), g.tensor((D, M, S), F32)
+    g.node("batch_gemm", [Pw, kw], [pv1], GEMM_NN)
+    g.node("batch_gemm", [Pc, kd], [pv2], GEMM_NN)
+    pv1f, pv2f = g.tensor((D, W, 1), F32), g.tensor((D, W, 1), F32)
+    g.node("reshape", [pv1], [pv1f])
+    g.node("reshape", [pv2], [pv2f])
+    sk = g.input("sink", (nh,), F32)
+    ci = g.input("cs_inv", (128, T), F32)
+    o = g.input("o_dbg", (D, W, 1), F32)
+    g.node("rg_ds_attn_fused_dense_f32", [pv1f, pv2f, mx, lsw, lsc, sk, ci], [o], struct.pack("ii", nh, qb))
+    r = recipes.compile(g)
+    bufs = {}
+    for n, t in r.persistent.items():
+        bufs[n] = device.malloc(max(t.nbytes, 256))
+    up = {"q_all": q_all, "ksw": ksw, "ksd": ksd, "wslots": wslots, "cslots": cslots,
+          "score": score, "thr": thr, "lslots": lslots, "sink": sink, "cs_inv": cs_inv,
+          "o_dbg": np.zeros((1, W, D), np.float32)}
+    for n, a in up.items():
+        device.h2d(bufs[n], np.ascontiguousarray(a))
+    for n in r.persistent:
+        r.bind(n, bufs[n])
+    r.launch()
+    device.sync()
+    od = device.d2h(bufs["o_dbg"], (1, W, D), np.float32)[0]
+    for a in bufs.values():
+        device.free(a)
+    g.destroy()
+
+    # numpy single-pass global-max reference (all-visible mask)
+    q16 = _bf16_to_f32(q_all).reshape(T, nh, D).astype(np.float64)
+    kwf = _bf16_to_f32(ksw[0]).astype(np.float64)
+    kdf = _bf16_to_f32(ksd[0]).astype(np.float64)
+    o_ref = np.zeros((T, nh, D), np.float64)
+    for t in range(T):
+        wlo, whi = max(0, t - 127), min(t + 1, C)
+        clim = min((t + 1) // ratio, K)
+        for h in range(nh):
+            scw_v = (q16[t, h] @ kwf[wlo:whi].T) * scale
+            scc_v = (q16[t, h] @ kdf[:clim].T) * scale
+            allsc = np.concatenate([scw_v, scc_v])
+            Mmax = allsc.max()
+            Pf = np.exp(allsc - Mmax)
+            Pb = bf16_round(Pf)
+            kv = np.concatenate([kwf[wlo:whi], kdf[:clim]], axis=0)
+            pv = Pb @ kv
+            ls = Pf.sum() + np.exp(float(sink[h]) - Mmax)
+            o_ref[t, h] = _rope_swap(pv / ls, cs_inv[t])
+    rel = float(np.linalg.norm(od - o_ref.reshape(W, D)) / max(np.linalg.norm(o_ref), 1e-12))
+    print(f"  DENSE fused o_inv vs numpy single-pass: norm_rel={rel:.4e}")
+    # Random weights hit bf16 P-cast rounding boundaries far more than real weights (listed real-weight
+    # gate is 4.6e-7); ~2e-5 is the fp32 exp8 / bf16 noise floor here, not a formula error (no NaN/inf).
+    assert rel <= 3e-5, f"dense fused attention diverges: norm_rel={rel:.4e}"

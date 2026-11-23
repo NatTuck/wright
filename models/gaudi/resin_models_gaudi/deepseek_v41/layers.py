@@ -1456,6 +1456,58 @@ def _listed_fused(
     return o
 
 
+def _dense_fused(
+    lg: LayerGraph, arena_blocks: int, ks_dense: Tensor, scores: int,
+    win_slots: int, win_keys: int, win_dep: Tensor | None = None, o_out: Tensor | None = None,
+) -> Tensor:
+    """The DENSE prefill compressed attention as ONE single-pass global-max softmax over the window keys and
+    every visible compressed entry of each query block (each column's top-512 list as a mask), the official
+    sparse_attn formula for <= 64 visible keys. Both key sets are in the slot layout (M = nh*128, S); the
+    window keys are gathered once (mla_gather), ds_slot_fused_dense casts bf16 P at the keys-only global max
+    and sums FP32 ls, two P.V gemms, ds_attn_fused_dense adds the parts and the sink and removes the rotation
+    -> o (D, W, 1)."""
+    d, T = lg.d, lg.T
+    D, nh = d.head_dim, d.heads
+    W = nh * T
+    C, K, S = win_keys, ks_dense.shape[1], win_slots
+    qb = QUERY_BLOCK_DENSE
+    M = nh * qb
+    wtable = lg.input("slots", (8, S), I32)
+    ctable = lg.input("cslots", (8, S), I32)
+    lp = lg.input("lat_pages", (C // PAGE, S), I32)
+    rp = lg.input("rope_pages", (C // PAGE, S), I32)
+    ksw = lg.tensor((D, C, S), BF16)
+    lg.node(
+        "rg_mla_gather_f32", [lg.arena(arena_blocks), lp, rp, wtable, win_dep if win_dep is not None else lg.dep()], [ksw],
+        struct.pack("i", 0),
+    )  # fmt: skip
+    qs = lg.view(lg.input("q_all", (D, W), BF16), (D, M, S))
+    scw = lg.tensor((C, M, S), F32)
+    lg.node("batch_gemm", [qs, ksw], [scw], GEMM_NT)
+    scc = lg.tensor((K, M, S), F32)
+    lg.node("batch_gemm", [qs, ks_dense], [scc], GEMM_NT)
+    Pw, Pc = lg.tensor((C, M, S), BF16), lg.tensor((K, M, S), BF16)
+    mx, lsw, lsc = (lg.tensor((M, S), F32), lg.tensor((M, S), F32), lg.tensor((M, S), F32))
+    lg.node(
+        "rg_ds_slot_fused_dense_f32",
+        [scw, scc, wtable, ctable, lg.input("ix_score", (scores, T), F32),
+         lg.input("ix_thr", (64, T), I32), lg.input("ix_lslots", (8, T), I32)],
+        [Pw, Pc, mx, lsw, lsc], struct.pack("fi", d.scale, nh),
+    )  # fmt: skip
+    pv1 = lg.tensor((D, M, S), F32)
+    lg.node("batch_gemm", [Pw, ksw], [pv1], GEMM_NN)
+    pv2 = lg.tensor((D, M, S), F32)
+    lg.node("batch_gemm", [Pc, ks_dense], [pv2], GEMM_NN)
+    o = o_out if o_out is not None else lg.tensor((D, W, 1), F32)
+    lg.node(
+        "rg_ds_attn_fused_dense_f32",
+        [lg.view(pv1, (D, W, 1)), lg.view(pv2, (D, W, 1)), mx, lsw, lsc,
+         lg.input("attn_sink", (nh,), F32), lg.input("cs_inv", (128, T), F32)],
+        [o], struct.pack("ii", nh, qb),
+    )  # fmt: skip
+    return o
+
+
 def attention_out_graph(
     device: Device,
     dims: Dims,
@@ -1487,6 +1539,11 @@ def attention_out_graph(
     W = nh * T
     if dense:
         ks = ks if ks is not None else _gather_dense(lg, arena_blocks, dense)
+        if win_keys:
+            o_out = lg.input(dbg_o, (D, W, 1), F32) if dbg_o else None
+            o = _dense_fused(lg, arena_blocks, ks, scores, win_slots, win_keys, win_dep, o_out)
+            _attention_out(lg, lg.view(o, (D, W)))
+            return lg.g
         o2, m2, l2 = _dense_part(lg, ks, scores)
         _attention_comb(lg, o2, m2, l2)
         return lg.g
