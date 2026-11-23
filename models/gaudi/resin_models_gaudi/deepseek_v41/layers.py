@@ -1273,7 +1273,7 @@ def index_gslot_graph(
     lg.node(
         "rg_ds_ix_gslot_f32",
         [lg.input("blk", (2, T), I32)],
-        [lg.input("ix_rec", (8, groups * S2), I32), lg.input("ix_gbase", (groups,), I32)],
+        [lg.input("ix_rec", (8, groups * S2), I32), lg.input("ix_gbase", (groups, 32), I32)],
         struct.pack("iiiiiiiii", S2, nblk, qb, INDEX_HEADS, ratio, keys, run, tp, page),
     )
     return lg.g

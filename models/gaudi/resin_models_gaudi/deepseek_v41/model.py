@@ -283,7 +283,9 @@ class _Tables:
             add(f"cmp_blocks{r}", i32, T, model.pages)
             # every merge group's slot records (lane 7: the tile's first index page) and the groups' first keys
             add(f"ix{r}.rec", i32, shape.ix_slots * model.ix_launches(shape, r), 8)
-            add(f"ix{r}.gb", i32, model.ix_groups(shape, r))
+            # per-group first key, each group in its own 128-byte (32 i32) slot so the merge/block recipes'
+            # ix_gbase section base (base + 128*g) is 128-aligned for every group (a packed +4*g misaligns g>0).
+            add(f"ix{r}.gb", i32, model.ix_groups(shape, r), 32)
         for layer in model.engram_layers:
             if model.engram == "host":
                 add(f"eg.{layer}", f32, T, 256 * J)
@@ -690,7 +692,7 @@ class DeepSeekV41Gaudi:
         # counts and pin from these (the fill writes neither)
         base = {
             "ix_vis": self.table + tb.off[f"ix_vis{ratio}"],
-            "ix_gbase": self.table + tb.off[f"ix{ratio}.gb"] + 4 * g,
+            "ix_gbase": self.table + tb.off[f"ix{ratio}.gb"] + 128 * g,
         }
         if kind == "b":
             names.update(
