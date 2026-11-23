@@ -1191,7 +1191,9 @@ class DeepSeekV41Gaudi:
                         graphs["sel", s, "user", "sparse"] = L.index_select_graph(
                             dev, d, T, self.kc, "user", top, sparse=True
                         )
-                graphs["out", s] = L.attention_out_graph(dev, d, T, nb, self.pages)
+                graphs["out", s] = L.attention_out_graph(
+                    dev, d, T, nb, self.pages, win_slots=s.win_slots, win_keys=s.win_keys
+                )
                 if self.dense(s):
                     graphs["out", s, "dense"] = L.attention_out_graph(
                         dev, d, T, nb, self.pages, dense=DENSE_KEYS, scores=self.ix_rows(s)

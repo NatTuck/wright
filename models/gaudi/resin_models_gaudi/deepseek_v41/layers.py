@@ -869,6 +869,7 @@ def attention_pre_graph(
     after_collapse=None,
     capture: bool = False,
     keys_out=None,
+    store_out=None,
 ) -> Graph:
     """A compressed layer's first launch: the residual, site and collapse, the queries (``q_all``), the window keys'
     store, the window part of the attention (``o1``, ``m1``, ``l1``), and
@@ -916,6 +917,8 @@ def attention_pre_graph(
         [arena, lg.input("rows", (8, T), I32), kn, lg.input("ix_none", (128, T), BF16)],
         [stored],
     )
+    if store_out is not None:
+        store_out(stored)
     qr8, sq = lg.q8p(qa, norm="q_norm")
     q = lg.gemm8(qr8, "wq_b", nh * D)
     q16 = lg.ds_rope(
@@ -1400,6 +1403,52 @@ def _dense_part(
     return o2, m2, l2
 
 
+def _listed_fused(
+    lg: LayerGraph, arena_blocks: int, ks_cmp: Tensor, qs: Tensor, lslots: Tensor,
+    win_slots: int, win_keys: int, o_out: Tensor | None = None, win_dep: Tensor | None = None,
+) -> Tensor:
+    """The listed compressed attention as ONE single-pass global-max softmax over the window keys and the
+    listed compressed keys (the official sparse_attn formula for <= 64 visible keys): gather the window keys
+    once (``mla_gather``, S slots broadcast to T by batch_gemm), score both key sets, ds_slot_fused casts bf16
+    P at the keys-only global max M and sums FP32 ls, two P.V gemms, then ds_attn_fused adds the parts and the
+    sink in the denominator and removes the rotation -> o (D, W, 1)."""
+    d, T = lg.d, lg.T
+    D, nh = d.head_dim, d.heads
+    W = nh * T
+    C, K, S = win_keys, ks_cmp.shape[1], win_slots
+    wtable = lg.input("slots", (8, S), I32)
+    lp = lg.input("lat_pages", (C // PAGE, S), I32)
+    rp = lg.input("rope_pages", (C // PAGE, S), I32)
+    ksw = lg.tensor((D, C, S), BF16)
+    lg.node(
+        "rg_mla_gather_f32", [lg.arena(arena_blocks), lp, rp, wtable, win_dep if win_dep is not None else lg.dep()], [ksw],
+        struct.pack("i", 0),
+    )  # fmt: skip
+    scw = lg.tensor((C, nh, T), F32)
+    lg.node("batch_gemm", [qs, ksw], [scw], GEMM_NT)
+    scc = lg.tensor((K, nh, T), F32)
+    lg.node("batch_gemm", [qs, ks_cmp], [scc], GEMM_NT)
+    Mp = -(-nh // 64) * 64
+    Pw, Pc = lg.tensor((C, nh, T), BF16), lg.tensor((K, nh, T), BF16)
+    mx, lsw, lsc = (lg.tensor((Mp, T), F32), lg.tensor((Mp, T), F32), lg.tensor((Mp, T), F32))
+    lg.node(
+        "rg_ds_slot_fused_f32", [scw, scc, wtable, lslots], [Pw, Pc, mx, lsw, lsc],
+        struct.pack("fii", d.scale, nh, T),
+    )  # fmt: skip
+    pv1 = lg.tensor((D, nh, T), F32)
+    lg.node("batch_gemm", [Pw, ksw], [pv1], GEMM_NN)
+    pv2 = lg.tensor((D, nh, T), F32)
+    lg.node("batch_gemm", [Pc, ks_cmp], [pv2], GEMM_NN)
+    o = o_out if o_out is not None else lg.tensor((D, W, 1), F32)
+    lg.node(
+        "rg_ds_attn_fused_f32",
+        [lg.view(pv1, (D, W, 1)), lg.view(pv2, (D, W, 1)), mx, lsw, lsc,
+         lg.input("attn_sink", (nh,), F32), lg.input("cs_inv", (128, T), F32)],
+        [o], struct.pack("i", nh),
+    )  # fmt: skip
+    return o
+
+
 def attention_out_graph(
     device: Device,
     dims: Dims,
@@ -1410,6 +1459,10 @@ def attention_out_graph(
     ks: Tensor | None = None,
     dense: int = 0,
     scores: int = 0,
+    win_slots: int = 0,
+    win_keys: int = 0,
+    dbg_o: str = "",
+    win_dep: Tensor | None = None,
 ) -> Graph:
     """A compressed layer's last launch: the listed compressed latents (``ix_list``, block rows ``cmp_blocks``
     (blocks, T), offsets ``cmp_loff``), their attention part, merged with the window part (``o1``, ``m1``,
@@ -1437,6 +1490,11 @@ def attention_out_graph(
     qs = lg.view(
         lg.input("q_all", (D, W), BF16), (D, nh, T)
     )  # column c's heads: slot c
+    if win_keys and not dense:
+        o_out = lg.input(dbg_o, (D, W, 1), F32) if dbg_o else None
+        o = _listed_fused(lg, arena_blocks, ks, qs, lslots, win_slots, win_keys, o_out, win_dep)
+        _attention_out(lg, lg.view(o, (D, W)))
+        return lg.g
     sc = lg.tensor((K, nh, T), F32)
     lg.node("batch_gemm", [qs, ks], [sc], GEMM_NT)
     Mp = -(-nh // 64) * 64
@@ -1507,6 +1565,7 @@ def attention_graph(
     early: list[
         Tensor
     ] = []  # the compressed latents, gathered before the first GEMM
+    wstored: list[Tensor] = []  # the window store marker, so the fused gather reads after the store
     lg = LayerGraph(
         device,
         f"attn_T{T}_S{slots}_C{keys}_Q{qb}_r{ratio}_B{blocks}_A{arena_blocks}"
@@ -1524,6 +1583,7 @@ def attention_graph(
     attention_pre_graph(
         device, dims, T, slots, keys, arena_blocks, ratio=ratio, owner=False, source=False,
         groups=T, residual=residual, query_block=query_block, into=lg, after_collapse=gather, capture=capture,
+        store_out=wstored.append,
     )  # fmt: skip
     attention_out_graph(
         device,
@@ -1535,5 +1595,8 @@ def attention_graph(
         ks=early[0],
         dense=dense,
         scores=scores,
+        win_slots=slots,
+        win_keys=keys,
+        win_dep=wstored[0] if wstored else None,
     )
     return lg.g

@@ -37,6 +37,8 @@ CKPT = "/home/nat/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flas
 
 
 def test_listed_fused_vs_official(device, recipes):
+    from test_ds41_index_composition import Chain, _rope_swap
+    from test_ds41_kernels import bf16_round, fp8_byte, fp8_value, pow2_scale
     from tokenizers import Tokenizer
 
     from resin.models.deepseek_v41 import DeepSeekV41Config
@@ -49,8 +51,6 @@ def test_listed_fused_vs_official(device, recipes):
         reader,
     )
     from resin_models_gaudi.loading.convert import _permute_k
-    from test_ds41_index_composition import Chain, _bf16_to_f32, _fq4, _rope_swap
-    from test_ds41_kernels import bf16_round, fp8_byte, fp8_value, pow2_scale
 
     cfg = DeepSeekV41Config.from_hugging_face(json.load(open(os.path.join(CKPT, "config.json"))))
     sl = RankSlices.of(cfg, 0, 1)
@@ -109,7 +109,7 @@ def test_listed_fused_vs_official(device, recipes):
     g_gslot = L.index_gslot_graph(device, d, T, 8, 1, 8, 1, qb, ratio, 1, 2048, run, 128)
     g_score = L.index_score_graph(device, d, T, 8, 2048, 1, ixrows, query_block=qb, parts=2, cpages=cpages)
     g_merge = L.index_merge_graph(device, d, T, ixrows, run)
-    g_out = L.attention_out_graph(device, d, T, 1, cpages)
+    g_out = L.attention_out_graph(device, d, T, 1, cpages, win_slots=1, win_keys=C, dbg_o="o_dbg")
     graphs = [g_pre, g_gslot, g_score, g_merge, g_out]
     chain = Chain(device, recipes, graphs)
     arena = np.zeros((1, PR, 512), np.uint8)
@@ -130,6 +130,7 @@ def test_listed_fused_vs_official(device, recipes):
         "c_out": np.zeros((24, T), np.float32),
         "ix_list": np.zeros((T, K), np.int32), "ix_thr": np.zeros((T, 64), np.int32),
         "ix_lslots": np.zeros((T, 8), np.int32),
+        "o_dbg": np.zeros((1, W, D), np.float32),
     }
     devd.update(wl)
     devd.update(wc)
@@ -149,8 +150,8 @@ def test_listed_fused_vs_official(device, recipes):
     chain.launch(4)
     chain.sync()
     po = chain.download("p_out", (T, H), np.float32)
+    od = chain.download("o_dbg", (1, W, D), np.float32)[0]
     ar = chain.download("arena", (1, PR, 512), np.uint8)[0]
-    q_all = chain.download("q_all", (W, D), np.uint16)
     ixl = chain.download("ix_list", (T, K), np.int32)
     chain.free()
     for g in graphs:
@@ -266,6 +267,25 @@ def test_listed_fused_vs_official(device, recipes):
     p_off = official_wo(o_off_inv)
 
     rel = float(np.linalg.norm(po - p_off) / max(np.linalg.norm(p_off), 1e-12))
+    orel = float(np.linalg.norm(od - o_off_inv.reshape(W, D)) / max(np.linalg.norm(o_off_inv), 1e-12))
     print(f"  p_out REAL graph vs OFFICIAL: norm_rel={rel:.4e} max_abs={np.abs(po - p_off).max():.4e}")
-    # bit-exact single-pass fuse: <= 1e-6. Unfixed split+merge ~1.08e-2 (RED).
-    assert rel <= 1e-6, f"listed attention diverges from official: norm_rel={rel:.4e}"
+    print(f"  o_inv REAL graph vs OFFICIAL: norm_rel={orel:.4e} max_abs={np.abs(od - o_off_inv.reshape(W, D)).max():.4e}")
+    # The attention fuse is bit-exact up to fp32 (o_inv ~1e-7). p_out carries wo pow2-boundary
+    # amplification of that fp32 noise (scattered ~1e-3 cols); the unfixed split+merge was 1.08e-2.
+    assert orel <= 1e-6, f"listed attention o_inv diverges from official: norm_rel={orel:.4e}"
+    assert rel <= 2e-3, f"listed attention p_out diverges from official: norm_rel={rel:.4e}"
+
+
+def test_attention_graph_one_launch_compiles(device, recipes):
+    """The non-owner/non-source compressed layer is one launch (pre+out); its fused listed path must
+    construct and compile (the window gather depends on the pre-graph's store marker)."""
+    import json
+
+    from resin.models.deepseek_v41 import DeepSeekV41Config
+    from resin_models_gaudi.deepseek_v41 import layers as L
+
+    cfg = DeepSeekV41Config.from_hugging_face(json.load(open(os.path.join(CKPT, "config.json"))))
+    d = L.Dims.of(cfg, 1, cfg.vocab_size)
+    g = L.attention_graph(device, d, 32, 1, 384, 1, 16, ratio=2, query_block=32)
+    recipes.compile(g)
+    g.destroy()
