@@ -58,8 +58,8 @@ def _silu_clamp(gate: np.ndarray, up: np.ndarray, lim: float) -> np.ndarray:
     return g * sig * u
 
 
-@pytest.fixture(scope="module")
-def ffn_case():
+@pytest.fixture(scope="module", params=[4, 32])
+def ffn_case(request):
     """Synthetic checkpoint-format weights + the device tensors the graph binds, and the numpy truth."""
     from resin_models_gaudi.deepseek_v41.weights import (
         OCP,
@@ -71,7 +71,8 @@ def ffn_case():
     from resin_models_gaudi.loading.convert import bf16_rne, kperm
 
     rng = np.random.default_rng(20261122)
-    H, E, K, T, w, lim, rscale, eps = 5120, 64, 6, 4, 576, 10.0, 1.5, 1e-20
+    H, E, K, w, lim, rscale, eps = 5120, 64, 6, 576, 10.0, 1.5, 1e-20
+    T = request.param
     w0 = w // 128 * 128
     t = w - w0
     S = K * T

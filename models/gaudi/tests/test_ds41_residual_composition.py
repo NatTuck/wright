@@ -56,10 +56,11 @@ def _sinkhorn(mix, scale, base, iters, eps):
     return pre, post, comb
 
 
-@pytest.mark.parametrize("T", [1, 4, 8])
+@pytest.mark.parametrize("T", [1, 4, 8, 16, 32, 64])
 def test_residual_and_site_match_reference(device, recipes, T):
-    from resin_models_gaudi.deepseek_v41 import layers as L
     from test_ds41_kernels import Run
+
+    from resin_models_gaudi.deepseek_v41 import layers as L
 
     rng = np.random.default_rng(4242 + T)
     H, eps, hc_eps, iters = 5120, 1e-20, 1e-6, 20
