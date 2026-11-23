@@ -6,6 +6,12 @@
 // params: eps.  index space: T <= 2: [32] (one row per member); else [8, ceil(T/4)] (4 rows x 4 tokens per member).
 #include "common.h"
 
+// The T>2 partial-store branch replicated lane 0 into output lanes 11-23 (comb rows 1-3 uniform -> mHC
+// streams never differentiate). Use the per-column full-store branch for every T (one member per row).
+#ifndef ROWS_ONLY
+#define ROWS_ONLY
+#endif
+
 void main(tensor fn, tensor X, tensor mixT, tensor rt, float eps)
 {
     const int5 off = get_index_space_offset();

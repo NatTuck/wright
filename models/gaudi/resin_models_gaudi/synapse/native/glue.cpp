@@ -293,8 +293,8 @@ static bool geom_mixp(const HabanaKernelParams* p, uint64_t is[5], uint32_t* ran
 }
 // mhc_mix
 static bool geom_mhc_mix(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
-    const uint64_t T = sz(p, true, 0, 0);
-    if (T > 2) { is[0] = sz(p, true, 0, 1) / 4; is[1] = (T + 3) / 4; *rank = 2; return true; }
+    // one member per output row (column j); the per-column full-store branch is correct for every T
+    // (the T>2 partial-store branch replicated lane 0 into lanes 11-23).
     is[0] = sz(p, true, 0, 1); *rank = 1; return true;
 }
 // kda_ck_step
