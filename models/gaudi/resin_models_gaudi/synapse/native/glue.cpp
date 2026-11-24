@@ -369,6 +369,10 @@ static bool geom_gather16(const HabanaKernelParams* p, uint64_t is[5], uint32_t*
 static bool geom_mx4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, true, 0, 0) + 2047) / 2048; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
 }
+// ds_ldec_f4: one column (512 latent elements) of the staging slab per member
+static bool geom_ldec_f4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 1; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
+}
 static GeomFn geom_glm(const char* n) {
     auto is = [&](const char* pre) { return strncmp(n, pre, strlen(pre)) == 0; };
     if (is("mhc_mixp")) return geom_mixp;               // (prefix: before mhc_mix)
@@ -421,6 +425,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_ix_slot_acc")) return geom_ix_slot_acc;
     if (is("ds_ix_qacc")) return geom_ix_qacc;
     if (is("ds_gather_list")) return geom_gather16;
+    if (is("ds_ldec_f4")) return geom_ldec_f4;
     if (is("ds_gather_dense_f4")) return geom_mla_gather;
     if (is("ds_smean")) return geom_elem64;
     if (is("ds_argmax")) return geom_columns;
@@ -610,6 +615,35 @@ static void ap_gather8(const HabanaKernelParams* p, HabanaKernelInstantiation* i
     o.allRequired = 0;
     amap(o, 0, 0, D, 0, D - 1); amap(o, 1, 1, 8, 0, 7); amap(o, 2, 2, 1, 0, 0);
 }
+// ds_gather_list_f4 staging: codes (256, C, T) + scales (32, C, T), 16 keys a member
+static void ap_gather_list_f4(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
+    TensorAccessPattern& c = inst->outputTensorAccessPattern[0];
+    c.allRequired = 0;
+    amap(c, 0, 0, 256, 0, 255); amap(c, 1, 1, 16, 0, 15); amap(c, 2, 2, 1, 0, 0);
+    TensorAccessPattern& s = inst->outputTensorAccessPattern[1];
+    s.allRequired = 0;
+    amap(s, 0, 0, 32, 0, 31); amap(s, 1, 1, 16, 0, 15); amap(s, 2, 2, 1, 0, 0);
+}
+// ds_ldec_f4: dequant one column of codes (256) + scales (32) -> 512 bf16
+static void ap_ldec_f4(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
+    for (int t = 0; t < 2; t++) {
+        TensorAccessPattern& w = inst->inputTensorAccessPattern[t];
+        w.allRequired = 0;
+        amap(w, 0, 0, t ? 32 : 256, 0, t ? 31 : 255); amap(w, 1, 1, 1, 0, 0);
+    }
+    TensorAccessPattern& o = inst->outputTensorAccessPattern[0];
+    o.allRequired = 0;
+    amap(o, 0, 0, 512, 0, 511); amap(o, 1, 1, 1, 0, 0);
+}
+// ds_gather_dense_f4 staging: codes (256, C, S) + scales (32, C, S), 32 keys a member
+static void ap_gather_dense_f4(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
+    TensorAccessPattern& c = inst->outputTensorAccessPattern[0];
+    c.allRequired = 0;
+    amap(c, 0, 0, 256, 0, 255); amap(c, 1, 1, 32, 0, 31); amap(c, 2, 2, 1, 0, 0);
+    TensorAccessPattern& s = inst->outputTensorAccessPattern[1];
+    s.allRequired = 0;
+    amap(s, 0, 0, 32, 0, 31); amap(s, 1, 1, 32, 0, 31); amap(s, 2, 2, 1, 0, 0);
+}
 static void ap_mla_slot_q(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
     const int D = int(sz(p, true, 0, 0));
     TensorAccessPattern& o = inst->outputTensorAccessPattern[0];
@@ -665,9 +699,10 @@ static ApFn ap_for(const char* n) {
     if (strncmp(n, "lq_qdqp_", 8) == 0) return ap_qdqp;
     if (strcmp(n, "mla_slot_q") == 0) return ap_mla_slot_q;
     if (strcmp(n, "mla_gather") == 0 || strcmp(n, "mla_gather_list") == 0) return ap_mla_gather;
-    if (strcmp(n, "ds_gather_dense_f4") == 0) return ap_mla_gather;
+    if (strcmp(n, "ds_gather_dense_f4") == 0) return ap_gather_dense_f4;
     if (strcmp(n, "ds_gather_list") == 0) return ap_gather8;
-    if (strcmp(n, "ds_gather_list_f4") == 0) return ap_gather8;
+    if (strcmp(n, "ds_gather_list_f4") == 0) return ap_gather_list_f4;
+    if (strcmp(n, "ds_ldec_f4") == 0) return ap_ldec_f4;
     if (strcmp(n, "attn_slot_q") == 0) return ap_slot_q;
     if (strcmp(n, "kv_gather") == 0 || strcmp(n, "kv_gather8") == 0) return ap_kv_gather;
     return nullptr;

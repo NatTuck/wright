@@ -1359,29 +1359,50 @@ def index_block_select_graph(
 
 
 def _gather_listed(lg: LayerGraph, arena_blocks: int, blocks: int) -> Tensor:
-    """The listed compressed latents of every column: (head_dim, 512, T) bf16."""
+    """The listed compressed latents of every column: (head_dim, 512, T) bf16.  The gather emits a packed
+    fp4 codes+scales staging slab; a separate dequant producer (ds_ldec_f4) decodes it to bf16 so the
+    compiler SRAM-slices the dequant tile feeding batch_gemm and overlaps TPC-dequant with MME-GEMM."""
     D, K, T = lg.d.head_dim, INDEX_TOP, lg.T
-    ks = lg.tensor((D, K, T), BF16)
+    codes = lg.tensor((D // 2, K, T), U8)
+    scales = lg.tensor((D // 16, K, T), U8)
     lg.node(
         "rg_ds_gather_list_f4_f32",
         [lg.arena(arena_blocks), lg.input("ix_list", (K, T), I32), lg.input("cmp_blocks", (blocks, T), I32),
          lg.input("cmp_loff", (64,), I32), lg.input("ix_lslots", (8, T), I32), lg.dep()],
-        [ks],
+        [codes, scales],
     )  # fmt: skip
+    codes2 = lg.tensor((D // 2, K * T), U8)
+    scales2 = lg.tensor((D // 16, K * T), U8)
+    ks2 = lg.tensor((D, K * T), BF16)
+    lg.node("reshape", [codes], [codes2])
+    lg.node("reshape", [scales], [scales2])
+    lg.node("rg_ds_ldec_f4_f32", [codes2, scales2], [ks2])
+    ks = lg.tensor((D, K, T), BF16)
+    lg.node("reshape", [ks2], [ks])
     return ks
 
 
 def _gather_dense(lg: LayerGraph, arena_blocks: int, keys: int) -> Tensor:
     """Every visible compressed latent of each query block's slot: (head_dim, keys, slots) bf16, from the owner's
-    latent pages ``cmp_lat`` (keys / 128, slots) and the slots ``cslots`` (8, slots)."""
+    latent pages ``cmp_lat`` (keys / 128, slots) and the slots ``cslots`` (8, slots).  Staging gather + separate
+    dequant producer (ds_ldec_f4) for SRAM slicing / TPC-dequant ∥ MME-GEMM overlap, as _gather_listed."""
     D, S = lg.d.head_dim, lg.T // QUERY_BLOCK_DENSE
-    ks = lg.tensor((D, keys, S), BF16)
+    codes = lg.tensor((D // 2, keys, S), U8)
+    scales = lg.tensor((D // 16, keys, S), U8)
     lp = lg.input("cmp_lat", (keys // PAGE, S), I32)
     lg.node(
         "rg_ds_gather_dense_f4_f32",
         [lg.arena(arena_blocks), lp, lp, lg.input("cslots", (8, S), I32), lg.dep()],
-        [ks],
+        [codes, scales],
     )
+    codes2 = lg.tensor((D // 2, keys * S), U8)
+    scales2 = lg.tensor((D // 16, keys * S), U8)
+    ks2 = lg.tensor((D, keys * S), BF16)
+    lg.node("reshape", [codes], [codes2])
+    lg.node("reshape", [scales], [scales2])
+    lg.node("rg_ds_ldec_f4_f32", [codes2, scales2], [ks2])
+    ks = lg.tensor((D, keys, S), BF16)
+    lg.node("reshape", [ks2], [ks])
     return ks
 
 

@@ -48,15 +48,20 @@ static inline float64 scale4_broadcast(float64 sf, int base)
 }
 
 // bf (128 bf16 codes, 8 groups of 16) * sbf (lanes base..base+7 = 8 e4m3 scales) -> 128 bf16 (natural).
-// The scale is positive, so the output sign is the input sign; OR it back to preserve -0.
+// Direct bf16 multiply (as the fp8 gather ds_gather_list does f.v1 * su): the fp4 product
+// e2m1(1 mantissa bit) x e4m3(3 bits) needs <= 4 significant bits and fits bf16 exactly.  The scale is
+// broadcast in f32 natural order (scale4_broadcast) then mapped to the bf16 REGISTER order with
+// convert_float128_to_bfloat128 SW_LINEAR -- the exact inverse of the codes' bf16->f32 SW_LINEAR widen,
+// so it matches bf's register order (v_convert_f32_to_bf16_all_b does NOT; it misaligns the groups).
+// bf16 multiply by a positive scale preserves -0.
 static inline bfloat128 mul_scale128(bfloat128 bf, bfloat128 sbf, int base)
 {
-    const float128 f = convert_bfloat128_to_float128(bf, SW_LINEAR);
     const float128 sf = convert_bfloat128_to_float128(sbf, SW_LINEAR);
-    float128 r;
-    r.v1 = f.v1 * scale4_broadcast(sf.v1, base);
-    r.v2 = f.v2 * scale4_broadcast(sf.v1, base + 4);
-    const bfloat128 out = convert_float128_to_bfloat128(r, SW_RHNE | SW_LINEAR);
+    float128 sb2;
+    sb2.v1 = scale4_broadcast(sf.v1, base);
+    sb2.v2 = scale4_broadcast(sf.v1, base + 4);
+    const bfloat128 su = convert_float128_to_bfloat128(sb2, SW_RHNE | SW_LINEAR);
+    const bfloat128 out = bf * su;
     const ushort128 sign = v_u16_and_b(__builtin_bit_cast(ushort128, bf), (ushort128)0x8000);
     return __builtin_bit_cast(bfloat128, v_u16_or_b(__builtin_bit_cast(ushort128, out), sign));
 }

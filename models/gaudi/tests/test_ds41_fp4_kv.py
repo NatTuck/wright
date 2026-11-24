@@ -262,12 +262,21 @@ def _fp4_roundtrip(device, recipes, x):
          g.input("ix", (128, T), F32)],
         [sink],
     )
+    codes = g.tensor((256, C, T), U8)
+    scales = g.tensor((32, C, T), U8)
     g.node(
         "rg_ds_gather_list_f4_f32",
         [arena, g.input("list", (C, T), I32), g.input("blocks", (1, T), I32),
          g.input("loff", (64,), I32), g.input("slots", (8, T), I32), sink],
-        [g.input("out", (512, C, T), BF16)],
+        [codes, scales],
     )
+    codes2 = g.tensor((256, C * T), U8)
+    scales2 = g.tensor((32, C * T), U8)
+    out2 = g.tensor((512, C * T), BF16)
+    g.node("reshape", [codes], [codes2])
+    g.node("reshape", [scales], [scales2])
+    g.node("rg_ds_ldec_f4_f32", [codes2, scales2], [out2])
+    g.node("reshape", [out2], [g.input("out", (512, C, T), BF16)])
     lst = np.zeros((T, C), np.int32)
     lst[:, :T] = np.arange(T, dtype=np.int32)
     blocks = np.full((T, 1), B, np.int32)
