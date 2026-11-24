@@ -952,7 +952,47 @@ pub fn engram_gather_into(
 /// read global row `ids[(c*layers+e)*width+j]` from the layer's mmap table, dequantize its 256 codes
 /// with the LUT (one E8M0 scale per 32 codes), and write `eg_emb[256*j+i, c]` — the f32 layout the
 /// device's `engram_graph` reads. Runs inside the fill under `py.detach` (no GIL, no per-step Python).
+///
+/// Prefill shapes gather on scoped worker threads (columns are independent, the ids are a pure hash
+/// of host-known prompt tokens, the LUT and the mmap tables are shared read-only); decode shapes
+/// stay serial — their gather is a few dozen rows and the decode floor is not to be perturbed.
 fn engram_gather_host(
+    engram: &Engram,
+    tables: &Tables,
+    w: &mut Words<'_>,
+    ids: &[i64],
+    host_tables: &[HostTable],
+    t: usize,
+) -> Result<(), String> {
+    let threads = gather_threads(tables.prefill, t);
+    if threads <= 1 {
+        engram_gather_serial(engram, tables, w, ids, host_tables, t)
+    } else {
+        engram_gather_threaded(engram, tables, w, ids, host_tables, t, threads)
+    }
+}
+
+/// The gather's worker count: `RESIN_DS41_GATHER_THREADS` (default 8, 0/1: serial), capped by the
+/// column count and the box's cores. Prefill only — a decode shape always returns 1.
+fn gather_threads(prefill: bool, t: usize) -> usize {
+    if !prefill {
+        return 1;
+    }
+    static CFG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cfg = *CFG.get_or_init(|| {
+        std::env::var("RESIN_DS41_GATHER_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+    });
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cfg.min(t).min(cores).max(1)
+}
+
+/// The serial gather: one column at a time through a scratch row buffer, then a bulk write.
+fn engram_gather_serial(
     engram: &Engram,
     tables: &Tables,
     w: &mut Words<'_>,
@@ -974,6 +1014,75 @@ fn engram_gather_host(
             engram_gather_into(ht.weight, ht.scale, &col_ids, &mut scratch)?;
             let base = c * (256 * width);
             w.set_many_f32(offset, base, &scratch);
+        }
+    }
+    Ok(())
+}
+
+/// The threaded gather: each layer's embedding region is split into contiguous column ranges, one
+/// per scoped worker, and every worker dequantizes its columns straight into its own disjoint slice
+/// of the host image (no scratch, no second copy). The mmap tables and the LUT are shared read-only;
+/// the workers touch no Python and no device state, so this is safe under the fill's `py.detach`.
+/// A worker's error (or panic) fails the fill; partial writes are harmless — an errored fill is
+/// never uploaded.
+fn engram_gather_threaded(
+    engram: &Engram,
+    tables: &Tables,
+    w: &mut Words<'_>,
+    ids: &[i64],
+    host_tables: &[HostTable],
+    t: usize,
+    threads: usize,
+) -> Result<(), String> {
+    let width = (engram.n - 1) * engram.heads;
+    let stride = 256 * width; // f32 words one column occupies in an embedding table
+    let per = t.div_ceil(threads);
+    let ranges: Vec<(usize, usize)> = (0..threads)
+        .map(|k| (k * per, ((k + 1) * per).min(t)))
+        .filter(|&(a, b)| a < b)
+        .collect();
+    let all: &mut [i32] = w.0;
+    for &(offset, e) in &tables.engram_emb {
+        let ht = host_tables
+            .get(e)
+            .ok_or_else(|| format!("no host Engram table for layer index {e}"))?;
+        let layer = &mut all[offset / 4..offset / 4 + t * stride];
+        // the workers' disjoint column slices of this layer's region
+        let mut rest = layer;
+        let mut slices = Vec::with_capacity(ranges.len());
+        for &(c0, c1) in &ranges {
+            let (mine, tail) = rest.split_at_mut((c1 - c0) * stride);
+            slices.push(mine);
+            rest = tail;
+        }
+        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(ranges.len());
+            for (&(c0, c1), slice) in ranges.iter().zip(slices) {
+                handles.push(scope.spawn(move || -> Result<(), String> {
+                    for c in c0..c1 {
+                        let col = &ids[(c * engram.layers + e) * width..][..width];
+                        let dst = &mut slice[(c - c0) * stride..][..stride];
+                        // SAFETY: i32 and f32 have identical size and alignment; the host image is
+                        // 4-byte aligned (words()) and every table offset is a multiple of 4; this
+                        // worker exclusively owns its column range's slice for the whole gather.
+                        let out = unsafe {
+                            std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f32>(), stride)
+                        };
+                        engram_gather_into(ht.weight, ht.scale, col, out)?;
+                    }
+                    Ok(())
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("an Engram gather worker panicked".into()))
+                })
+                .collect()
+        });
+        for r in results {
+            r?;
         }
     }
     Ok(())
@@ -1585,5 +1694,379 @@ mod tests {
         // a missing host table for the layer index is an error too
         let mut w = words(&mut buf, nbytes).unwrap();
         assert!(engram_gather_host(&engram, &tables, &mut w, &vec![0i64; width], &[], 1).is_err());
+    }
+
+    /// The independent oracle LUT at all 65536 pairs, built once (the large-shape gates below do
+    /// millions of lookups; `ref_lut` per element would be needlessly slow). Still shares no code
+    /// with the production LUT: it is the `ref_ocp`/`ref_lut` transcription.
+    fn ref_lut_table() -> Vec<[f32; 256]> {
+        (0..256)
+            .map(|s| {
+                let mut row = [0f32; 256];
+                for (c, v) in row.iter_mut().enumerate() {
+                    *v = ref_lut(s, c as u8);
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// One layer's oracle output with a prebuilt independent LUT: same indexing as `ref_gather`.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_gather_lut(
+        lut: &[[f32; 256]],
+        weight: &[u8],
+        scale: &[u8],
+        ids: &[i64],
+        t: usize,
+        layers: usize,
+        width: usize,
+        e: usize,
+    ) -> Vec<u32> {
+        let mut out = vec![0u32; t * 256 * width];
+        for c in 0..t {
+            for j in 0..width {
+                let row = ids[(c * layers + e) * width + j] as usize;
+                for i in 0..256 {
+                    let code = weight[row * 256 + i];
+                    let s = scale[row * 8 + i / 32];
+                    out[c * 256 * width + j * 256 + i] = lut[usize::from(s)][usize::from(code)].to_bits();
+                }
+            }
+        }
+        out
+    }
+
+    /// A multi-layer Engram and its per-layer host tables with DIFFERENT bytes per layer (a layer
+    /// swap or a wrong `e` must be visible), `layers` embedding tables laid out back to back.
+    #[allow(clippy::type_complexity)]
+    fn threaded_fixture(
+        layers: usize,
+        rows: usize,
+        seed: u8,
+        t: usize,
+    ) -> (Engram, Vec<(Vec<u8>, Vec<u8>)>, Tables, usize) {
+        let (n, heads) = (4usize, 8usize);
+        let engram = Engram {
+            token_map: vec![],
+            pad_id: 0,
+            multipliers: vec![],
+            n,
+            heads,
+            layers,
+            primes: vec![],
+            offsets: vec![],
+        };
+        let data: Vec<(Vec<u8>, Vec<u8>)> = (0..layers)
+            .map(|e| synthetic_table(rows, seed.wrapping_add(e as u8 * 31)))
+            .collect();
+        let width = (n - 1) * heads;
+        let per = t * 256 * width * 4;
+        let tables = Tables {
+            t,
+            prefill: true,
+            engram_emb: (0..layers).map(|e| (e * per, e)).collect(),
+            nbytes: layers * per,
+            ..Tables::default()
+        };
+        (engram, data, tables, width)
+    }
+
+    fn ids_of(t: usize, layers: usize, width: usize, rows: usize, seed: u8, variant: u64) -> Vec<i64> {
+        (0..t * layers * width)
+            .map(|k| ((k as u64 * 7 + variant * 11 + u64::from(seed)) % rows as u64) as i64)
+            .collect()
+    }
+
+    fn buf_words(buf: &[u8]) -> Vec<u32> {
+        buf.chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    }
+
+    /// Bit-compare two word vectors; on mismatch report the FIRST differing word (a full `assert_eq`
+    /// dump of a 12.6M-word vector is an 18 MB log line).
+    fn assert_words_eq(got: &[u32], want: &[u32], ctx: &str) {
+        assert_eq!(got.len(), want.len(), "{ctx}: length");
+        if let Some(at) = got.iter().zip(want).position(|(a, b)| a != b) {
+            panic!(
+                "{ctx}: first mismatch at word {at}: got {:#010x}, want {:#010x}",
+                got[at], want[at]
+            );
+        }
+    }
+
+    /// The THREADED gather on the required case class — same shape, DIFFERENT data (different ids,
+    /// different table bytes, different bytes per layer) — at shapes where every worker owns several
+    /// columns (the small-t oracle above gives each worker one column at most, so a within-range
+    /// lane/order bug is invisible there). Includes the production 2048-column chunk and an odd
+    /// column count (uneven ranges), one and two layers.
+    #[test]
+    fn engram_gather_threaded_same_shape_different_data() {
+        let lut = ref_lut_table();
+        let rows = 4096usize;
+        for layers in [1usize, 2] {
+            for seed in [0u8, 200] {
+                for t in [64usize, 257, 2048] {
+                    let (engram, data, tables, width) = threaded_fixture(layers, rows, seed, t);
+                    let hts: Vec<HostTable> = data
+                        .iter()
+                        .map(|(w, s)| HostTable { weight: w, scale: s })
+                        .collect();
+                    for variant in 0..2u64 {
+                        let ids = ids_of(t, layers, width, rows, seed, variant);
+                        let mut buf = vec![0u8; tables.nbytes];
+                        {
+                            let mut w = words(&mut buf, tables.nbytes).unwrap();
+                            engram_gather_host(&engram, &tables, &mut w, &ids, &hts, t).unwrap();
+                        }
+                        let got = buf_words(&buf);
+                        let mut want = Vec::with_capacity(got.len());
+                        for (e, (weight, scale)) in data.iter().enumerate() {
+                            want.extend(ref_gather_lut(&lut, weight, scale, &ids, t, layers, width, e));
+                        }
+                        assert_words_eq(
+                            &got,
+                            &want,
+                            &format!("layers {layers}, seed {seed}, t {t}, variant {variant}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The threaded gather is bit-exact against the serial gather on the same inputs (both paths
+    /// called directly, so the comparison does not depend on the dispatch or the environment).
+    #[test]
+    fn engram_gather_threaded_bit_exact_vs_serial() {
+        let rows = 4096usize;
+        for layers in [1usize, 2] {
+            for t in [64usize, 257, 2048] {
+                let (engram, data, tables, width) = threaded_fixture(layers, rows, 9, t);
+                let hts: Vec<HostTable> = data
+                    .iter()
+                    .map(|(w, s)| HostTable { weight: w, scale: s })
+                    .collect();
+                for variant in 0..2u64 {
+                    let ids = ids_of(t, layers, width, rows, 9, variant);
+                    let mut serial = vec![0u8; tables.nbytes];
+                    let mut threaded = vec![0u8; tables.nbytes];
+                    {
+                        let mut w = words(&mut serial, tables.nbytes).unwrap();
+                        engram_gather_serial(&engram, &tables, &mut w, &ids, &hts, t).unwrap();
+                    }
+                    {
+                        let mut w = words(&mut threaded, tables.nbytes).unwrap();
+                        engram_gather_threaded(&engram, &tables, &mut w, &ids, &hts, t, 8).unwrap();
+                    }
+                    assert_words_eq(
+                        &buf_words(&serial),
+                        &buf_words(&threaded),
+                        &format!("layers {layers}, t {t}, variant {variant}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The threaded path keeps the serial path's error contract: an out-of-range row and a missing
+    /// host table both fail the fill (here in a worker's late column, not the first).
+    #[test]
+    fn engram_gather_threaded_rejects_bad_rows_and_missing_tables() {
+        let rows = 64usize;
+        let t = 64usize;
+        let (engram, data, tables, width) = threaded_fixture(1, rows, 0, t);
+        let hts: Vec<HostTable> = data
+            .iter()
+            .map(|(w, s)| HostTable { weight: w, scale: s })
+            .collect();
+        let mut ids = ids_of(t, 1, width, rows, 0, 0);
+        ids[40 * width + 5] = rows as i64; // one past the last row, in a late worker's range
+        let mut buf = vec![0u8; tables.nbytes];
+        let mut w = words(&mut buf, tables.nbytes).unwrap();
+        assert!(engram_gather_threaded(&engram, &tables, &mut w, &ids, &hts, t, 8).is_err());
+        // a missing host table for the layer index is an error too
+        let ids = ids_of(t, 1, width, rows, 0, 0);
+        let mut w = words(&mut buf, tables.nbytes).unwrap();
+        assert!(engram_gather_threaded(&engram, &tables, &mut w, &ids, &[], t, 8).is_err());
+    }
+
+    /// Decode shapes never thread (the decode floor is not to be perturbed), and a one-column
+    /// prefill has nothing to split.
+    #[test]
+    fn gather_threads_is_prefill_only() {
+        assert_eq!(gather_threads(false, 2048), 1);
+        assert_eq!(gather_threads(false, 64), 1);
+        assert_eq!(gather_threads(true, 1), 1);
+        let n = gather_threads(true, 2048);
+        assert!((1..=8).contains(&n));
+    }
+
+    /// Isolated gather timing against the REAL checkpoint mmap tables (no device, no boot): the
+    /// production 2048-column chunk, random rows (a fresh prompt's case), serial vs threaded, with
+    /// a bit-exact check of every arm against the serial output on the real bytes. Ignored by
+    /// default; run with `cargo test -p resin-gaudi -- --ignored engram_gather_real_table_bench`.
+    #[test]
+    #[ignore]
+    fn engram_gather_real_table_bench() {
+        let ckpt = std::env::var("DS41_CHECKPOINT").unwrap_or_else(|_| {
+            "/home/nat/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017\
+             /snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170"
+                .into()
+        });
+        let index = std::fs::read_to_string(format!("{ckpt}/model.safetensors.index.json"))
+            .expect("checkpoint index");
+        // the two Engram layers' shards, out of the weight map
+        let shard_of = |layer: usize| -> String {
+            let key = format!("\"layers.{layer}.engram.embed.weight\": \"");
+            let at = index.find(&key).expect("engram weight map entry") + key.len();
+            index[at..index[at..].find('"').unwrap() + at].to_string()
+        };
+        // a safetensors tensor's (rows, data start, data end) out of the shard header
+        let tensor = |header: &str, name: &str| -> (usize, usize, usize) {
+            let at = header.find(&format!("\"{name}\"")).expect(name);
+            let rest = &header[at..];
+            let int_after = |key: &str| -> usize {
+                let s = &rest[rest.find(key).unwrap() + key.len()..];
+                let end = s.find(|c: char| !c.is_ascii_digit()).unwrap();
+                s[..end].parse().unwrap()
+            };
+            let rows = int_after("\"shape\":[");
+            let key = "\"data_offsets\":[";
+            let lo = int_after(key);
+            let hi = {
+                let s = &rest[rest.find(key).unwrap() + key.len()..];
+                let comma = s.find(',').unwrap();
+                let s = &s[comma + 1..];
+                let end = s.find(|c: char| !c.is_ascii_digit()).unwrap();
+                s[..end].parse::<usize>().unwrap()
+            };
+            (rows, lo, hi)
+        };
+        let mut maps = Vec::new();
+        let mut hts: Vec<HostTable> = Vec::new();
+        let mut rows_n = Vec::new();
+        for layer in [1usize, 14] {
+            let path = format!("{ckpt}/{}", shard_of(layer));
+            let len = std::fs::metadata(&path).unwrap().len() as usize;
+            let cpath = std::ffi::CString::new(path.clone()).unwrap();
+            // SAFETY: a read-only shared mapping of the whole shard, kept alive in `maps` until the
+            // test ends; the HostTable slices borrow it exactly as the runner's numpy views do.
+            let (ptr, fd) = unsafe {
+                let fd = libc::open(cpath.as_ptr(), libc::O_RDONLY);
+                assert!(fd >= 0, "open {path}");
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED, "mmap {path}");
+                (ptr as *const u8, fd)
+            };
+            let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+            let hlen = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+            let header = std::str::from_utf8(&raw[8..8 + hlen]).unwrap();
+            let base = 8 + hlen;
+            let name = format!("layers.{layer}.engram.embed");
+            let (rows, wlo, whi) = tensor(header, &format!("{name}.weight"));
+            let (_, slo, shi) = tensor(header, &format!("{name}.scale"));
+            assert_eq!(whi - wlo, rows * 256);
+            assert_eq!(shi - slo, rows * 8);
+            // residency of the table's own pages (the gather's read term depends on it); mincore
+            // needs a page-aligned range
+            let page = 4096usize;
+            let lo = (base + wlo.min(slo)) & !(page - 1);
+            let hi = (base + whi.max(shi) + page - 1) & !(page - 1);
+            let pages = (hi - lo) / page;
+            let mut vec = vec![0u8; pages];
+            let rc = unsafe {
+                libc::mincore(
+                    ptr.add(lo) as *mut libc::c_void,
+                    hi - lo,
+                    vec.as_mut_ptr(),
+                )
+            };
+            let resident = if rc == 0 {
+                vec.iter().filter(|&&v| v & 1 == 1).count() as f64 / pages as f64
+            } else {
+                -1.0
+            };
+            eprintln!(
+                "layer {layer}: {rows} rows from {}, table pages {resident:.1}% resident",
+                path.rsplit('/').next().unwrap()
+            );
+            hts.push(HostTable {
+                weight: &raw[base + wlo..base + whi],
+                scale: &raw[base + slo..base + shi],
+            });
+            rows_n.push(rows);
+            maps.push((ptr, len, fd));
+        }
+        let (t, layers, width) = (2048usize, 2usize, 24usize);
+        let per = t * 256 * width * 4;
+        let tables = Tables {
+            t,
+            prefill: true,
+            engram_emb: vec![(0, 0), (per, 1)],
+            nbytes: 2 * per,
+            ..Tables::default()
+        };
+        let engram = Engram {
+            token_map: vec![],
+            pad_id: 0,
+            multipliers: vec![],
+            n: 4,
+            heads: 8,
+            layers,
+            primes: vec![],
+            offsets: vec![],
+        };
+        // random rows: a fresh prompt's scattered ids (no n-gram repetition)
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let ids: Vec<i64> = (0..t * layers * width)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) % rows_n[0] as u64) as i64
+            })
+            .collect();
+        let mut serial = vec![0u8; tables.nbytes];
+        let mut arm = vec![0u8; tables.nbytes];
+        let time = |buf: &mut [u8], f: &dyn Fn(&mut Words<'_>) -> Result<(), String>| -> f64 {
+            let start = std::time::Instant::now();
+            let mut w = words(buf, tables.nbytes).unwrap();
+            f(&mut w).unwrap();
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        for rep in 0..3 {
+            let ms = time(&mut serial, &|w| {
+                engram_gather_serial(&engram, &tables, w, &ids, &hts, t)
+            });
+            eprintln!("BENCH serial rep {rep}: {ms:.1} ms");
+        }
+        for threads in [2usize, 4, 8, 16] {
+            for rep in 0..3 {
+                let ms = time(&mut arm, &|w| {
+                    engram_gather_threaded(&engram, &tables, w, &ids, &hts, t, threads)
+                });
+                eprintln!("BENCH threaded-{threads} rep {rep}: {ms:.1} ms");
+            }
+            assert_words_eq(
+                &buf_words(&serial),
+                &buf_words(&arm),
+                &format!("real tables, threaded-{threads}"),
+            );
+        }
+        for (ptr, len, fd) in maps {
+            unsafe {
+                libc::munmap(ptr as *mut libc::c_void, len);
+                libc::close(fd);
+            }
+        }
     }
 }
