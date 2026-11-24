@@ -2081,8 +2081,10 @@ def test_direct_slot_merge_equals_the_scan(device, recipes, S):
             np.testing.assert_array_equal(out[k], outs[-1][k])
 
 
-@pytest.mark.parametrize("T", [1, 5, 64], ids=["T1", "T5", "T64"])
-def test_tiled_index_selection_matches_full(device, recipes, T):
+@pytest.mark.parametrize("groups", [2, 4, 8, 16], ids=["g2", "g4", "g8", "g16"])
+@pytest.mark.parametrize("T", [1, 5, 32, 64, 128, 512, 1024, 2048],
+                         ids=["T1", "T5", "T32", "T64", "T128", "T512", "T1024", "T2048"])
+def test_tiled_index_selection_matches_full(device, recipes, T, groups):
     """The tiled index selection lists exactly what one pass over every key does.
 
     ``index_merge_graph`` merges a group's own 2048-key rows with the running top entries of the groups before
@@ -2105,11 +2107,11 @@ def test_tiled_index_selection_matches_full(device, recipes, T):
         route_scale=1.5, ranks=1,
     )  # fmt: skip
     rng = np.random.default_rng(7)
-    run, rows, groups = L.INDEX_RUN, L.INDEX_TILE, 4
+    run, rows = L.INDEX_RUN, L.INDEX_TILE
     K = rows * groups
     # columns that see everything, most of it, a middle amount, and amounts that are not a multiple of 64
     pattern = np.array([K, 5000, 900, 700, 3000, 1500], np.int32)
-    vis = np.resize(pattern, T).astype(np.int32)
+    vis = np.minimum(np.resize(pattern, T), K).astype(np.int32)
     # a graph tensor's shape is fastest dimension first, so a (rows, T) score tensor is a (T, rows) array
     score = rng.standard_normal((T, K)).astype(np.float32)
     for t in range(T):
