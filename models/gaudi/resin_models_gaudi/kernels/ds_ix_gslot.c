@@ -46,7 +46,12 @@ void main(tensor blk, tensor rec, tensor gbase, int S2, int nblk, int qb, int he
             const int seen = s_i32_ld_g(gen_addr(bc, blk));
             int len = seen - first;
             len = len < 0 ? 0 : (len > keys ? keys : len);
-            const int key0 = tile == 0 ? 0 : run + (tile - g * tp) * keys;
+            // the score row of the tile's first key: group 0's merge buffer has no running set
+            // (its tiles start at row 0); a later group carries `run` running-candidate rows ahead
+            // of its tiles (index_merge_graph's tile_row0 = base > 0 ? run : 0). The offset is per
+            // GROUP, not per tile — adding `run` to group 0's tiles>0 shifts their scores +run rows
+            // and the merge lists every such key `run` positions too high (drops the needle).
+            const int key0 = (g == 0 ? 0 : run) + (tile - g * tp) * keys;
             const int live = len > 0;
             // a padding slot is lane 0 = -1 and lanes 1 .. 7 = 0, the launches' "no keys" record
             int64 v = 0;
