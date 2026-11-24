@@ -86,7 +86,11 @@ void main(tensor arena, tensor cand, tensor cslots, tensor blocks, tensor loff, 
                     v_i32_st_tnsr_partial(osk, ids, (int64)(cc + C * s), 0, 0);
                 }
             }
+#ifdef CPOS_LOCAL
+            int5 pc = {key0 % get_dim_size(cpos, 0) + 64 * j, c, 0, 0, 0};
+#else
             int5 pc = {key0 + 64 * j, c, 0, 0, 0};
+#endif
             v_i32_st_tnsr(pc, cpos, pv);
         }
     }

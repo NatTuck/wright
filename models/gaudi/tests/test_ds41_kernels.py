@@ -2352,7 +2352,7 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
     addr = {
         "blk": device.malloc(8 * T),
         "ix_rec": device.malloc(4 * 8 * groups * S2),
-        "ix_gbase": device.malloc(4 * 32 * groups),
+        "ix_gbase": device.malloc(4 * 64 * groups),
     }
     recipe = recipes.compile(g)
     try:
@@ -2365,7 +2365,7 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
             device.sync()
             return (
                 device.d2h(addr["ix_rec"], (groups * S2, 8), np.int32),
-                device.d2h(addr["ix_gbase"], (groups, 32), np.int32)[:, 0],
+                device.d2h(addr["ix_gbase"], (groups, 64), np.int32)[:, 0],
             )
 
         got, got_gb = go(blk)

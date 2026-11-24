@@ -79,7 +79,11 @@ static inline uchar256 ctl_of(int64 e)
 }
 
 void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor exact, tensor pos_old,
-          tensor gbase, tensor slots, tensor list, tensor sout, tensor pos_out,
+          tensor gbase,
+#ifdef CPOS
+          tensor cpos,
+#endif
+          tensor slots, tensor list, tensor sout, tensor pos_out,
           int NM, int KS, int H, int run)
 {
     int5 zc = {0, 0, 0, 0, 0};
@@ -150,10 +154,16 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                     const uint64 k = mkey(as_float64(svec));
                     const int64 pos = lane + (int64)(b * 64);
                     const int64 key = pos ^ (int64)BIAS;
-                    // the entry's position: an earlier group's, or this group's by arithmetic
+                    // the entry's position: an earlier group's, or this group's from cpos
+#ifdef CPOS
+                    const int64 pv = b * 64 >= tile_row0
+                        ? v_i32_ld_tnsr_b((int5){b * 64 - tile_row0, c, 0, 0, 0}, cpos)
+                        : v_i32_ld_tnsr_b(sc, pos_old);
+#else
                     const int64 pv = b * 64 >= tile_row0
                         ? lane + (int64)(base + b * 64 - tile_row0)
                         : v_i32_ld_tnsr_b(sc, pos_old);
+#endif
                     const uint64 none = (uint64)0x7FFFFFFF, ukey = as_uint64(key);
                     int64 lo = as_int64(pass == 0 ? v_u32_sel_less_u32_b(th, k, ukey, none)
                                                   : v_u32_sel_eq_u32_b(k, th, ukey, none));
@@ -212,8 +222,12 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
                     int64 twr;
                     RED(tw, twr, v_i32_max_b);
                     const int64 row = DECODE(twr);
+#ifdef CPOS
+                    cv = row;  // keyed by position: the largest tie's position directly
+#else
                     cv = v_i32_sel_less_i32_b(row, (int64)tile_row0, (int64)-1,
                                               row + (int64)(base - tile_row0));
+#endif
                 }
                 int5 rc = {7, c, 0, 0, 0};
                 v_i32_st_tnsr_partial(rc, slots, cv, 0, 0);

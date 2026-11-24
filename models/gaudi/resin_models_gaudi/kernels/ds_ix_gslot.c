@@ -28,8 +28,8 @@ void main(tensor blk, tensor rec, tensor gbase, int S2, int nblk, int qb, int he
     scalar_cache_reset();
     for (int g = off[0]; g < end[0]; g++) {
         if (off[1] == 0) {
-            // gbase is (32, groups) col-major: gbase[0, g] lands at element g*32 (byte 128*g), the
-            // 128-aligned per-group section the merge/block kernels bind (table + ix.gb + 128*g).
+            // gbase is (64, groups) col-major: gbase[0, g] lands at element g*64 (byte 256*g), the
+            // 256-aligned per-group section the merge/block kernels bind (table + ix.gb + 256*g).
             // The old (groups, 32) + {g, 0} wrote gbase[g, 0] at element g (byte 4*g), so every group
             // g>0 read unwritten padding (=0) as its base and the merge listed only group 0's keys.
             int5 gc = {0, g, 0, 0, 0};

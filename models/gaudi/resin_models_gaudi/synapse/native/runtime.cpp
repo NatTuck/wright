@@ -214,9 +214,11 @@ RG_API int rg_shutdown() {
 // ---------------------------------------------------------------- memory
 RG_API uint64_t rg_malloc(uint64_t bytes) {
     uint64_t raw = 0;
-    synStatus s = synDeviceMalloc(g_dev, (bytes ? bytes : 256) + 128, 0, 0, &raw);
+    synStatus s = synDeviceMalloc(g_dev, (bytes ? bytes : 256) + 256, 0, 0, &raw);
     if (s != synSuccess) { fail(s, "synDeviceMalloc"); return 0; }
-    const uint64_t aligned = (raw + 127) & ~uint64_t(127);
+    // 256-byte alignment: recipe sections bound at these addresses are validated at 256 (a 128-aligned
+    // section fails synLaunchWithExternalEventsExt status=30 at the larger replay-kept group counts).
+    const uint64_t aligned = (raw + 255) & ~uint64_t(255);
     std::lock_guard<std::mutex> lock(g_alloc_mu);
     g_alloc[aligned] = raw;
     return aligned;

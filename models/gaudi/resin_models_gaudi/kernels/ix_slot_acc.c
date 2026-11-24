@@ -17,7 +17,11 @@
 #define NINF (-3.0e38f)
 
 #ifdef SCALED
+#ifdef SCORE_OUT
+void main(tensor S, tensor w, tensor slots, tensor sq, tensor sk, tensor sink, tensor score, float scale)
+#else
 void main(tensor S, tensor w, tensor slots, tensor score, tensor sq, tensor sk, tensor sink, float scale)
+#endif
 #else
 void main(tensor S, tensor w, tensor slots, tensor score, tensor sink, float scale)
 #endif

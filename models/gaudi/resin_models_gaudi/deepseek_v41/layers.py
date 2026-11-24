@@ -1266,6 +1266,215 @@ def index_merge_graph(
     return lg.g
 
 
+def index_chain_graph(
+    device: Device,
+    dims: Dims,
+    tokens: int,
+    slots: int,
+    keys: int,
+    blocks: int,
+    run: int,
+    tiles: int,
+    query_block: int = 0,
+    parts: int = 1,
+    cpages: int = 0,
+    heads: int = 0,
+) -> Graph:
+    """The unrolled tiled index chain: ``tiles`` tiles of gather + dequant + score GEMM + acc + assemble + merge
+    in ONE recipe, the running top-``run`` carried device-resident in double-buffered buffers. Each tile's acc
+    writes its scores to ``ix_tile``; ``ds_ix_assemble`` places the previous running set (rows 0 .. run) and the
+    tile (rows run ..) into the tile's merge buffer — a single-producer device replacement for the host
+    copy_multi — and the merge folds it into the next running set. No (kmax, T) score array. The staging tensors
+    are reused across tiles (a control dependency serializes the tiles), so the workspace is one tile's,
+    constant in the context. ``ix_gb{i}`` is tile i's first key and ``ix_s{i}.p{p}`` its part p's slot records
+    (ds_ix_gslot builds them on the device)."""
+    d, T, S, C = dims, tokens, slots, keys
+    qb = query_block or T
+    prefill = qb % 8 == 0 and C % 1024 == 0
+    P = 1  # one part: the acc's score slab is a single-producer graph-local tensor the assemble reads
+    lg = LayerGraph(device, f"ix_chain_T{T}_S{S}_C{C}_Q{qb}_B{tiles}_p{P}", d, T)
+    M = INDEX_HEADS * qb
+    W = INDEX_HEADS * T
+    Sp = S // P
+    rows = C  # one tile of keys per merge
+    K = run + rows
+    q8, qsc = lg.input("ix_q8", (INDEX_DIM, W), F8), lg.input("ix_qs", (W,), F32)
+    w = lg.input("ix_w", (INDEX_HEADS, T), F32)
+    seen = lg.input("ix_vis", (T,), I32)
+    pages, loff = lg.input("cmp_blocks", (cpages, T), I32), lg.input("cmp_loff", (64,), I32)
+    rinit = lg.input("ix_rinit", (run, T), F32)
+    pinit = lg.input("ix_pinit", (run, T), I32)
+    lslots, ilist = lg.input("ix_lslots", (8, T), I32), lg.input("ix_list", (run, T), I32)
+    prev = -1
+    rprev, pprev = rinit, pinit
+    for i in range(tiles):
+        base = lg.input(f"ix_gb{i}", (1,), I32)
+        tile = lg.tensor((rows, T), F32)
+        m = lg.tensor((K, T), F32)
+        rnext = lg.tensor((run, T), F32)
+        pnext = lg.tensor((run, T), I32)
+        first_nodes = []
+        for p in range(P):
+            table = lg.input(f"ix_s{i}.p{p}", (8, Sp), I32)
+            qs, sq = lg.tensor((INDEX_DIM, M, Sp), F8), lg.tensor((M, Sp), F32)
+            codes = lg.tensor((INDEX_DIM // 2, C, Sp), U8)
+            scales = lg.tensor((INDEX_DIM // 32, C, Sp), U8)
+            sk, ktab, ids = (
+                lg.tensor((C, Sp), F32),
+                lg.tensor((C, Sp), I32),
+                lg.tensor((C, Sp), I32),
+            )
+            codes2 = lg.tensor((INDEX_DIM // 2, C * Sp), U8)
+            scales2 = lg.tensor((INDEX_DIM // 32, C * Sp), U8)
+            ktab2, ids2 = lg.tensor((C * Sp,), I32), lg.tensor((C * Sp,), I32)
+            dec = lg.tensor((INDEX_DIM, C * Sp), F8)
+            ks2 = lg.tensor((2 * INDEX_DIM, C // 2, Sp), F8)
+            sc = lg.tensor((C, M, Sp), BF16 if prefill else F32)
+            sink = lg.tensor((64, 1), I32)
+            nq = lg.g.node("rg_ix_slot_q8_f32", [q8, qsc, table], [qs, sq])
+            ng = lg.g.node(
+                "rg_ds_ix_gather_f4_f32",
+                [lg.arena(blocks), pages, table, lg.dep(), loff],
+                [codes, scales, sk, ktab, ids],
+                struct.pack("i", CMP_PAGE_ROWS),
+            )
+            first_nodes += [nq, ng]
+            lg.node("reshape", [codes], [codes2])
+            lg.node("reshape", [scales], [scales2])
+            lg.node("reshape", [ktab], [ktab2])
+            lg.node("reshape", [ids], [ids2])
+            lg.node("rg_mx4_decs_f32", [codes2, scales2, ids2, ktab2], [dec], struct.pack("ii", 0, 0))
+            lg.node("reshape", [dec], [ks2])
+            ks = lg.view(ks2, (INDEX_DIM, C, Sp))
+            lg.node("batch_gemm", [qs, ks], [sc], GEMM_NT)
+            if prefill:
+                lg.node(
+                    "rg_ds_ix_qacc_o_f32",
+                    [sc, w, table, sq, sk],
+                    [sink, tile],
+                    struct.pack("f", INDEX_SCALE),
+                )
+            else:
+                lg.node(
+                    "rg_ds_ix_slot_acc8_o_f32",
+                    [sc, w, table, sq, sk],
+                    [sink, tile],
+                    struct.pack("f", INDEX_SCALE),
+                )
+        if prev >= 0:  # tile i starts only after tile i-1's merge (the running set it reads)
+            for n in first_nodes:
+                lg.g.dep(prev, n)
+        lg.node("rg_ds_ix_assemble_f32", [rprev, tile], [m], struct.pack("ii", 0 if i == 0 else run, rows))
+        vis, exact = lg.tensor((T,), I32), lg.tensor((T,), I32)
+        thr = lg.tensor((64, T), I32)
+        cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
+        lg.node("rg_ix_gvis_f32", [seen, base], [vis, exact], struct.pack("iii", run, rows, run))
+        lg.node("rg_ix_thr_f32", [m, vis], [thr], struct.pack("i", run))
+        lg.node("rg_ix_bcnt_f32", [m, vis, thr], [cnt, gsum])
+        # only the last tile's list is the column's final one; earlier merges list into scratch
+        lo, li = (lslots, ilist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((run, T), I32))
+        prev = lg.g.node(
+            "rg_ds_ix_merge_f32",
+            [m, vis, thr, cnt, gsum, exact, pprev, base],
+            [lo, li, rnext, pnext],
+            struct.pack("iiii", max(1, 48 // T), run, heads, run),
+        )
+        rprev, pprev = rnext, pnext
+    return lg.g
+
+
+def index_sparse_chain_graph(
+    device: Device,
+    dims: Dims,
+    tokens: int,
+    keys: int,
+    blocks: int,
+    run: int,
+    tiles: int,
+    cand_top: int,
+    pages: int,
+    heads: int = 0,
+) -> Graph:
+    """The unrolled SPARSE index chain (the consumer layers' candidate-entry top-512): ``tiles`` tiles of the
+    column's ``cand_top`` candidate blocks' keys, gathered by ix_cgather_f4_local (tile-local cpos), scored, and
+    folded into a device-resident running top-``run`` by ds_ix_merge_cpos (tile positions read from cpos). ONE
+    recipe for a batch of ``tokens`` columns replaces the (kc, T) compact-score staging + per-chunk launches: the
+    merge buffer is (run + keys, tokens), constant in the context. ``ix_s{i}`` is tile i's slot records (one slot
+    per column, key0 = i*keys), ``ix_gb{i}`` its first candidate-entry index; the candidate list/slots and the
+    step's page table are bound to the batch's column slice."""
+    d, T, C = dims, tokens, keys
+    rows = C
+    K = run + rows
+    S = T  # one slot per column (query_block 1)
+    lg = LayerGraph(device, f"ix_schain_T{T}_C{C}_B{tiles}_ct{cand_top}", d, T)
+    M = INDEX_HEADS
+    W = INDEX_HEADS * T
+    q8, qsc = lg.input("ix_q8", (INDEX_DIM, W), F8), lg.input("ix_qs", (W,), F32)
+    w = lg.input("ix_w", (INDEX_HEADS, T), F32)
+    seen = lg.input("ix_visc", (T,), I32)
+    cand = lg.input("cand_list", (cand_top, T), I32)
+    cslots = lg.input("cand_slots", (8, T), I32)
+    pagesT, loff = lg.input("cmp_blocks", (pages, T), I32), lg.input("cmp_loff", (64,), I32)
+    rinit = lg.input("ix_rinit", (run, T), F32)
+    pinit = lg.input("ix_pinit", (run, T), I32)
+    lslots, ilist = lg.input("ix_lslots", (8, T), I32), lg.input("ix_list", (run, T), I32)
+    prev = -1
+    rprev, pprev = rinit, pinit
+    for i in range(tiles):
+        base = lg.input(f"ix_gb{i}", (1,), I32)
+        table = lg.input(f"ix_s{i}", (8, S), I32)
+        tile = lg.tensor((rows, T), F32)
+        m = lg.tensor((K, T), F32)
+        cpos = lg.tensor((rows, T), I32)
+        qs, sq = lg.tensor((INDEX_DIM, M, S), F8), lg.tensor((M, S), F32)
+        codes = lg.tensor((INDEX_DIM // 2, C, S), U8)
+        scales = lg.tensor((INDEX_DIM // 32, C, S), U8)
+        sk, ktab, ids = lg.tensor((C, S), F32), lg.tensor((C, S), I32), lg.tensor((C, S), I32)
+        codes2 = lg.tensor((INDEX_DIM // 2, C * S), U8)
+        scales2 = lg.tensor((INDEX_DIM // 32, C * S), U8)
+        ktab2, ids2 = lg.tensor((C * S,), I32), lg.tensor((C * S,), I32)
+        dec = lg.tensor((INDEX_DIM, C * S), F8)
+        ks2 = lg.tensor((2 * INDEX_DIM, C // 2, S), F8)
+        sc = lg.tensor((C, M, S), F32)
+        sink = lg.tensor((64, 1), I32)
+        nq = lg.g.node("rg_ix_slot_q8_f32", [q8, qsc, table], [qs, sq])
+        ng = lg.g.node(
+            "rg_ix_cgather_f4_local_f32",
+            [lg.arena(blocks), cand, cslots, pagesT, loff, table, lg.dep()],
+            [codes, scales, sk, ktab, ids, cpos],
+            struct.pack("i", CMP_PAGE_ROWS),
+        )
+        if prev >= 0:
+            lg.g.dep(prev, nq)
+            lg.g.dep(prev, ng)
+        lg.node("reshape", [codes], [codes2])
+        lg.node("reshape", [scales], [scales2])
+        lg.node("reshape", [ktab], [ktab2])
+        lg.node("reshape", [ids], [ids2])
+        lg.node("rg_mx4_decs_f32", [codes2, scales2, ids2, ktab2], [dec], struct.pack("ii", 0, 0))
+        lg.node("reshape", [dec], [ks2])
+        ks = lg.view(ks2, (INDEX_DIM, C, S))
+        lg.node("batch_gemm", [qs, ks], [sc], GEMM_NT)
+        lg.node("rg_ds_ix_slot_acc8_o_f32", [sc, w, table, sq, sk], [sink, tile], struct.pack("f", INDEX_SCALE))
+        lg.node("rg_ds_ix_assemble_f32", [rprev, tile], [m], struct.pack("ii", 0 if i == 0 else run, rows))
+        vis, exact = lg.tensor((T,), I32), lg.tensor((T,), I32)
+        thr = lg.tensor((64, T), I32)
+        cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
+        lg.node("rg_ix_gvis_f32", [seen, base], [vis, exact], struct.pack("iii", run, rows, run))
+        lg.node("rg_ix_thr_f32", [m, vis], [thr], struct.pack("i", run))
+        lg.node("rg_ix_bcnt_f32", [m, vis, thr], [cnt, gsum])
+        lo, li = (lslots, ilist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((run, T), I32))
+        rnext, pnext = lg.tensor((run, T), F32), lg.tensor((run, T), I32)
+        prev = lg.g.node(
+            "rg_ds_ix_merge_cpos_f32",
+            [m, vis, thr, cnt, gsum, exact, pprev, base, cpos],
+            [lo, li, rnext, pnext],
+            struct.pack("iiii", max(1, 48 // T), run, heads, run),
+        )
+        rprev, pprev = rnext, pnext
+    return lg.g
+
+
 def index_gslot_graph(
     device: Device,
     dims: Dims,
@@ -1291,7 +1500,7 @@ def index_gslot_graph(
     lg.node(
         "rg_ds_ix_gslot_f32",
         [lg.input("blk", (2, T), I32)],
-        [lg.input("ix_rec", (8, groups * S2), I32), lg.input("ix_gbase", (32, groups), I32)],
+        [lg.input("ix_rec", (8, groups * S2), I32), lg.input("ix_gbase", (64, groups), I32)],
         struct.pack("iiiiiiiii", S2, nblk, qb, INDEX_HEADS, ratio, keys, run, tp, page),
     )
     return lg.g

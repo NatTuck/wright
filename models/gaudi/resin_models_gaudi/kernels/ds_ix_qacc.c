@@ -16,7 +16,11 @@
 #define TQ 8
 #define NB 16
 
+#ifdef SCORE_OUT
+void main(tensor S, tensor w, tensor slots, tensor sq, tensor sk, tensor sink, tensor score, float scale)
+#else
 void main(tensor S, tensor w, tensor slots, tensor score, tensor sq, tensor sk, tensor sink, float scale)
+#endif
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();

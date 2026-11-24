@@ -285,9 +285,9 @@ class _Tables:
             add(f"cmp_blocks{r}", i32, T, model.pages)
             # every merge group's slot records (lane 7: the tile's first index page) and the groups' first keys
             add(f"ix{r}.rec", i32, shape.ix_slots * model.ix_launches(shape, r), 8)
-            # per-group first key, each group in its own 128-byte (32 i32) slot so the merge/block recipes'
-            # ix_gbase section base (base + 128*g) is 128-aligned for every group (a packed +4*g misaligns g>0).
-            add(f"ix{r}.gb", i32, model.ix_groups(shape, r), 32)
+            # per-group first key, each group in its own 256-byte (64 i32) slot so the merge/block recipes'
+            # ix_gbase section base (base + 256*g) is 256-aligned for every group (sections validate at 256).
+            add(f"ix{r}.gb", i32, model.ix_groups(shape, r), 64)
         for layer in model.engram_layers:
             if model.engram == "host":
                 add(f"eg.{layer}", f32, T, 256 * J)
@@ -695,7 +695,7 @@ class DeepSeekV41Gaudi:
         # counts and pin from these (the fill writes neither)
         base = {
             "ix_vis": self.table + tb.off[f"ix_vis{ratio}"],
-            "ix_gbase": self.table + tb.off[f"ix{ratio}.gb"] + 128 * g,
+            "ix_gbase": self.table + tb.off[f"ix{ratio}.gb"] + 256 * g,
         }
         if kind == "b":
             names.update(
@@ -1489,7 +1489,7 @@ class DeepSeekV41Gaudi:
             if _tb is not None:
                 _rec = dev.d2h(self.table + _tb.off["ix1.rec"], (8 * 64,), np.int32).reshape(64, 8)
                 _np.save(f"{_td2}/ixrec1_{tag}_r{self.rank}.npy", _rec)
-                _gb = dev.d2h(self.table + _tb.off["ix1.gb"], (64 * 32,), np.int32).reshape(64, 32)
+                _gb = dev.d2h(self.table + _tb.off["ix1.gb"], (64 * 64,), np.int32).reshape(64, 64)
                 _np.save(f"{_td2}/ixgb1_{tag}_r{self.rank}.npy", _gb)
             print(f"[ixcap {tag}] saved group0 tiles L{sorted(self.ixcap)} + cand + sparse + list", flush=True)
           except Exception as _e:
