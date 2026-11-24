@@ -241,6 +241,24 @@ class DeepSeekV41GaudiRunner:
                 print(f"TIMINGS {d}", flush=True)
                 return out
             self.forward = _timed_forward
+        if __import__("os").environ.get("RESIN_DS41_IXCAP"):
+            _fwd2 = self.forward
+            _flag = "/tmp/other-stingray/dump_decode"
+            def _cap_forward(plan, *args, **kwargs):
+                out = _fwd2(plan, *args, **kwargs)
+                try:
+                    if __import__("os").path.exists(_flag):
+                        _ph = str(getattr(plan, "phase", "")).upper()
+                        if "PREFILL" in _ph:
+                            self.model.dump_full("prefill")
+                        elif "DECODE" in _ph:
+                            __import__("os").remove(_flag)
+                            self.model.dump_full("dec0")
+                except Exception as _e:
+                    with open("/tmp/index-merge-fix/hook.log", "a") as _hf:
+                        _hf.write(f"err {_e}\n")
+                return out
+            self.forward = _cap_forward
         self.enqueue = self.executor.enqueue
         self.release = self.executor.release
         self.metrics_snapshot = self.executor.metrics_snapshot  # the Engine's metrics, no Python

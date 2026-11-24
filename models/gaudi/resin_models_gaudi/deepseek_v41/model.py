@@ -1091,6 +1091,22 @@ class DeepSeekV41Gaudi:
             self.ixcap_pos = buf(4 * _mg * L.INDEX_RUN)
             self.ixcap_score = buf(4 * _mg * L.INDEX_RUN)
             self.ixcap_groups = _mg
+            # per-layer DECODE selection (ix_list col0) and score tile, captured after each layer's index ops
+            self.ixcap_dl = {_l: buf(4 * L.INDEX_TOP * MAX_T) for _l in self.cfg.index_source_layers}
+            self.ixcap_dt = {_l: buf(4 * _rows * MAX_T) for _l in self.cfg.index_source_layers}
+            # COMPREHENSIVE per-layer capture: decode step0 col0 (d) and prefill last-real-col reg7 (p)
+            _prows = max(self.ix_rows(s) for s in self.shapes if s.prefill)
+            _H4 = 4 * self.d.hidden
+            self.cap = {}
+            for _l in self.cfg.index_source_layers:
+                self.cap[_l] = {
+                    "d_q8": buf(L.INDEX_DIM * L.INDEX_HEADS), "d_qs": buf(4 * L.INDEX_HEADS),
+                    "d_w": buf(4 * L.INDEX_HEADS), "d_list": buf(4 * L.INDEX_TOP),
+                    "d_lslots": buf(4 * 8), "d_tile": buf(4 * _rows), "d_x": buf(_H4 * 4),
+                    "p_q8": buf(L.INDEX_DIM * L.INDEX_HEADS), "p_qs": buf(4 * L.INDEX_HEADS),
+                    "p_w": buf(4 * L.INDEX_HEADS), "p_list": buf(4 * L.INDEX_TOP),
+                    "p_lslots": buf(4 * 8), "p_tile": buf(4 * _prows), "p_x": buf(_H4 * 4),
+                }
         self.logits = buf(4 * d.vocab * TMAX)
         self.logits_all = (
             buf(4 * d.vocab * TMAX * self.nranks) if self.nranks > 1 else self.logits
@@ -1289,6 +1305,87 @@ class DeepSeekV41Gaudi:
         return self.device.compile_count - self.compiles_at_start
 
     # ------------------------------------------------------------------ diagnostics
+    def dump_full(self, tag: str = "full") -> None:
+        """Comprehensive offline-debug dump: per-layer decode-step0 (d_) and prefill-last-real-col (p_)
+        q8/qs/w/list/lslots/tile/residual, the candidate arm, arena index pages + page tables + loff,
+        with a manifest. Each tensor saved independently so one failure cannot drop the rest."""
+        import os as _os, json as _json
+        import numpy as _np
+        dev = self.device; D = "/tmp/index-merge-fix"; K = "/tmp/kv-quant-fix/cap"
+        _os.makedirs(D, exist_ok=True); _os.makedirs(K, exist_ok=True)
+        man = {"tag": tag, "rank": self.rank, "tensors": [], "errors": []}
+        def save(path, arr):
+            _np.save(path, arr); man["tensors"].append(_os.path.basename(path))
+        H4 = 4 * self.d.hidden
+        _drows = max(self.ix_rows(s) for s in self.shapes if not s.prefill)
+        _prows = max(self.ix_rows(s) for s in self.shapes if s.prefill)
+        specs = [("q8", (L.INDEX_DIM * L.INDEX_HEADS,), _np.uint8), ("qs", (L.INDEX_HEADS,), _np.float32),
+                 ("w", (L.INDEX_HEADS,), _np.float32), ("list", (L.INDEX_TOP,), _np.int32),
+                 ("lslots", (8,), _np.int32), ("x", (H4,), _np.float32)]
+        for l, cp in getattr(self, "cap", {}).items():
+            for pre, shp, dt in specs:
+                for ph in ("d", "p"):
+                    try: save(f"{D}/cap_{ph}_{pre}_L{l}_{tag}_r{self.rank}.npy", dev.d2h(cp[f"{ph}_{pre}"], shp, dt))
+                    except Exception as e: man["errors"].append(f"{ph}_{pre}_L{l}: {e}")
+            for ph, rows in (("d", _drows), ("p", _prows)):
+                try: save(f"{D}/cap_{ph}_tile_L{l}_{tag}_r{self.rank}.npy", dev.d2h(cp[f"{ph}_tile"], (rows,), _np.float32))
+                except Exception as e: man["errors"].append(f"{ph}_tile_L{l}: {e}")
+        for nm, n, dt in [("cand_bmax", self.kb, _np.float32), ("cand_thr", 64, _np.int32),
+                          ("cand_list", max(1, self.cfg.candidate_topk_blocks), _np.int32)]:
+            try: save(f"{D}/{nm}_{tag}_r{self.rank}.npy", dev.d2h(self.io[nm], (n,), dt))
+            except Exception as e: man["errors"].append(f"{nm}: {e}")
+        # arena index pages around the needle + page tables + owner offsets
+        try:
+            npos = int(_os.environ.get("RESIN_DS41_NEEDLE_POS", "16214"))
+            if _os.path.exists("/tmp/other-stingray/needle_pos"):
+                npos = int(open("/tmp/other-stingray/needle_pos").read().strip())
+            cb1 = dev.d2h(self.table + self.tables[Shape(1, False)].off["cmp_blocks1"], (self.pages,), _np.int32)
+            blk = int(cb1[npos // PAGE_TOKENS]) // 1024
+            c0, c1 = max(0, blk - 5), min(self.arena_blocks, blk + 15)
+            save(f"{K}/arena2_{tag}_r{self.rank}.npy", dev.d2h(self.arena + c0 * 1024 * 512, ((c1 - c0) * 1024 * 512,), _np.uint8))
+            save(f"{K}/arenab02_{tag}_r{self.rank}.npy", _np.array(c0, _np.int64))
+        except Exception as e:
+            man["errors"].append(f"arena2: {e}")
+        for r in (1, 2):
+            for Tk, tb in self.tables.items():
+                if f"cmp_blocks{r}" not in tb.off: continue
+                try:
+                    cb = dev.d2h(self.table + tb.off[f"cmp_blocks{r}"], (Tk.T * self.pages,), _np.int32).reshape(Tk.T, -1)
+                    save(f"{K}/cmpblocks{r}_T{Tk.T}_{tag}_r{self.rank}.npy", cb)
+                except Exception as e: man["errors"].append(f"cmpblocks{r}_T{Tk.T}: {e}")
+        for o in self.geo.owners:
+            try: save(f"{K}/loff{o}_{tag}_r{self.rank}.npy", dev.d2h(self.loff[o], (64,), _np.int32))
+            except Exception as e: man["errors"].append(f"loff{o}: {e}")
+        # WINDOW host tables: slots (key0/klen) + per-layer window latent pages (lat.{layer})
+        for Tk, tb in self.tables.items():
+            if "slots" not in tb.off: continue
+            try:
+                save(f"{K}/wslots_T{Tk.T}_{tag}_r{self.rank}.npy", dev.d2h(self.table + tb.off["slots"], (Tk.win_slots * 8,), _np.int32).reshape(Tk.win_slots, 8))
+            except Exception as e: man["errors"].append(f"wslots_T{Tk.T}: {e}")
+            for layer in range(self.n_layers):
+                if f"lat.{layer}" not in tb.off: continue
+                try:
+                    save(f"{K}/wlat_L{layer}_T{Tk.T}_{tag}_r{self.rank}.npy", dev.d2h(self.table + tb.off[f"lat.{layer}"], (Tk.win_slots * (Tk.win_keys // PAGE_TOKENS),), _np.int32).reshape(Tk.win_slots, -1))
+                except Exception as e: man["errors"].append(f"wlat_L{layer}_T{Tk.T}: {e}")
+        # WINDOW arena KV: the physical rows the decode (T=1) window lat.0 points at (recent tokens near pt,
+        # NOT the needle region). Capture [min_row .. max_row+PAGE_ROWS) so the harness can gather window keys.
+        try:
+            Tkd = Shape(1, False); tbd = self.tables[Tkd]
+            if "lat.0" in tbd.off:
+                npg = Tkd.win_keys // PAGE_TOKENS
+                lat0 = dev.d2h(self.table + tbd.off["lat.0"], (Tkd.win_slots * npg,), _np.int32)
+                rows = lat0[lat0 >= 0]
+                amax = self.arena_blocks * 1024
+                if rows.size and int(rows.min()) >= 0 and int(rows.max()) + PAGE_ROWS <= amax:
+                    r0 = int(rows.min()); r1 = int(rows.max()) + PAGE_ROWS
+                    save(f"{K}/warena_{tag}_r{self.rank}.npy", dev.d2h(self.arena + r0 * 512, ((r1 - r0) * 512,), _np.uint8))
+                    save(f"{K}/warena_b0_{tag}_r{self.rank}.npy", _np.array(r0, _np.int64))
+                else:
+                    man["errors"].append(f"warena: lat0 out of arena range (min={int(rows.min()) if rows.size else -1} max={int(rows.max()) if rows.size else -1} amax={amax})")
+        except Exception as e: man["errors"].append(f"warena: {e}")
+        _json.dump(man, open(f"{D}/manifest_{tag}_r{self.rank}.json", "w"), indent=0)
+        print(f"[dump_full {tag}] {len(man['tensors'])} tensors, {len(man['errors'])} errors", flush=True)
+
     def dump_step(self, tag: str = "") -> None:
         """RESIN_DS41_DUMP: after a step, print what the residual stream and the head actually hold.
 
@@ -1342,6 +1439,9 @@ class DeepSeekV41Gaudi:
             for _l, _cap in self.ixcap.items():
                 _a = dev.d2h(_cap, (_rows * MAX_T,), np.float32).reshape(MAX_T, _rows)
                 _np.save(f"{_td2}/ixcap_L{_l}_{tag}_r{self.rank}.npy", _a[0])
+            for _l, _cap in getattr(self, "ixcap_dl", {}).items():
+                _np.save(f"{_td2}/ixdl_L{_l}_{tag}_r{self.rank}.npy", dev.d2h(_cap, (L.INDEX_TOP * MAX_T,), np.int32).reshape(MAX_T, L.INDEX_TOP)[0])
+                _np.save(f"{_td2}/ixdt_L{_l}_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_dt[_l], (_rows * MAX_T,), np.float32).reshape(MAX_T, _rows)[0])
             for _nm in ("cand_bmax", "cand_thr", "cand_list", "ix_thr", "ix_thr2"):
                 if _nm in self.io:
                     _n = {"cand_bmax": self.kb, "cand_thr": 64, "cand_list": max(1, self.cfg.candidate_topk_blocks), "ix_thr": 64, "ix_thr2": 64}[_nm]
@@ -1386,6 +1486,19 @@ class DeepSeekV41Gaudi:
             ar = dev.d2h(self.arena + b0 * 1024 * 512, ((b1 - b0) * 1024 * 512,), np.uint8)
             _np.save(f"{td}/arena_{tag}_r{self.rank}.npy", ar)
             _np.save(f"{td}/arenab0_{tag}_r{self.rank}.npy", np.array(b0, np.int64))
+            # second range covering the >=31k needle pages: dynamic around the ratio1 needle page's block
+            try:
+                _np_pos = int(_os.environ.get("RESIN_DS41_NEEDLE_POS", "16214"))
+                _cb1 = dev.d2h(self.table + self.tables[Shape(1, False)].off["cmp_blocks1"], (self.pages,), np.int32)
+                _pg = _np_pos // PAGE_TOKENS
+                _blk = int(_cb1[_pg]) // 1024
+                c0, c1 = max(0, _blk - 5), min(self.arena_blocks, _blk + 15)
+            except Exception:
+                c0, c1 = 1400, min(self.arena_blocks, 1560)
+            if c1 > c0:
+                ar2 = dev.d2h(self.arena + c0 * 1024 * 512, ((c1 - c0) * 1024 * 512,), np.uint8)
+                _np.save(f"{td}/arena2_{tag}_r{self.rank}.npy", ar2)
+                _np.save(f"{td}/arenab02_{tag}_r{self.rank}.npy", np.array(c0, np.int64))
             for o in self.geo.owners:
                 lv = dev.d2h(self.loff[o], (64,), np.int32)
                 _np.save(f"{td}/loff{o}_{tag}_r{self.rank}.npy", lv)
@@ -2004,6 +2117,31 @@ class DeepSeekV41Gaudi:
                         and layer == max(self.cfg.index_source_layers)):
                     native.copy(self.ixcap_list, self.io["ix_list"], 4 * L.INDEX_TOP * T)
                     native.copy(self.ixcap_tile, self.ix_tile, 4 * self.ix_rows(s) * T)
+                if (_os.environ.get("RESIN_DS41_IXCAP") and not s.prefill
+                        and layer in getattr(self, "ixcap_dl", {})):
+                    native.copy(self.ixcap_dl[layer], self.io["ix_list"], 4 * L.INDEX_TOP * T)
+                    native.copy(self.ixcap_dt[layer], self.ix_tile, 4 * self.ix_rows(s) * T)
+                if _os.environ.get("RESIN_DS41_IXCAP") and layer in getattr(self, "cap", {}):
+                    cp = self.cap[layer]
+                    q8b = L.INDEX_DIM * L.INDEX_HEADS; hsb = 4 * L.INDEX_HEADS
+                    lb = 4 * L.INDEX_TOP; sb = 4 * 8; xb = 4 * self.d.hidden * 4
+                    tb = 4 * self.ix_rows(s)
+                    if not s.prefill:
+                        native.copy(cp["d_q8"], self.io["ix_q8"], q8b)
+                        native.copy(cp["d_qs"], self.io["ix_qs"], hsb)
+                        native.copy(cp["d_w"], self.io["ix_w"], hsb)
+                        native.copy(cp["d_list"], self.io["ix_list"], lb)
+                        native.copy(cp["d_lslots"], self.io["ix_lslots"], sb)
+                        native.copy(cp["d_tile"], self.ix_tile, tb)
+                        native.copy(cp["d_x"], ops["x_ffn"], xb)
+                    else:
+                        native.copy(cp["p_q8"], (self.io["ix_q8"], 7, q8b), q8b)
+                        native.copy(cp["p_qs"], (self.io["ix_qs"], 7, hsb), hsb)
+                        native.copy(cp["p_w"], (self.io["ix_w"], 7, hsb), hsb)
+                        native.copy(cp["p_list"], (self.io["ix_list"], 7, lb), lb)
+                        native.copy(cp["p_lslots"], (self.io["ix_lslots"], 7, sb), sb)
+                        native.copy(cp["p_tile"], (self.ix_tile, 7, tb), tb)
+                        native.copy(cp["p_x"], (ops["x_ffn"], 7, xb), xb)
             if "out" in ops:
                 dense_or(ops, "out", ratio)
             if ccl:
