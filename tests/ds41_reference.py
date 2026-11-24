@@ -474,23 +474,25 @@ class Reference(_Model):
                 counts["sparse"] = sparse
                 if sparse:
                     v["ix_visc"][:] = np.where(live, self.kc, 0)
-                    lc = np.flatnonzero(live)
                     chunks = self.kc // INDEX_KEYS
-                    rec = np.zeros((len(lc) * chunks, 8), np.int64)
-                    rec[:, 1] = L.INDEX_HEADS * np.repeat(lc, chunks)
-                    # query position kc - 1: every compact entry is visible to the slot
-                    rec[:, 2] = self.kc - 1
-                    rec[:, 3] = INDEX_KEYS * np.tile(np.arange(chunks), len(lc))
-                    rec[:, 4] = self.kc
-                    rec[:, 5] = np.repeat(lc, chunks)
-                    rec[:, 6] = 1
-                    n = self.ixc_launches(s)
-                    table = np.zeros((n * s.ix_slots, 8), np.int64)
+                    sb = self.sparse_batch(s)
+                    batches, per = self.ixsc_batches(s), self.ixc_launches(s)
+                    table = np.zeros((batches * per * s.ix_slots, 8), np.int64)
                     table[:, 0] = -1
-                    table[: len(rec)] = rec
-                    counts["ixc"] = -(-len(rec) // s.ix_slots)
-                    for j in range(n):
-                        v[f"ixc.{j}"][:] = table[j * s.ix_slots : (j + 1) * s.ix_slots]
+                    for b in range(batches):
+                        for rc in range(sb):
+                            c = b * sb + rc
+                            if c >= s.T or not live[c]:
+                                continue
+                            for chunk in range(chunks):
+                                ri = rc * chunks + chunk
+                                flat = (b * per + ri // s.ix_slots) * s.ix_slots + ri % s.ix_slots
+                                table[flat] = [
+                                    0, L.INDEX_HEADS * rc, self.kc - 1, INDEX_KEYS * chunk,
+                                    self.kc, rc, 1, 0,
+                                ]
+                    counts["ixc"] = batches * (per + 1)
+                    v["ixsc.rec"][:] = table
             per = HISTORY_TOKENS // ratio // PAGE_TOKENS  # pages per HISTORY block
             pr = np.where(
                 hist[:, :, None] >= 0, hist[:, :, None] + PAIR_ROWS * np.arange(per), -1

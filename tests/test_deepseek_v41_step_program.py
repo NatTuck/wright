@@ -135,6 +135,7 @@ def model(nranks: int):
         embed=op("tok", "emb"),
         head=op("x", "logits"),
         store=op("st", "kv"),
+        ixg=[],
     )
     m.n_layers = len(prog.layers)
     return M, m, prog

@@ -77,6 +77,7 @@ GATHER_T = 16
 TMAX = PREFILL_BUCKETS[-1]
 QUERY_BLOCK = 128  # prefill columns per window slot
 INDEX_KEYS = 2048  # index keys per index slot
+SPARSE_BATCH = 64  # columns per sparse query-block batch: the compact (kc, batch) staging bounds the OOM term
 PREFILL_IX_SLOTS = 16
 PREFILL_IX_PARTS = 4  # a prefill index launch's slots in parts (index_score_graph)
 # a prefill step whose every column sees more than PREFILTER_MIN entries picks each column's top 512 from the
@@ -272,8 +273,9 @@ class _Tables:
         add("ix_visb", i32, T)
         add("ix_visb2", i32, T)
         add("ix_visc", i32, T)
-        for j in range(model.ixc_launches(shape)):
-            add(f"ixc.{j}", i32, shape.ix_slots, 8)
+        # the sparse arm's per-batch slot records (relative columns within each query-block batch), flat:
+        # batch b, launch j is at record (b*ixc_launches + j)*ix_slots
+        add("ixsc.rec", i32, model.ixsc_batches(shape) * model.ixc_launches(shape) * shape.ix_slots, 8)
         # (T, 2): each query block's first position and the entries its last column sees (the graph tensor is
         # (2, T): lane 0 the position, lane 1 the count). Everything the tiled index chain needs per *group* is
         # derived from this and ix_vis on the device (ds_ix_gslot, ix_gvis, ds_ix_bmax, ix_cmask, ds_ix_merge),
@@ -598,11 +600,22 @@ class DeepSeekV41Gaudi:
         ]
 
     def ixc_launches(self, shape: Shape) -> int:
-        """index launches over candidate entries a step of ``shape`` may need (the sparse arm: one slot per
-        column per 2048-entry chunk of its candidate blocks, prefill and decode alike)"""
+        """index launches over candidate entries ONE query-block batch of ``shape`` may need (the sparse arm: one
+        slot per column per 2048-entry chunk of its candidate blocks). The step runs ixsc_batches such batches, each
+        scoring only its own columns into the bounded (kc, sparse_batch) staging — never the full (kc, T)."""
         if not self.kc:
             return 0
-        return -(-shape.T * (self.kc // INDEX_KEYS) // shape.ix_slots)
+        return -(-self.sparse_batch(shape) * (self.kc // INDEX_KEYS) // shape.ix_slots)
+
+    def sparse_batch(self, shape: Shape) -> int:
+        """columns per sparse query-block batch (the bounded staging width); 256-byte-aligned column slices"""
+        return min(shape.T, SPARSE_BATCH)
+
+    def ixsc_batches(self, shape: Shape) -> int:
+        """sparse query-block batches a step of ``shape`` runs"""
+        if not self.kc:
+            return 0
+        return -(-shape.T // self.sparse_batch(shape))
 
     def dense(self, s: Shape) -> bool:
         """whether prefill steps of ``s`` have the dense compressed attention (query blocks of 128)"""
@@ -777,35 +790,49 @@ class DeepSeekV41Gaudi:
             [self._op(self.r["ixbl", s], layer, sel)] if cand == "source" else []
         )
         if cand == "user" and self.ixc_launches(s):
-            ops["ixsp"] = [
-                self._op(
-                    self.r["ixc", s],
-                    layer,
-                    {
-                        **head,
-                        **tail,
-                        "ix_slots": t(f"ixc.{j}"),
-                        "ix_score": self.io["ix_score_sparse"],
-                        "ix_cpos": self.io["ix_cpos"],
-                        # the candidate-entry gather reads the step's page table and the owner's offset
-                        # (tail carries cmp_blocks already; cmp_loff is the sparse launch's own)
-                        "cmp_loff": self.loff[owner],
-                    },
+            # query-block batches: each scores only its own columns into the bounded (kc, sparse_batch) staging,
+            # then selects; the column slices keep every bound section 256-byte aligned (sparse_batch a mult of 64)
+            sb, per = self.sparse_batch(s), self.ixc_launches(s)
+            ct = self.cfg.candidate_topk_blocks
+            ops["ixsp"] = []
+            for b in range(self.ixsc_batches(s)):
+                co = b * sb
+                q8o, wo = L.INDEX_DIM * L.INDEX_HEADS * co, 4 * L.INDEX_HEADS * co
+                for j in range(per):
+                    ops["ixsp"].append(
+                        self._op(
+                            self.r["ixc", s],
+                            layer,
+                            {
+                                **head,
+                                "ix_slots": t("ixsc.rec") + 4 * 8 * s.ix_slots * (b * per + j),
+                                "ix_score": self.io["ix_score_sparse"],
+                                "ix_cpos": self.io["ix_cpos"],
+                                "cmp_loff": self.loff[owner],
+                                "cmp_blocks": t(f"cmp_blocks{ratio}") + 4 * self.pages * co,
+                                "ix_q8": self.io["ix_q8"] + q8o,
+                                "ix_qs": self.io["ix_qs"] + wo,
+                                "ix_w": self.io["ix_w"] + wo,
+                                "cand_list": self.io["cand_list"] + 4 * ct * co,
+                                "cand_slots": self.io["cand_slots"] + 4 * 8 * co,
+                            },
+                        )
+                    )
+                ops["ixsp"].append(
+                    self._op(
+                        self.r["sel", s, "user", "sparse"],
+                        layer,
+                        {
+                            "ix_score": self.io["ix_score_sparse"],
+                            "ix_cpos": self.io["ix_cpos"],
+                            "ix_vis": t(f"ix_vis{ratio}") + 4 * co,
+                            "ix_visc": t("ix_visc") + 4 * co,
+                            "ix_list": self.io["ix_list"] + 4 * L.INDEX_RUN * co,
+                            "ix_lslots": self.io["ix_lslots"] + 4 * 8 * co,
+                        },
+                    )
                 )
-                for j in range(self.ixc_launches(s))
-            ]
-            ops["ixsp_tail"] = [
-                self._op(
-                    self.r["sel", s, "user", "sparse"],
-                    layer,
-                    {
-                        "ix_score": self.io["ix_score_sparse"],
-                        "ix_cpos": self.io["ix_cpos"],
-                        "ix_vis": t(f"ix_vis{ratio}"),
-                        "ix_visc": t("ix_visc"),
-                    },
-                )
-            ]
+            ops["ixsp_tail"] = []
         return ops
 
     # ------------------------------------------------------------------ weights
@@ -1053,13 +1080,13 @@ class DeepSeekV41Gaudi:
             "ix_list": buf(4 * L.INDEX_TOP * T),
             "ix_lslots": buf(4 * 8 * T),
             "cand_bmax": buf(4 * self.kb * T),
-            # the sparse arm's compact scores and positions: (kc, T) for the widest step (prefill TMAX, not
-            # just the decode MAX_T), since a prefill step scores every column's candidate entries too
-            "ix_score_sparse": buf(4 * max(1, self.kc) * T),
+            # the sparse arm's compact scores and positions, bounded to ONE query-block batch (kc, SPARSE_BATCH):
+            # each batch scores only its own columns, so the staging never grows with the step's T (the OOM fix)
+            "ix_score_sparse": buf(4 * max(1, self.kc) * SPARSE_BATCH),
             "cand_thr": buf(4 * 64 * T),
             "cand_list": buf(4 * max(1, self.cfg.candidate_topk_blocks) * T),
             "cand_slots": buf(4 * 8 * T),
-            "ix_cpos": buf(4 * max(1, self.kc) * T),
+            "ix_cpos": buf(4 * max(1, self.kc) * SPARSE_BATCH),
             "cmp_sink": buf(256),
             "cmp_stored": buf(256),
             "ix_sink": buf(256 * 8),  # (a part's sink each, prefill index launches)
@@ -1228,15 +1255,16 @@ class DeepSeekV41Gaudi:
                     dev, d, T, self.kb, top, True
                 )
                 if self.ixc_launches(s):
-                    # the sparse arm scores one column's candidate entries per slot (query_block=1), so its
-                    # gather (ix_cgather) reads that column's candidate list; prefill's qb=128 score slots do
-                    # not apply here
+                    # the sparse arm scores one column's candidate entries per slot (query_block=1) over ONE
+                    # query-block batch of sparse_batch columns; the step runs ixsc_batches batches, each binding
+                    # its column slice, so the compact staging stays (kc, sparse_batch) — the OOM fix
+                    sb = self.sparse_batch(s)
                     graphs["ixc", s] = L.index_score_graph(
-                        dev, d, T, s.ix_slots, INDEX_KEYS, nb, self.kc, query_block=1,
+                        dev, d, sb, s.ix_slots, INDEX_KEYS, nb, self.kc, query_block=1,
                         cand_top=top, pages=self.pages,
                     )  # fmt: skip
                     graphs["sel", s, "user", "sparse"] = L.index_select_graph(
-                        dev, d, T, self.kc, "user", top, sparse=True
+                        dev, d, sb, self.kc, "user", top, sparse=True
                     )
                 graphs["out", s] = L.attention_out_graph(
                     dev, d, T, nb, self.pages, win_slots=s.win_slots, win_keys=s.win_keys
@@ -1465,8 +1493,8 @@ class DeepSeekV41Gaudi:
                     _dt = np.int32 if _nm in ("cand_thr", "cand_list", "ix_thr", "ix_thr2") else np.float32
                     _np.save(f"{_td2}/{_nm}_{tag}_r{self.rank}.npy", dev.d2h(self.io[_nm], (_n * MAX_T,), _dt).reshape(MAX_T, _n)[0])
             _kc = max(1, self.kc)
-            _np.save(f"{_td2}/ix_score_sparse_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_score_sparse"], (_kc * MAX_T,), np.float32).reshape(MAX_T, _kc)[0])
-            _np.save(f"{_td2}/ix_cpos_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_cpos"], (_kc * MAX_T,), np.int32).reshape(MAX_T, _kc)[0])
+            _np.save(f"{_td2}/ix_score_sparse_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_score_sparse"], (_kc * SPARSE_BATCH,), np.float32).reshape(SPARSE_BATCH, _kc)[0])
+            _np.save(f"{_td2}/ix_cpos_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_cpos"], (_kc * SPARSE_BATCH,), np.int32).reshape(SPARSE_BATCH, _kc)[0])
             _np.save(f"{_td2}/ixlist2_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_list"], (L.INDEX_TOP * MAX_T,), np.int32).reshape(MAX_T, L.INDEX_TOP)[0])
             _np.save(f"{_td2}/ixlistfull_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_list"], (L.INDEX_TOP * TMAX,), np.int32).reshape(TMAX, L.INDEX_TOP))
             _np.save(f"{_td2}/ixvisb_{tag}_r{self.rank}.npy", dev.d2h(self.table + self.tables[Shape(1, False)].off["ix_visb"], (MAX_T,), np.int32))
@@ -2310,7 +2338,10 @@ class DeepSeekV41Gaudi:
                     "lat": [off[f"lat.{layer}"] for layer in layers],
                     "ix_visb": off["ix_visb"],
                     "ix_visc": off["ix_visc"],
-                    "ixc": [off[f"ixc.{j}"] for j in range(self.ixc_launches(s))],
+                    "ixsc_rec": off["ixsc.rec"],
+                    "sparse_batch": self.sparse_batch(s),
+                    "ixsc_batches": self.ixsc_batches(s),
+                    "ixc_per_batch": self.ixc_launches(s),
                     "ix_vis": (off["ix_vis1"], off["ix_vis2"]),
                     "cmp_blocks": (off["cmp_blocks1"], off["cmp_blocks2"]),
                     "engram": [

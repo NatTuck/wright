@@ -226,8 +226,11 @@ pub struct Tables {
     /// the padded block counts of the ratio that is not the candidate source's (`_visb`)
     pub ix_visb2: usize,
     pub ix_visc: usize,
-    /// per candidate launch
-    pub ixc: Vec<usize>,
+    /// the sparse arm's flat per-batch slot records (relative columns within each query-block batch)
+    pub ixsc_rec: usize,
+    pub sparse_batch: usize,
+    pub ixsc_batches: usize,
+    pub ixc_per_batch: usize,
     pub ix_vis: [usize; 2],
     pub cmp_blocks: [usize; 2],
     /// per Engram layer of a step that hashes on the device: (hi table, lo table, its index among the
@@ -718,44 +721,49 @@ pub fn fill(
         if candidate_ratio {
             counts.cand = model.candidate.is_some_and(|(_, topk)| most > topk * 8);
             counts.sparse =
-                !tables.ixc.is_empty() && cols.iter().all(|&c| vis[c] > model.kc);
+                tables.ixsc_batches > 0 && cols.iter().all(|&c| vis[c] > model.kc);
             if counts.sparse {
                 for (c, _) in vis.iter().enumerate() {
                     w.set(tables.ix_visc, c, if live(c) { model.kc } else { 0 });
                 }
+                // query-block batches: batch b scores its own columns (relative rc) into the bounded staging.
+                // Each batch's records are rc*chunks+chunk packed into ixc_per_batch launches of ix_slots; the
+                // step's native program runs batches*(per+1) ops (the per-batch selection follows its scores).
                 let chunks = (model.kc / INDEX_KEYS) as usize;
-                let total = tables.ixc.len() * tables.ix_slots;
-                let records = cols.len() * chunks;
-                if records > total {
-                    return Err("a step's candidate launches exceed the table capacity".into());
-                }
+                let (sb, batches, per) =
+                    (tables.sparse_batch, tables.ixsc_batches, tables.ixc_per_batch);
+                let total = batches * per * tables.ix_slots;
                 let mut table = vec![[0i64; 8]; total];
                 for row in &mut table {
                     row[0] = -1;
                 }
-                for (i, &c) in cols.iter().enumerate() {
-                    for chunk in 0..chunks {
-                        table[i * chunks + chunk] = [
-                            0,
-                            model.index_heads * c as i64,
-                            model.kc - 1,
-                            INDEX_KEYS * chunk as i64,
-                            model.kc,
-                            c as i64,
-                            1,
-                            0,
-                        ];
+                for b in 0..batches {
+                    for rc in 0..sb {
+                        let c = b * sb + rc;
+                        if c >= t || !live(c) {
+                            continue;
+                        }
+                        for chunk in 0..chunks {
+                            let ri = rc * chunks + chunk;
+                            let flat = (b * per + ri / tables.ix_slots) * tables.ix_slots
+                                + ri % tables.ix_slots;
+                            table[flat] = [
+                                0,
+                                model.index_heads * rc as i64,
+                                model.kc - 1,
+                                INDEX_KEYS * chunk as i64,
+                                model.kc,
+                                rc as i64,
+                                1,
+                                0,
+                            ];
+                        }
                     }
                 }
-                counts.ixc = records.div_ceil(tables.ix_slots);
-                for (j, &launch) in tables.ixc.iter().enumerate() {
-                    for (s, row) in table[j * tables.ix_slots..(j + 1) * tables.ix_slots]
-                        .iter()
-                        .enumerate()
-                    {
-                        for (lane, &value) in row.iter().enumerate() {
-                            w.set(launch, s * 8 + lane, value);
-                        }
+                counts.ixc = batches * (per + 1);
+                for (i, row) in table.iter().enumerate() {
+                    for (lane, &value) in row.iter().enumerate() {
+                        w.set(tables.ixsc_rec, i * 8 + lane, value);
                     }
                 }
             }
@@ -1086,6 +1094,58 @@ fn engram_gather_threaded(
         }
     }
     Ok(())
+}
+
+/// Cross-chunk Engram prefetch: gather one prefill chunk's `eg_emb` into a caller-owned host buffer,
+/// ahead of the step that will consume it, so the gather overlaps the previous chunk's device submit.
+///
+/// `before` are the `engram.n - 1` (or fewer) tokens immediately before `pos0` and `tokens` the chunk's
+/// own `n` tokens — exactly what the consuming step's `Rows` carries (the context keeps only the newest
+/// tokens, and `engram_ids` reads no further back). The buffer is layer-major: layer `e`'s `t` columns
+/// of `256 * width` f32 at byte `e * t * 256 * width * 4`, the layout `engram_gather_host` writes. This
+/// calls the SAME `engram_ids` + `engram_gather_host` as the step fill, so a matching chunk's bytes are
+/// bit-identical to gathering in place; the caller copies them into the image and skips the fill's gather.
+pub fn engram_prefetch_gather(
+    engram: &Engram,
+    host_tables: &[HostTable],
+    before: &[i64],
+    tokens: &[i64],
+    pos0: i64,
+    t: usize,
+    out: &mut [u8],
+) -> Result<(), String> {
+    let n = tokens.len();
+    let width = (engram.n - 1) * engram.heads;
+    let per = t * 256 * width * 4;
+    let column = [0i64];
+    let pos = [pos0];
+    let real = [n as i64];
+    let before_indptr = [0i64, before.len() as i64];
+    // engram_ids reads only column/pos0/real/before; the window and history parts are unused here.
+    let empty = [0i64, 0];
+    let rows = Rows {
+        column: &column,
+        pos0: &pos,
+        real: &real,
+        window_first: &column,
+        window_indptr: &empty,
+        window: &[],
+        window_ids: &[],
+        history_indptr: &empty,
+        history: &[],
+        before_indptr: &before_indptr,
+        before,
+    };
+    let ids = engram_ids(engram, &rows, tokens, t)?;
+    let tables = Tables {
+        t,
+        prefill: true,
+        engram_emb: (0..engram.layers).map(|e| (e * per, e)).collect(),
+        nbytes: engram.layers * per,
+        ..Tables::default()
+    };
+    let mut w = words(out, tables.nbytes)?;
+    engram_gather_host(engram, &tables, &mut w, &ids, host_tables, t)
 }
 
 /// A DSpark draft step's settings: the drafted block, its noise token, and the drafter's stages (the last layers
@@ -1901,6 +1961,198 @@ mod tests {
         assert_eq!(gather_threads(true, 1), 1);
         let n = gather_threads(true, 2048);
         assert!((1..=8).contains(&n));
+    }
+
+    /// A HASHING Engram (real token_map / multipliers / primes / offsets, so `engram_ids` actually
+    /// hashes), per-layer host tables with DIFFERENT bytes, and a prompt of in-map tokens. `rows` is
+    /// large enough that every hashed id (prime modulus + offset) lands inside the table.
+    fn hashing_fixture(
+        layers: usize,
+        rows: usize,
+        seed: u8,
+    ) -> (Engram, Vec<(Vec<u8>, Vec<u8>)>, Vec<i64>) {
+        let (n, heads) = (4usize, 8usize);
+        let width = (n - 1) * heads;
+        let vocab = 4096i64;
+        let token_map: Vec<i64> = (0..vocab).collect();
+        // distinct non-zero multipliers per (layer, n-gram lane)
+        let multipliers: Vec<i64> = (0..layers * n)
+            .map(|k| (0x9E37_79B9u64.wrapping_mul(k as u64 + 1) ^ u64::from(seed)) as i64 | 1)
+            .collect();
+        // positive moduli, one per (layer, n-1, head); kept small so ids stay inside `rows`
+        let primes: Vec<i64> = (0..layers * (n - 1) * heads)
+            .map(|k| 1009 + (k as i64 * 7) % 512)
+            .collect();
+        let offsets: Vec<i64> = (0..layers * width).map(|k| (k as i64 * 3) % 256).collect();
+        let engram = Engram {
+            token_map,
+            pad_id: 0,
+            multipliers,
+            n,
+            heads,
+            layers,
+            primes,
+            offsets,
+        };
+        let data: Vec<(Vec<u8>, Vec<u8>)> = (0..layers)
+            .map(|e| synthetic_table(rows, seed.wrapping_add(e as u8 * 31)))
+            .collect();
+        // a prompt of in-map tokens (varied by seed): the prefetch reconstructs ids from these
+        let mut state = 0x1234_5678_9abc_def0u64 ^ u64::from(seed);
+        let prompt: Vec<i64> = (0..8192)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) % vocab as u64) as i64
+            })
+            .collect();
+        (engram, data, prompt)
+    }
+
+    /// The prefetch gather is bit-identical to the production step gather on the required case class —
+    /// same shape, DIFFERENT data (different prompts, pos0, chunk sizes, buckets, per-layer bytes). The
+    /// production path uses the FULL prefix as `before` (what a naive reconstruction would pass); the
+    /// prefetch uses only the newest `n - 1` tokens (what the context actually keeps). `engram_ids`
+    /// reads no further back, so the two must agree byte for byte; a wrong `before` window or padding
+    /// in the prefetch reconstruction shows up here.
+    #[test]
+    fn engram_prefetch_matches_step_gather_same_shape_different_data() {
+        let rows = 4096usize;
+        for layers in [1usize, 2] {
+            for seed in [0u8, 200] {
+                let (engram, data, prompt) = hashing_fixture(layers, rows, seed);
+                let hts: Vec<HostTable> = data
+                    .iter()
+                    .map(|(w, s)| HostTable { weight: w, scale: s })
+                    .collect();
+                let width = (engram.n - 1) * engram.heads;
+                // (pos0, n, t): a mid-prompt full chunk, an odd chunk, the small last-chunk bucket,
+                // and a chunk right at the sequence start (padding before the first tokens)
+                for &(pos0, n, t) in &[
+                    (2048i64, 2048usize, 2048usize),
+                    (4096, 93, 128),
+                    (2048, 257, 512),
+                    (0, 64, 128),
+                    (3, 5, 32),
+                ] {
+                    let tokens = &prompt[pos0 as usize..pos0 as usize + n];
+                    let per = t * 256 * width * 4;
+                    // production: full-prefix before, the step's own ids + gather
+                    let full_before = &prompt[..pos0 as usize];
+                    let column = [0i64];
+                    let pos = [pos0];
+                    let real = [n as i64];
+                    let bindptr = [0i64, full_before.len() as i64];
+                    let empty = [0i64, 0];
+                    let rows_full = Rows {
+                        column: &column,
+                        pos0: &pos,
+                        real: &real,
+                        window_first: &column,
+                        window_indptr: &empty,
+                        window: &[],
+                        window_ids: &[],
+                        history_indptr: &empty,
+                        history: &[],
+                        before_indptr: &bindptr,
+                        before: full_before,
+                    };
+                    let ids = engram_ids(&engram, &rows_full, tokens, t).unwrap();
+                    let tables = Tables {
+                        t,
+                        prefill: true,
+                        engram_emb: (0..layers).map(|e| (e * per, e)).collect(),
+                        nbytes: layers * per,
+                        ..Tables::default()
+                    };
+                    let mut step = vec![0u8; tables.nbytes];
+                    {
+                        let mut w = words(&mut step, tables.nbytes).unwrap();
+                        engram_gather_host(&engram, &tables, &mut w, &ids, &hts, t).unwrap();
+                    }
+                    // prefetch: only the newest n-1 tokens before pos0 (the context's window)
+                    let keep = (engram.n - 1).min(pos0 as usize);
+                    let short_before = &prompt[pos0 as usize - keep..pos0 as usize];
+                    let mut pref = vec![0u8; tables.nbytes];
+                    engram_prefetch_gather(
+                        &engram, &hts, short_before, tokens, pos0, t, &mut pref,
+                    )
+                    .unwrap();
+                    assert_words_eq(
+                        &buf_words(&step),
+                        &buf_words(&pref),
+                        &format!("layers {layers}, seed {seed}, pos0 {pos0}, n {n}, t {t}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The consume path: prefetch into a layer-major ring, then copy each layer's region into the image
+    /// at its OWN (non-contiguous) `engram_emb` offset, must equal gathering straight into the image.
+    /// Different per-layer bytes and a gap between the layers' regions make a swapped offset or a wrong
+    /// per-layer stride visible. This is the copy/layout gate the fill's skip-gather path relies on.
+    #[test]
+    fn engram_prefetch_ring_copy_matches_in_place_gather() {
+        let rows = 4096usize;
+        let layers = 2usize;
+        let (engram, data, prompt) = hashing_fixture(layers, rows, 9);
+        let hts: Vec<HostTable> = data
+            .iter()
+            .map(|(w, s)| HostTable { weight: w, scale: s })
+            .collect();
+        let width = (engram.n - 1) * engram.heads;
+        let (pos0, n, t) = (2048i64, 2048usize, 2048usize);
+        let per = t * 256 * width * 4;
+        let tokens = &prompt[pos0 as usize..pos0 as usize + n];
+        // image: layer 0 at 1024, layer 1 after a 4096-byte gap (non-contiguous, distinct offsets)
+        let off0 = 1024usize;
+        let off1 = off0 + per + 4096;
+        let nbytes = off1 + per + 1024;
+        let image_tables = Tables {
+            t,
+            prefill: true,
+            engram_emb: vec![(off0, 0), (off1, 1)],
+            nbytes,
+            ..Tables::default()
+        };
+        // in-place production gather into the image offsets
+        let full_before = &prompt[..pos0 as usize];
+        let column = [0i64];
+        let pos = [pos0];
+        let real = [n as i64];
+        let bindptr = [0i64, full_before.len() as i64];
+        let empty = [0i64, 0];
+        let rows_full = Rows {
+            column: &column,
+            pos0: &pos,
+            real: &real,
+            window_first: &column,
+            window_indptr: &empty,
+            window: &[],
+            window_ids: &[],
+            history_indptr: &empty,
+            history: &[],
+            before_indptr: &bindptr,
+            before: full_before,
+        };
+        let ids = engram_ids(&engram, &rows_full, tokens, t).unwrap();
+        let mut in_place = vec![0u8; nbytes];
+        {
+            let mut w = words(&mut in_place, nbytes).unwrap();
+            engram_gather_host(&engram, &image_tables, &mut w, &ids, &hts, t).unwrap();
+        }
+        // prefetch into a contiguous layer-major ring, then copy to the image offsets
+        let keep = (engram.n - 1).min(pos0 as usize);
+        let short_before = &prompt[pos0 as usize - keep..pos0 as usize];
+        let mut ring = vec![0u8; layers * per];
+        engram_prefetch_gather(&engram, &hts, short_before, tokens, pos0, t, &mut ring).unwrap();
+        let mut copied = vec![0u8; nbytes];
+        for &(offset, e) in &image_tables.engram_emb {
+            copied[offset..offset + per].copy_from_slice(&ring[e * per..e * per + per]);
+        }
+        assert_words_eq(&buf_words(&in_place), &buf_words(&copied), "ring copy vs in-place");
     }
 
     /// Isolated gather timing against the REAL checkpoint mmap tables (no device, no boot): the
