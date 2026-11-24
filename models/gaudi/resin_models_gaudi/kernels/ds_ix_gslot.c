@@ -46,12 +46,16 @@ void main(tensor blk, tensor rec, tensor gbase, int S2, int nblk, int qb, int he
             const int seen = s_i32_ld_g(gen_addr(bc, blk));
             int len = seen - first;
             len = len < 0 ? 0 : (len > keys ? keys : len);
-            // the score row of the tile's first key: group 0's merge buffer has no running set
-            // (its tiles start at row 0); a later group carries `run` running-candidate rows ahead
-            // of its tiles (index_merge_graph's tile_row0 = base > 0 ? run : 0). The offset is per
-            // GROUP, not per tile — adding `run` to group 0's tiles>0 shifts their scores +run rows
-            // and the merge lists every such key `run` positions too high (drops the needle).
-            const int key0 = (g == 0 ? 0 : run) + (tile - g * tp) * keys;
+            // the tile-LOCAL score row of the tile's first key. The score launches write ix_tile
+            // (a (rows, T) buffer, column stride rows) at rows 0 .. rows for EVERY group; the merge
+            // op's copy then places that tile at the group's merge-buffer rows (row0 = 0 for group 0,
+            // `run` for a later group's running-candidate prefix). So key0 carries NO `run` offset —
+            // the copy's destination adds it. The old `tile==0 ? 0 : run + ...` added `run` to every
+            // tile>0: group 0's tiles>0 landed +run rows high (the merge listed each key `run`
+            // positions too high, dropping the decode needle), and a later group's acc wrote rows
+            // run .. run+rows — overlapping group 0's 0 .. rows and overflowing the rows-sized tile —
+            // so its copy (reading 0 .. rows) re-listed group 0's keys and corrupted prefill merge.
+            const int key0 = (tile - g * tp) * keys;
             const int live = len > 0;
             // a padding slot is lane 0 = -1 and lanes 1 .. 7 = 0, the launches' "no keys" record
             int64 v = 0;
