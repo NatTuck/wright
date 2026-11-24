@@ -11,8 +11,8 @@ use crate::tables::{Words, words};
 
 pub const PAGE_TOKENS: i64 = 128;
 pub const HISTORY_TOKENS: i64 = 256;
-pub const PAGE_ROWS: i64 = 129;
-pub const INDEX_ROWS: i64 = 33;
+pub const PAGE_ROWS: i64 = 80; // fp4 compressed latent page rows (window pages stay 129, via layer_rows)
+pub const INDEX_ROWS: i64 = 17; // fp4 index page rows
 pub const PAIR_ROWS: i64 = PAGE_ROWS + INDEX_ROWS;
 pub const INDEX_KEYS: i64 = 2048;
 /// the rows of a merge group's running candidates (the top index entries; `INDEX_TOP` of the Python side)
@@ -605,16 +605,14 @@ pub fn fill(
         };
         for (g, j, k) in entries {
             let p = j / page;
-            let row = padded(history(k), history_width, p / owner.pages, -1)?
+            let lat0 = padded(history(k), history_width, p / owner.pages, -1)?
                 + owner.offset
                 + PAIR_ROWS * (p % owner.pages);
             let e = j % page;
-            w.set(store, g * 8, row + e);
-            w.set(store, g * 8 + 2, 4 * (row + PAGE_ROWS) + e);
-            w.set(store, g * 8 + 5, row + PAGE_ROWS + INDEX_ROWS - 1);
-            w.set(store, g * 8 + 6, e);
-            w.set(store, g * 8 + 3, row + page);
-            w.set(store, g * 8 + 4, e);
+            // fp4 store (ds_store_f4): lane 0 = the latent page's first row, lane 1 = the entry index;
+            // the kernel derives the code/scale rows for the latent and the index page (lat0 + PAGE_ROWS).
+            w.set(store, g * 8, lat0);
+            w.set(store, g * 8 + 1, e);
         }
     }
 

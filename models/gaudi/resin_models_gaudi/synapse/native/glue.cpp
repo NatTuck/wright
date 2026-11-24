@@ -201,6 +201,10 @@ static bool geom_rcnt(const HabanaKernelParams* p, uint64_t is[5], uint32_t* ran
 static bool geom_cgather(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = 1; is[1] = sz(p, true, 0, 1) / 32; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
 }
+// ix_cgather_f4: 64 keys (8 blocks) of the (64, 2048, S) code staging per member
+static bool geom_cgather_f4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 1; is[1] = sz(p, true, 0, 1) / 64; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
+}
 // ix_bgather: 64 listed blocks of a column per member (input 1 (NBL, T))
 static bool geom_bgather(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = sz(p, false, 1, 0) / 64; is[1] = sz(p, false, 1, 1); *rank = 2; return true;
@@ -417,6 +421,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_ix_slot_acc")) return geom_ix_slot_acc;
     if (is("ds_ix_qacc")) return geom_ix_qacc;
     if (is("ds_gather_list")) return geom_gather16;
+    if (is("ds_gather_dense_f4")) return geom_mla_gather;
     if (is("ds_smean")) return geom_elem64;
     if (is("ds_argmax")) return geom_columns;
     if (is("ds_mk_add")) return geom_mk_add;
@@ -518,6 +523,7 @@ static GeomFn geom_for(const char* n) {
     if (is("ix_bcnt")) return geom_elem64;
     if (is("ix_bmax") || is("ix_cmask")) return geom_k512;
     if (is("ix_rcnt")) return geom_rcnt;
+    if (is("ix_cgather_f4")) return geom_cgather_f4;
     if (is("ix_cgather")) return geom_cgather;
     if (is("ix_bgather")) return geom_bgather;
     if (is("ix_cfix")) return geom_k512;
@@ -659,6 +665,7 @@ static ApFn ap_for(const char* n) {
     if (strncmp(n, "lq_qdqp_", 8) == 0) return ap_qdqp;
     if (strcmp(n, "mla_slot_q") == 0) return ap_mla_slot_q;
     if (strcmp(n, "mla_gather") == 0 || strcmp(n, "mla_gather_list") == 0) return ap_mla_gather;
+    if (strcmp(n, "ds_gather_dense_f4") == 0) return ap_mla_gather;
     if (strcmp(n, "ds_gather_list") == 0) return ap_gather8;
     if (strcmp(n, "ds_gather_list_f4") == 0) return ap_gather8;
     if (strcmp(n, "attn_slot_q") == 0) return ap_slot_q;

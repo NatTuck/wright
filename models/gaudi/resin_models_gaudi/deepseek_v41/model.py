@@ -35,6 +35,7 @@ from resin.models.deepseek_v41 import DeepSeekV41Config
 from resin_models_gaudi.common.sampling import PARAMS, TOP_MAX
 from resin_models_gaudi.deepseek_v41 import layers as L
 from resin_models_gaudi.deepseek_v41.cache import (
+    CMP_PAGE_ROWS,
     HISTORY_TOKENS,
     INDEX_ROWS,
     PAGE_ROWS,
@@ -2253,7 +2254,7 @@ class DeepSeekV41Gaudi:
             radix_min=RADIX_MIN,
             prefilter=(PREFILTER_BLOCKS, PREFILTER_MIN),
             dense_keys=DENSE_KEYS,
-            geometry=(PAGE_TOKENS, HISTORY_TOKENS, PAGE_ROWS, INDEX_ROWS, INDEX_KEYS, PENDING_SLOTS),
+            geometry=(PAGE_TOKENS, HISTORY_TOKENS, CMP_PAGE_ROWS, INDEX_ROWS, INDEX_KEYS, PENDING_SLOTS),
             engram_host=engram_host,
         )
         for s, tb in self.tables.items():

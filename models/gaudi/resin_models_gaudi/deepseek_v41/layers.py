@@ -17,7 +17,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from resin_models_gaudi.deepseek_v41.cache import PAGE_ROWS
+from resin_models_gaudi.deepseek_v41.cache import CMP_PAGE_ROWS, PAGE_ROWS
 from resin_models_gaudi.glm5_3_flash.layers import GEMM_NN, GEMM_NT
 from resin_models_gaudi.glm5_3_flash.layers import LayerGraph as GlmLayerGraph
 from resin_models_gaudi.glm5_3_flash.weights import NS
@@ -817,11 +817,12 @@ def _compress_store(
         [k],
         GEMM_NT,
     )
-    ix32 = lg.fq4(lg.ds_rope(k, cs_g, 1, norm="ix_knorm"), 0)
-    lq = lg.fq4(lg.rope(latn, cs_g, 1), 1)
+    ix_rope = lg.ds_rope(k, cs_g, 1, norm="ix_knorm")
+    lat_rope = lg.rope(latn, cs_g, 1)
+    # true fp4 codes + group scales (the store quantizes; no fq4 round-trip re-quantization)
     lg.node(
-        "rg_mla_store_i8_f32",
-        [arena, lg.input("cmp_store", (8, G), I32), lq, ix32],
+        "rg_ds_store_f4_f32",
+        [arena, lg.input("cmp_store", (8, G), I32), lat_rope, ix_rope],
         [lg.input("cmp_stored", (64, 1), I32)],
     )
 
@@ -1037,18 +1038,22 @@ def index_score_graph(
         ks2, sk = (
             lg.tensor((2 * INDEX_DIM, C // 2, Sp), F8),
             lg.tensor((C, Sp), F32),
-        )  # two keys a row
+        )  # two keys a row; sk = 2^k, the per-key tensor scale restored by qacc
+        codes = lg.tensor((INDEX_DIM // 2, C, Sp), U8)
+        scales = lg.tensor((INDEX_DIM // 32, C, Sp), U8)
+        ktab = lg.tensor((C, Sp), I32)  # per-key k = maxS-132 (mx4_decs row scale)
+        ids = lg.tensor((C, Sp), I32)  # identity row map (c + C*s) for mx4_decs R=0
         if cand_top:
             lg.node(
-                "rg_ix_cgather_f32",
+                "rg_ix_cgather_f4_f32",
                 [lg.arena(blocks), lg.input("cand_list", (cand_top, T), I32), lg.input("cand_slots", (8, T), I32),
                  lg.input("cmp_blocks", (pages, T), I32), lg.input("cmp_loff", (64,), I32), table, lg.dep()],
-                [ks2, sk, lg.input("ix_cpos", (scores, T), I32)],
-                struct.pack("i", PAGE_ROWS),
+                [codes, scales, sk, ktab, ids, lg.input("ix_cpos", (scores, T), I32)],
+                struct.pack("i", CMP_PAGE_ROWS),
             )  # fmt: skip
         else:
             lg.node(
-                "rg_ds_ix_gather_f32",
+                "rg_ds_ix_gather_f4_f32",
                 [
                     lg.arena(blocks),
                     lg.input("cmp_blocks", (cpages, T), I32),
@@ -1056,18 +1061,31 @@ def index_score_graph(
                     lg.dep(),
                     lg.input("cmp_loff", (64,), I32),
                 ],
-                [ks2, sk],
-                struct.pack("i", PAGE_ROWS),
+                [codes, scales, sk, ktab, ids],
+                struct.pack("i", CMP_PAGE_ROWS),
             )
+        # fp4 -> fp8 NORMALIZED by the per-key tensor scale k (mx4_decs, per-row k from ktab): the fp8
+        # code is code*2^(S-127-k) (< 240), and qacc restores 2^k via sk.  k=0 would saturate large scales.
+        codes2 = lg.tensor((INDEX_DIM // 2, C * Sp), U8)
+        scales2 = lg.tensor((INDEX_DIM // 32, C * Sp), U8)
+        ktab2 = lg.tensor((C * Sp,), I32)
+        ids2 = lg.tensor((C * Sp,), I32)
+        dec = lg.tensor((INDEX_DIM, C * Sp), F8)
+        lg.node("reshape", [codes], [codes2])
+        lg.node("reshape", [scales], [scales2])
+        lg.node("reshape", [ktab], [ktab2])
+        lg.node("reshape", [ids], [ids2])
+        lg.node("rg_mx4_decs_f32", [codes2, scales2, ids2, ktab2], [dec], struct.pack("ii", 0, 0))
+        lg.node("reshape", [dec], [ks2])
         inputs.append((table, qs, sq, lg.view(ks2, (INDEX_DIM, C, Sp)), sk))
     scs = []
-    for (
+    for p, (
         table,
         qs,
         sq,
         ks,
         sk,
-    ) in inputs:  # (prefill: each head's product rounded to bf16, as the reference's)
+    ) in enumerate(inputs):  # (prefill: each head's product rounded to bf16, as the reference's)
         sc = lg.tensor((C, M, Sp), BF16 if prefill else F32)
         lg.node("batch_gemm", [qs, ks], [sc], GEMM_NT)
         scs.append(sc)
@@ -1345,7 +1363,7 @@ def _gather_listed(lg: LayerGraph, arena_blocks: int, blocks: int) -> Tensor:
     D, K, T = lg.d.head_dim, INDEX_TOP, lg.T
     ks = lg.tensor((D, K, T), BF16)
     lg.node(
-        "rg_ds_gather_list_f32",
+        "rg_ds_gather_list_f4_f32",
         [lg.arena(arena_blocks), lg.input("ix_list", (K, T), I32), lg.input("cmp_blocks", (blocks, T), I32),
          lg.input("cmp_loff", (64,), I32), lg.input("ix_lslots", (8, T), I32), lg.dep()],
         [ks],
@@ -1360,10 +1378,9 @@ def _gather_dense(lg: LayerGraph, arena_blocks: int, keys: int) -> Tensor:
     ks = lg.tensor((D, keys, S), BF16)
     lp = lg.input("cmp_lat", (keys // PAGE, S), I32)
     lg.node(
-        "rg_mla_gather_f32",
+        "rg_ds_gather_dense_f4_f32",
         [lg.arena(arena_blocks), lp, lp, lg.input("cslots", (8, S), I32), lg.dep()],
         [ks],
-        struct.pack("i", 0),
     )
     return ks
 

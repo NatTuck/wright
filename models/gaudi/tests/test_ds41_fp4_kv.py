@@ -295,17 +295,14 @@ def test_fp4_store_gather_value_exact(device, recipes):
             )
 
 
-def test_fp4_index_store_gather(device, recipes):
-    """Indexer fp4 path: ds_store_f4 (index codes+e8m0) -> ds_ix_gather_f4 (staging) -> mx4_dec (k=0,
-    fp4->fp8 with e8m0 folded).  The fp8 value == the checkpoint fp4 index key value (exact in range)."""
+def _index_gather_dequant(device, recipes, ix, T, C):
+    """The production indexer fp4 path: ds_store_f4 (index codes+e8m0) -> ds_ix_gather_f4 (codes, scales,
+    per-key sk=2^k, ktab=k, ids) -> mx4_decs (per-row k, fp4->fp8 NORMALIZED).  Returns (fp8 value (C,128),
+    sk (C,)).  The effective key value is fp8_value(dec) * sk."""
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
     from test_ds41_kernels import fp8_value
 
-    rng = np.random.default_rng(303)
-    T = 6
-    C = 32
-    ix = (rng.standard_normal((T, 128)) * np.exp2(rng.integers(-4, 4, (T, 4)).repeat(32, 1))).astype(np.float32)
     PR, NB, B = 256, 8, 200
     g = Graph(device, "t_fp4ix")
     arena = g.input("arena", (512, PR, NB), U8)
@@ -318,16 +315,23 @@ def test_fp4_index_store_gather(device, recipes):
            [sink])
     codes = g.tensor((64, C, 1), U8)
     scales = g.tensor((4, C, 1), U8)
+    sk = g.input("sk", (C, 1), F32)
+    ktab = g.tensor((C, 1), I32)
+    ids = g.tensor((C, 1), I32)
     g.node("rg_ds_ix_gather_f4_f32",
            [arena, g.input("cmp_blocks", (1, 1), I32), g.input("slots", (8, 1), I32), sink,
             g.input("loff", (64,), I32)],
-           [codes, scales], struct.pack("i", 80))
+           [codes, scales, sk, ktab, ids], struct.pack("i", 80))
     codes2 = g.tensor((64, C), U8)
     scales2 = g.tensor((4, C), U8)
+    ktab2 = g.tensor((C,), I32)
+    ids2 = g.tensor((C,), I32)
     g.node("reshape", [codes], [codes2])
     g.node("reshape", [scales], [scales2])
+    g.node("reshape", [ktab], [ktab2])
+    g.node("reshape", [ids], [ids2])
     dec2 = g.tensor((128, C), F8)
-    g.node("rg_mx4_dec_f32", [codes2, scales2], [dec2], struct.pack("i", 0))
+    g.node("rg_mx4_decs_f32", [codes2, scales2, ids2, ktab2], [dec2], struct.pack("ii", 0, 0))
     dec = g.input("dec", (128, C, 1), F8)
     g.node("reshape", [dec2], [dec])
     slots = np.array([[0, 0, 0, 0, T, 0, 1, 0]], np.int32)
@@ -335,11 +339,42 @@ def test_fp4_index_store_gather(device, recipes):
         "arena": np.zeros((NB, PR, 512), np.uint8), "sink": np.zeros((1, 64), np.int32),
         "rows": rows, "lat": np.zeros((T, 512), np.float32), "ix": np.ascontiguousarray(ix),
         "cmp_blocks": np.full((1, 1), B, np.int32), "slots": slots,
-        "loff": np.zeros(64, np.int32), "dec": np.zeros((1, C, 128), np.uint8)}, ["dec"])["dec"]
-    got = fp8_value(out[0])  # (C, 128)
+        "loff": np.zeros(64, np.int32), "dec": np.zeros((1, C, 128), np.uint8),
+        "sk": np.zeros((1, C), np.float32)}, ["dec", "sk"])
+    return fp8_value(out["dec"][0]), out["sk"][0]  # (C, 128), (C,)
+
+
+def test_fp4_index_store_gather(device, recipes):
+    """Indexer fp4 path: ds_store_f4 (index codes+e8m0) -> ds_ix_gather_f4 (staging + per-key sk) ->
+    mx4_decs (per-row k, fp4->fp8 normalized).  fp8_value(dec) * sk == the checkpoint fp4 index key value."""
+    rng = np.random.default_rng(303)
+    T = 6
+    C = 32
+    ix = (rng.standard_normal((T, 128)) * np.exp2(rng.integers(-4, 4, (T, 4)).repeat(32, 1))).astype(np.float32)
+    decv, sk = _index_gather_dequant(device, recipes, ix, T, C)
+    got = decv * sk[:, None]
     want = fp4_ref(ix, 32, False)
     for k in range(T):
         np.testing.assert_array_equal(got[k], want[k], err_msg=f"index key {k}")
+
+
+def test_fp4_index_large_scale(device, recipes):
+    """RED->GREEN: index keys with LARGE e8m0 group scales (2^8..2^12).  The fp4->fp8 dequant must
+    normalize by a per-key tensor scale k (sk = 2^k) so the fp8 code stays < 240; the effective value
+    fp8_value(dec) * sk must equal the checkpoint fp4 value exactly.  With k=0 / sk=1 the fp8 saturates
+    (or wraps to poison) for large scales -> RED.  The small-scale test above cannot catch this."""
+    rng = np.random.default_rng(404)
+    T = 6
+    C = 32
+    ix = (rng.standard_normal((T, 128)) * np.exp2(rng.integers(8, 13, (T, 4)).repeat(32, 1))).astype(np.float32)
+    decv, sk = _index_gather_dequant(device, recipes, ix, T, C)
+    got = decv * sk[:, None]
+    want = fp4_ref(ix, 32, False)
+    mism = 0
+    for k in range(T):
+        mism += int(np.sum(got[k] != want[k]))
+    print(f"  fp4 index large-scale: {mism}/{T*128} elems differ from the checkpoint fp4 value")
+    assert mism == 0, f"large-scale index dequant not value-exact ({mism} elems): k=0 fp8 saturation"
 
 
 if __name__ == "__main__":

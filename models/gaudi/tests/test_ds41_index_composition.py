@@ -266,8 +266,8 @@ def test_prefill_compressed_span(device, recipes, seed):
     lat_pages = np.array([[0, 129, 258]], np.int32)
     cmp_store = np.full((G2, 8), -1, np.int32)
     for g in range(T // 2):
-        e = g  # entry g at page row CMP + g (one page holds 128 entries)
-        cmp_store[g] = [CMP + e, 0, 4 * (CMP + 129) + e, CMP + 128, e, CMP + 161, e, 0]
+        e = g  # fp4: all entries in the page at lat0=CMP, entry e=g
+        cmp_store[g] = [CMP, e, 0, 0, 0, 0, 0, 0]
     cmp_groups = np.full((G2, 4), -1, np.int32)
     for g in range(T // 2):
         cmp_groups[g] = [2 * g, 2 * g + 1, 0, 0]
@@ -427,15 +427,13 @@ def test_prefill_compressed_span(device, recipes, seed):
     sk = np.zeros(T // 2)
     for g in range(T // 2):
         lq = _fq4(_rope_swap(latn[g], cs_g[g]), 1)
-        s = pow2_scale(float(np.abs(lq).max()))
-        latd[g] = fp8_value(fp8_byte(lq / s, np.zeros(D, np.int64))) * s
+        latd[g] = lq  # fp4 value (exact); store keeps codes+scales
         k = bf16_round(latn[g]).astype(np.float32) @ ix_wk_f32.T
         rr = 1.0 / np.sqrt((k.astype(np.float64) ** 2).mean() + eps)
         kni = k * rr * ix_knorm
         ix32 = _fq4(_rope_swap(kni, cs_g[g]), 0)
-        s = pow2_scale(float(np.abs(ix32).max()))
-        sk[g] = s
-        k8n[g] = fp8_byte(ix32 / s, np.zeros(ID, np.int64))
+        sk[g] = 1.0  # fp4 index: e8m0 scale folded into the fp8 dequant in the gather
+        k8n[g] = fp8_byte(ix32, np.zeros(ID, np.int64))  # fp8(ix32) exact (fp4 <=5 sig bits)
     k8v = fp8_value(k8n.astype(np.uint8))
     # index queries: wq_b -> RoPE -> fq4(mode 0) -> fp8 pow2 per (token, head) column
     qi = (qr_n @ iwq_eff.T) * qsq[:, None]  # (T, IH*ID)
@@ -512,18 +510,14 @@ def test_prefill_compressed_span(device, recipes, seed):
 
     print(f"\n=== prefill compressed span T={T} seed={seed} ===")
     ar = got["arena"]
+    from test_ds41_fp4_kv import _decode_latent, _decode_index
     lat_ok, ix_ok = True, True
     for g in range(T // 2):
-        srow = int(cmp_store[g, 3])
-        gs = ar[srow, 4 * g : 4 * g + 4].view(np.float32)[0]
-        gotlat = fp8_value(ar[CMP + g, :D]) * gs
+        lat0 = int(cmp_store[g, 0]); e = int(cmp_store[g, 1])
+        gotlat = _decode_latent(ar, lat0, e)
         rl = _report(f"latent{g}", gotlat, latd[g])
         lat_ok &= rl < 2e-3
-        unit = int(cmp_store[g, 2])
-        gb = ar[unit >> 2, (unit & 3) * 128 : (unit & 3) * 128 + ID]
-        irow = int(cmp_store[g, 5])
-        gis = ar[irow, 4 * g : 4 * g + 4].view(np.float32)[0]
-        gotix = fp8_value(gb) * gis
+        gotix = _decode_index(ar, lat0, e)
         ri = _report(f"index{g}", gotix, k8v[g] * sk[g])
         ix_ok &= ri < 2e-3
     assert lat_ok, "stored latents diverge"
