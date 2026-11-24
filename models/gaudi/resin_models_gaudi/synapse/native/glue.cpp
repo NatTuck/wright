@@ -209,6 +209,10 @@ static bool geom_bgather(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_pairs16(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = 1; is[1] = sz(p, true, 0, 1) / 16; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
 }
+// ds_ix_gather_f4: 32 keys of the (64, C, S) code staging per member
+static bool geom_ix_gather_f4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 1; is[1] = sz(p, true, 0, 1) / 32; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
+}
 // ds_mk_add: 64 vocabulary entries of one rank's slice for one row per member
 static bool geom_mk_add(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, false, 0, 0) + 63) / 64; is[1] = sz(p, true, 0, 1); is[2] = sz(p, false, 0, 2); *rank = 3; return true;
@@ -419,6 +423,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_ix_merge")) return geom_ix_list;
     if (is("ds_ix_bmax")) return geom_k512;
     if (is("ds_ix_pin")) return geom_columns;
+    if (is("ds_ix_gather_f4")) return geom_ix_gather_f4;
     if (is("ds_ix_gather")) return geom_pairs16;
     if (is("ds_ix_gslot")) return geom_ix_gslot;
     if (is("ix_gvis")) return geom_ix_gvis;
@@ -503,6 +508,7 @@ static GeomFn geom_for(const char* n) {
     if (is("ml4_moe_sum") || is("rsum")) return geom_elem;
     if (is("ml4_ix_acc")) return geom_elem64;
     if (is("mla_store")) return geom_mla_store;
+    if (is("ds_store_f4")) return geom_mla_store;
     if (is("mla_slot_out")) return geom_slot_out;
     if (is("mla_gather")) return geom_mla_gather;
     if (is("mla_slot_q")) return geom_slot_q;
@@ -654,6 +660,7 @@ static ApFn ap_for(const char* n) {
     if (strcmp(n, "mla_slot_q") == 0) return ap_mla_slot_q;
     if (strcmp(n, "mla_gather") == 0 || strcmp(n, "mla_gather_list") == 0) return ap_mla_gather;
     if (strcmp(n, "ds_gather_list") == 0) return ap_gather8;
+    if (strcmp(n, "ds_gather_list_f4") == 0) return ap_gather8;
     if (strcmp(n, "attn_slot_q") == 0) return ap_slot_q;
     if (strcmp(n, "kv_gather") == 0 || strcmp(n, "kv_gather8") == 0) return ap_kv_gather;
     return nullptr;
