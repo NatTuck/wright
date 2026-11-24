@@ -1368,11 +1368,13 @@ def test_candidate_blocks_mask(device, recipes):
     g = Graph(device, "t_ds41_candidates")
     sc, V, VB = g.input("score", (K, T), F32), g.input("vis", (T,), I32), g.input("visb", (T,), I32)
     bmax, cthr = g.input("bmax", (K // 8, T), F32), g.input("cthr", (64, T), I32)
+    gb = g.input("gbase", (1,), I32)
     g.node("rg_ix_bmax_f32", [sc, V], [bmax])
     g.node("rg_ix_thr_f32", [bmax, VB], [cthr], struct.pack("i", top))
-    g.node("rg_ix_cmask_f32", [sc, V, bmax, cthr], [g.input("out", (K, T), F32)])
+    g.node("rg_ix_cmask_f32", [sc, V, bmax, cthr, gb], [g.input("out", (K, T), F32)])
     arrays = {"score": score, "vis": vis, "visb": visb, "bmax": np.zeros((T, K // 8), np.float32),
-              "cthr": np.zeros((T, 64), np.int32), "out": np.zeros((T, K), np.float32)}  # fmt: skip
+              "cthr": np.zeros((T, 64), np.int32), "out": np.zeros((T, K), np.float32),
+              "gbase": np.zeros(1, np.int32)}  # fmt: skip
     addr = {}
     try:
         for name, a in arrays.items():
@@ -1884,15 +1886,7 @@ def ds41_dims(ranks: int = 1):
     [
         "",
         "source",
-        pytest.param(
-            "user",
-            marks=pytest.mark.xfail(
-                reason="the block-prefilter arm was removed by the indexer tiling: index_select_graph's "
-                "prefilter path is dead in the model (_graphs compiles only sel,user,sparse), so its "
-                "user-masked arm is no longer maintained",
-                strict=False,
-            ),
-        ),
+        "user",
     ],
 )
 def test_prefilter_selection_lists_the_plain_entries(device, recipes, cand):
@@ -2347,7 +2341,7 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
                 ln = min(max(int(block[b, 1]) - first, 0), keys)
                 if ln <= 0:
                     continue
-                key0 = 0 if tile == 0 else run + (tile - g * tp) * keys
+                key0 = (tile - g * tp) * keys  # tile-local for every group (the merge copy adds the run offset)
                 rec[g * S2 + rg] = [
                     0, L.INDEX_HEADS * c0, int(block[b, 0]), key0, key0 + ln, c0, ratio,
                     first // page,
@@ -2358,7 +2352,7 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
     addr = {
         "blk": device.malloc(8 * T),
         "ix_rec": device.malloc(4 * 8 * groups * S2),
-        "ix_gbase": device.malloc(4 * groups),
+        "ix_gbase": device.malloc(4 * 32 * groups),
     }
     recipe = recipes.compile(g)
     try:
@@ -2371,7 +2365,7 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
             device.sync()
             return (
                 device.d2h(addr["ix_rec"], (groups * S2, 8), np.int32),
-                device.d2h(addr["ix_gbase"], (groups,), np.int32),
+                device.d2h(addr["ix_gbase"], (groups, 32), np.int32)[:, 0],
             )
 
         got, got_gb = go(blk)

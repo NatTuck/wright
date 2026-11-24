@@ -5,8 +5,8 @@
 // block order; cthr from ix_thr over the blocks). Vectors past the visible entries are not written.
 // The group's tile-local visible keys are derived here from the column's visible entries (``ixvis``, the step's
 // O(T) table) and the group's first key (``gbase``): vis = clamp(seen - base, 0, K). No per-group host table.
-// tensors: 0 score (K, T) f32  1 ixvis (T) i32  2 bmax (K / 8, T) f32  3 cthr (64, T) i32 | 4 out (K, T) f32
-//        | 5 gbase (1,) i32
+// tensors: 0 score (K, T) f32  1 ixvis (T) i32  2 bmax (K / 8, T) f32  3 cthr (64, T) i32  4 gbase (1,) i32
+//        | 5 out (K, T) f32   (inputs first, then the output: the graph binds tensors by position)
 // index space: [K / 512, T]
 #include "common.h"
 
@@ -25,7 +25,7 @@ static inline uchar256 ctl_of(int64 e)
     return __builtin_bit_cast(uchar256, c);
 }
 
-void main(tensor score, tensor ixvis, tensor bmax, tensor cthr, tensor out, tensor gbase)
+void main(tensor score, tensor ixvis, tensor bmax, tensor cthr, tensor gbase, tensor out)
 {
     int5 zc = {0, 0, 0, 0, 0};
     const int base = s_i32_ld_g(gen_addr(zc, gbase));

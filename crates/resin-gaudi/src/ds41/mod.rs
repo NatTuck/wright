@@ -714,46 +714,50 @@ pub fn fill(
                 }
             }
         }
-        counts.cand =
-            !tables.prefill && model.candidate.is_some_and(|(_, topk)| most > topk * 8);
-        counts.sparse =
-            !tables.ixc.is_empty() && cols.iter().all(|&c| vis[c] > model.kc);
-        if counts.sparse {
-            for (c, _) in vis.iter().enumerate() {
-                w.set(tables.ix_visc, c, if live(c) { model.kc } else { 0 });
-            }
-            let chunks = (model.kc / INDEX_KEYS) as usize;
-            let total = tables.ixc.len() * tables.ix_slots;
-            let records = cols.len() * chunks;
-            if records > total {
-                return Err("a step's candidate launches exceed the table capacity".into());
-            }
-            let mut table = vec![[0i64; 8]; total];
-            for row in &mut table {
-                row[0] = -1;
-            }
-            for (i, &c) in cols.iter().enumerate() {
-                for chunk in 0..chunks {
-                    table[i * chunks + chunk] = [
-                        0,
-                        model.index_heads * c as i64,
-                        model.kc - 1,
-                        INDEX_KEYS * chunk as i64,
-                        model.kc,
-                        c as i64,
-                        1,
-                        0,
-                    ];
+        // The candidate prefilter and the sparse reindex arm belong to the candidate source's ratio only
+        // (its top-2048 blocks gate the later layers of that same ratio). Drive them from that ratio's
+        // visibility, not the last ratio's, and for prefill as well as decode.
+        if candidate_ratio {
+            counts.cand = model.candidate.is_some_and(|(_, topk)| most > topk * 8);
+            counts.sparse =
+                !tables.ixc.is_empty() && cols.iter().all(|&c| vis[c] > model.kc);
+            if counts.sparse {
+                for (c, _) in vis.iter().enumerate() {
+                    w.set(tables.ix_visc, c, if live(c) { model.kc } else { 0 });
                 }
-            }
-            counts.ixc = records.div_ceil(tables.ix_slots);
-            for (j, &launch) in tables.ixc.iter().enumerate() {
-                for (s, row) in table[j * tables.ix_slots..(j + 1) * tables.ix_slots]
-                    .iter()
-                    .enumerate()
-                {
-                    for (lane, &value) in row.iter().enumerate() {
-                        w.set(launch, s * 8 + lane, value);
+                let chunks = (model.kc / INDEX_KEYS) as usize;
+                let total = tables.ixc.len() * tables.ix_slots;
+                let records = cols.len() * chunks;
+                if records > total {
+                    return Err("a step's candidate launches exceed the table capacity".into());
+                }
+                let mut table = vec![[0i64; 8]; total];
+                for row in &mut table {
+                    row[0] = -1;
+                }
+                for (i, &c) in cols.iter().enumerate() {
+                    for chunk in 0..chunks {
+                        table[i * chunks + chunk] = [
+                            0,
+                            model.index_heads * c as i64,
+                            model.kc - 1,
+                            INDEX_KEYS * chunk as i64,
+                            model.kc,
+                            c as i64,
+                            1,
+                            0,
+                        ];
+                    }
+                }
+                counts.ixc = records.div_ceil(tables.ix_slots);
+                for (j, &launch) in tables.ixc.iter().enumerate() {
+                    for (s, row) in table[j * tables.ix_slots..(j + 1) * tables.ix_slots]
+                        .iter()
+                        .enumerate()
+                    {
+                        for (lane, &value) in row.iter().enumerate() {
+                            w.set(launch, s * 8 + lane, value);
+                        }
                     }
                 }
             }
@@ -787,11 +791,12 @@ pub fn fill(
         }
         // the tiled chain: how many merge groups this step needs, and so how many of each arm's launches it takes.
         // Each group's merge is a _IxMergeOp that emits TWO native ops (copy_multi + launch), so the plain arm
-        // is ix_lpg score launches + 2 per group; the candidate arm adds one block-max/cand-mask op on decode.
+        // is ix_lpg score launches + 2 per group; the candidate arm adds one block-max/cand-mask op (prefill and
+        // decode alike).
         let tp = tables.ix_tp as i64;
         let used = ((chunks + tp - 1) / tp) as usize;
         counts.ix[ri] = used * (tables.ix_lpg + 2);
-        counts.pf[ri] = used * (tables.ix_lpg + if tables.prefill { 2 } else { 3 });
+        counts.pf[ri] = used * (tables.ix_lpg + 3);
         if std::env::var("RESIN_DS41_DEBUG_COUNTS").is_ok() {
             eprintln!(
                 "[fill ri={}] chunks={} tp={} used={} ix_lpg={} ix_tp={} => counts.ix={} counts.pf={}",

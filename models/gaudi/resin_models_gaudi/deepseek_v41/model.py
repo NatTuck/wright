@@ -597,8 +597,9 @@ class DeepSeekV41Gaudi:
         ]
 
     def ixc_launches(self, shape: Shape) -> int:
-        """index launches over candidate entries a decode step of ``shape`` may need (none for prefill)"""
-        if shape.prefill or not self.kc:
+        """index launches over candidate entries a step of ``shape`` may need (the sparse arm: one slot per
+        column per 2048-entry chunk of its candidate blocks, prefill and decode alike)"""
+        if not self.kc:
             return 0
         return -(-shape.T * (self.kc // INDEX_KEYS) // shape.ix_slots)
 
@@ -747,15 +748,14 @@ class DeepSeekV41Gaudi:
             ]
             plain.extend(acc)
             cnd.extend(acc)
-            if not s.prefill:
-                kind = "k" if cand == "user" else "b"
-                cnd.append(
-                    self._op(
-                        self.r[f"ix{kind}", s],
-                        layer,
-                        self._ix_group_names(s, ratio, g, head, kind),
-                    )
+            kind = "k" if cand == "user" else "b"
+            cnd.append(
+                self._op(
+                    self.r[f"ix{kind}", s],
+                    layer,
+                    self._ix_group_names(s, ratio, g, head, kind),
                 )
+            )
             merge = self._op(
                 self.r["ixm", s],
                 layer,
@@ -765,47 +765,46 @@ class DeepSeekV41Gaudi:
             plain.append(merge)
             cnd.append(merge)
         ops: dict = {"ixp": plain, "ixc2": cnd}
-        if not s.prefill:
-            sel = {
-                "ix_visb": self.table + self.tables[s].off["ix_visb"],
-                "cand_bmax": self.io["cand_bmax"],
-                "cand_thr": self.io["cand_thr"],
-                "cand_list": self.io["cand_list"],
-                "cand_slots": self.io["cand_slots"],
-            }
-            ops["ixc_tail"] = (
-                [self._op(self.r["ixbl", s], layer, sel)] if cand == "source" else []
-            )
-            if cand == "user" and self.ixc_launches(s):
-                ops["ixsp"] = [
-                    self._op(
-                        self.r["ixc", s],
-                        layer,
-                        {
-                            **head,
-                            **tail,
-                            "ix_slots": t(f"ixc.{j}"),
-                            "ix_score": self.io["ix_score_sparse"],
-                            "ix_cpos": self.io["ix_cpos"],
-                            # the candidate-entry gather reads the step's page table and the owner's offset
-                            # (tail carries cmp_blocks already; cmp_loff is the sparse launch's own)
-                            "cmp_loff": self.loff[owner],
-                        },
-                    )
-                    for j in range(self.ixc_launches(s))
-                ]
-                ops["ixsp_tail"] = [
-                    self._op(
-                        self.r["sel", s, "user", "sparse"],
-                        layer,
-                        {
-                            "ix_score": self.io["ix_score_sparse"],
-                            "ix_cpos": self.io["ix_cpos"],
-                            "ix_vis": t(f"ix_vis{ratio}"),
-                            "ix_visc": t("ix_visc"),
-                        },
-                    )
-                ]
+        sel = {
+            "ix_visb": self.table + self.tables[s].off[self._visb(ratio)],
+            "cand_bmax": self.io["cand_bmax"],
+            "cand_thr": self.io["cand_thr"],
+            "cand_list": self.io["cand_list"],
+            "cand_slots": self.io["cand_slots"],
+        }
+        ops["ixc_tail"] = (
+            [self._op(self.r["ixbl", s], layer, sel)] if cand == "source" else []
+        )
+        if cand == "user" and self.ixc_launches(s):
+            ops["ixsp"] = [
+                self._op(
+                    self.r["ixc", s],
+                    layer,
+                    {
+                        **head,
+                        **tail,
+                        "ix_slots": t(f"ixc.{j}"),
+                        "ix_score": self.io["ix_score_sparse"],
+                        "ix_cpos": self.io["ix_cpos"],
+                        # the candidate-entry gather reads the step's page table and the owner's offset
+                        # (tail carries cmp_blocks already; cmp_loff is the sparse launch's own)
+                        "cmp_loff": self.loff[owner],
+                    },
+                )
+                for j in range(self.ixc_launches(s))
+            ]
+            ops["ixsp_tail"] = [
+                self._op(
+                    self.r["sel", s, "user", "sparse"],
+                    layer,
+                    {
+                        "ix_score": self.io["ix_score_sparse"],
+                        "ix_cpos": self.io["ix_cpos"],
+                        "ix_vis": t(f"ix_vis{ratio}"),
+                        "ix_visc": t("ix_visc"),
+                    },
+                )
+            ]
         return ops
 
     # ------------------------------------------------------------------ weights
@@ -1053,8 +1052,9 @@ class DeepSeekV41Gaudi:
             "ix_list": buf(4 * L.INDEX_TOP * T),
             "ix_lslots": buf(4 * 8 * T),
             "cand_bmax": buf(4 * self.kb * T),
-            "ix_score_sparse": buf(4 * max(1, self.kc) * MAX_T),
-            "ix_cpos": buf(4 * max(1, self.kc) * MAX_T),
+            # the sparse arm's compact scores and positions: (kc, T) for the widest step (prefill TMAX, not
+            # just the decode MAX_T), since a prefill step scores every column's candidate entries too
+            "ix_score_sparse": buf(4 * max(1, self.kc) * T),
             "cand_thr": buf(4 * 64 * T),
             "cand_list": buf(4 * max(1, self.cfg.candidate_topk_blocks) * T),
             "cand_slots": buf(4 * 8 * T),
@@ -1107,6 +1107,18 @@ class DeepSeekV41Gaudi:
                     "p_w": buf(4 * L.INDEX_HEADS), "p_list": buf(4 * L.INDEX_TOP),
                     "p_lslots": buf(4 * 8), "p_tile": buf(4 * _prows), "p_x": buf(_H4 * 4),
                 }
+        # RESIN_DS41_PFLIST: capture every index source layer's full prefill top-512 list (512, T) after its
+        # index ops, for the differential fidelity gate against the checkpoint reference (default off)
+        self.pf_list = {}
+        self.pf_lslots = {}
+        self.pf_meta = None
+        if _os.environ.get("RESIN_DS41_PFLIST"):
+            for _l in self.cfg.index_source_layers:
+                if _l < self.n_layers:
+                    self.pf_list[_l] = buf(4 * L.INDEX_TOP * TMAX)
+                    self.pf_lslots[_l] = buf(4 * 8 * TMAX)
+            self.pf_meta = buf(8)  # the last prefill chunk's (pos0, n) from meta
+            self.pf_cand = buf(4 * max(1, self.cfg.candidate_topk_blocks) * TMAX)  # L20's candidate block list
         self.logits = buf(4 * d.vocab * TMAX)
         self.logits_all = (
             buf(4 * d.vocab * TMAX * self.nranks) if self.nranks > 1 else self.logits
@@ -1204,23 +1216,27 @@ class DeepSeekV41Gaudi:
                         L.INDEX_RUN, PAGE_TOKENS,
                     )  # fmt: skip
                 graphs["ixm", s] = L.index_merge_graph(dev, d, T, rows, L.INDEX_RUN)
-                if not s.prefill:  # decoding: the candidate blocks the source layer publishes
-                    graphs["ixb", s] = L.index_blocks_graph(dev, d, T, rows)
-                    graphs["ixk", s] = L.index_mask_graph(dev, d, T, rows)
-                    graphs["ixbs", s] = L.index_block_select_graph(
-                        dev, d, T, self.kb, top, False
+                # the candidate blocks the source layer publishes, and the sparse reindex arm over them
+                # (prefill and decode alike: the block/mask/gather kernels are per column, shape-agnostic)
+                graphs["ixb", s] = L.index_blocks_graph(dev, d, T, rows)
+                graphs["ixk", s] = L.index_mask_graph(dev, d, T, rows)
+                graphs["ixbs", s] = L.index_block_select_graph(
+                    dev, d, T, self.kb, top, False
+                )
+                graphs["ixbl", s] = L.index_block_select_graph(
+                    dev, d, T, self.kb, top, True
+                )
+                if self.ixc_launches(s):
+                    # the sparse arm scores one column's candidate entries per slot (query_block=1), so its
+                    # gather (ix_cgather) reads that column's candidate list; prefill's qb=128 score slots do
+                    # not apply here
+                    graphs["ixc", s] = L.index_score_graph(
+                        dev, d, T, s.ix_slots, INDEX_KEYS, nb, self.kc, query_block=1,
+                        cand_top=top, pages=self.pages,
+                    )  # fmt: skip
+                    graphs["sel", s, "user", "sparse"] = L.index_select_graph(
+                        dev, d, T, self.kc, "user", top, sparse=True
                     )
-                    graphs["ixbl", s] = L.index_block_select_graph(
-                        dev, d, T, self.kb, top, True
-                    )
-                    if self.ixc_launches(s):
-                        graphs["ixc", s] = L.index_score_graph(
-                            dev, d, T, s.ix_slots, INDEX_KEYS, nb, self.kc, query_block=qb,
-                            cand_top=top, pages=self.pages,
-                        )  # fmt: skip
-                        graphs["sel", s, "user", "sparse"] = L.index_select_graph(
-                            dev, d, T, self.kc, "user", top, sparse=True
-                        )
                 graphs["out", s] = L.attention_out_graph(
                     dev, d, T, nb, self.pages, win_slots=s.win_slots, win_keys=s.win_keys
                 )
@@ -2113,6 +2129,14 @@ class DeepSeekV41Gaudi:
             dense_or(ops, "attn", ratio)
             if "ixp" in ops:
                 index(ratio, ops)
+                if (_os.environ.get("RESIN_DS41_PFLIST") and s.prefill
+                        and layer in getattr(self, "pf_list", {})):
+                    native.copy(self.pf_list[layer], self.io["ix_list"], 4 * L.INDEX_TOP * T)
+                    native.copy(self.pf_lslots[layer], self.io["ix_lslots"], 4 * 8 * T)
+                    native.copy(self.pf_meta, self.table + self.tables[s].off["meta"], 8)
+                    if layer == self.cfg.candidate_source_layer:
+                        native.copy(self.pf_cand, self.io["cand_list"],
+                                    4 * max(1, self.cfg.candidate_topk_blocks) * T)
                 if (_os.environ.get("RESIN_DS41_IXCAP") and s.prefill
                         and layer == max(self.cfg.index_source_layers)):
                     native.copy(self.ixcap_list, self.io["ix_list"], 4 * L.INDEX_TOP * T)

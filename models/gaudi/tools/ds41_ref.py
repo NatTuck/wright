@@ -49,6 +49,11 @@ parser.add_argument("--layers", type=int, default=40)
 parser.add_argument("--decode", type=int, default=8)
 parser.add_argument("--dump", type=int, default=4)
 parser.add_argument("--last", type=int, default=64)
+parser.add_argument("--index-dump", action="store_true",
+                    help="dump only each index source layer's top-512 list (skip the large per-layer outputs)")
+parser.add_argument("--chunk-index", type=int, default=0, metavar="C",
+                    help="compute the indexer scores in query chunks of C (memory-safe at long context; "
+                         "per-query math is identical to the checkpoint's full einsum)")
 parser.add_argument("--ids-file")
 parser.add_argument("--text")
 parser.add_argument("ids", nargs="*", type=int)
@@ -372,6 +377,80 @@ for module in model.modules():
         module._buffers[name] = new
 model.eval()
 
+# ------------------------------------------------------------------ chunked indexer (memory-safe long context)
+# The checkpoint's Indexer.forward materializes (b, s, h, t) index scores, which is O(n^2) memory. Every step
+# of its selection is per-query, so computing the scores in query chunks is bit-identical; this calls the
+# checkpoint's OWN select_candidate_blocks / einsum / topk, just over a query slice at a time.
+if args.chunk_index:
+    _CHUNK = args.chunk_index
+
+    def _chunked_indexer_forward(self, x, qr, latent, start_pos, offset):
+        assert self.freqs_cis is not None
+        bsz, seqlen, _ = x.size()
+        ratio, rd, end_pos = self.compress_ratio, self.rope_head_dim, start_pos + seqlen
+        if self.owns_k and latent is not None:
+            freqs = (
+                self.freqs_cis[: seqlen - seqlen % ratio : ratio]
+                if start_pos == 0
+                else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+            )
+            k = self.k_norm(self.wk(latent))
+            M.apply_rotary_emb(k[..., -rd:], freqs)
+            M.fp4_act_quant(k, M.fp4_block_size, True)
+            self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
+        if self.owns_k:
+            M.shared_attn.index_k = self.k_cache
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
+        M.apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
+        M.fp4_act_quant(q, M.fp4_block_size, True)
+        index_k = M.shared_attn.index_k[:bsz, : end_pos // ratio]
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        n_pos = end_pos // ratio
+        topk = min(self.index_topk, n_pos)
+        if start_pos != 0 or seqlen <= _CHUNK:
+            index_score = torch.einsum("bshd,btd->bsht", q, index_k)
+            index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+            if M.world_size > 1:
+                M.dist.all_reduce(index_score)
+            if start_pos == 0:
+                compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
+                index_score.masked_fill_(torch.arange(n_pos, device=x.device) >= compress_lens, -torch.inf)
+            else:
+                compress_lens = end_pos // ratio
+            if self.is_candidate_source:
+                M.shared_attn.candidates = M.select_candidate_blocks(
+                    index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size)
+            elif self.uses_candidates:
+                index_score = index_score.masked_fill(~M.shared_attn.candidates, -torch.inf)
+            idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+            return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+        # prefill: chunk over queries
+        compress_lens_full = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
+        pos = torch.arange(n_pos, device=x.device)
+        out = torch.empty(bsz, seqlen, topk, dtype=torch.int32, device=x.device)
+        cand = (
+            torch.zeros(bsz, seqlen, n_pos, dtype=torch.bool, device=x.device)
+            if self.is_candidate_source else None
+        )
+        for s0 in range(0, seqlen, _CHUNK):
+            s1 = min(s0 + _CHUNK, seqlen)
+            sc = torch.einsum("bshd,btd->bsht", q[:, s0:s1], index_k)
+            sc = (sc.relu_() * weights[:, s0:s1].unsqueeze(-1)).sum(dim=2)
+            cl = compress_lens_full[s0:s1]
+            sc.masked_fill_(pos >= cl, -torch.inf)
+            if self.is_candidate_source:
+                cand[:, s0:s1] = M.select_candidate_blocks(
+                    sc, cl, self.candidate_topk_blocks, self.candidate_block_size)
+            elif self.uses_candidates:
+                sc = sc.masked_fill(~M.shared_attn.candidates[:, s0:s1], -torch.inf)
+            idxs = sc.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+            out[:, s0:s1] = torch.where(idxs < cl, idxs + offset, -1).int()
+        if self.is_candidate_source:
+            M.shared_attn.candidates = cand
+        return out
+
+    M.Indexer.forward = _chunked_indexer_forward
+
 # ------------------------------------------------------------------ dumps
 dumps: dict[str, np.ndarray] = {}
 recording = {"on": True}
@@ -391,6 +470,12 @@ def hook(fn):
 
 
 for i, block in enumerate(model.layers):
+    if args.index_dump:
+        if block.attn.indexer is not None:
+            block.attn.indexer.register_forward_hook(
+                hook(lambda o, i=i: put(f"l{i}.topk", o))
+            )
+        continue
     if i >= args.dump:
         continue
     block.attn.register_forward_hook(hook(lambda o, i=i: put(f"l{i}.attn_out", o)))
@@ -427,7 +512,7 @@ def forward(
             h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index, :])
         h, pre_mix = layer(h, start, pre_mix, None)
         if streams is not None:
-            rows = slice(None) if i < args.dump else slice(-args.last, None)
+            rows = slice(None) if (i < args.dump and not args.index_dump) else slice(-args.last, None)
             streams[f"x{i}"] = h[0, rows].float().numpy().copy()
             streams[f"p{i}"] = pre_mix[0, rows].float().numpy().copy()
     h = layer.hc_pre(h, pre_mix)

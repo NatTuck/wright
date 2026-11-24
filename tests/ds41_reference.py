@@ -420,15 +420,20 @@ class Reference(_Model):
                     seen = min((q + s.qb) // ratio, seen_all)
                     b = (r.column + b0) // s.qb
                     blk[b] = (k, r.column + b0, q, seen)
-                    v["blk"][b, 0] = q
-                    v["blk"][b, 1] = seen
+                    v[f"blk{ratio}"][b, 0] = q
+                    v[f"blk{ratio}"][b, 1] = seen
             nb = -(-vis // 8)
             v[self._visb(ratio)][:] = np.minimum(-(-nb // 64) * 64, self.kmax // 8)
-            counts["cand"] = bool(
-                not s.prefill
-                and cfg.candidate_source_layer >= 0
-                and int(vis.max()) > cfg.candidate_topk_blocks * 8
+            # the candidate prefilter / sparse arm belong to the candidate source's ratio (prefill and decode)
+            candidate_ratio = (
+                cfg.candidate_source_layer < 0
+                or ratio == cfg.compress_ratios[cfg.candidate_source_layer]
             )
+            if candidate_ratio:
+                counts["cand"] = bool(
+                    cfg.candidate_source_layer >= 0
+                    and int(vis.max()) > cfg.candidate_topk_blocks * 8
+                )
             counts["dense", ratio] = self.dense(s) and bool(
                 np.all(vis[live] <= DENSE_KEYS)
             )
@@ -459,32 +464,33 @@ class Reference(_Model):
                         -1,
                     )
             # every live column sees more than kc entries: index sources after the candidate source score
-            # only their columns' candidate entries
-            sparse = (
-                self.ixc_launches(s) > 0
-                and cfg.candidate_source_layer >= 0
-                and bool(np.all(vis[live] > self.kc))
-            )
-            counts["sparse"] = sparse
-            if sparse:
-                v["ix_visc"][:] = np.where(live, self.kc, 0)
-                lc = np.flatnonzero(live)
-                chunks = self.kc // INDEX_KEYS
-                rec = np.zeros((len(lc) * chunks, 8), np.int64)
-                rec[:, 1] = L.INDEX_HEADS * np.repeat(lc, chunks)
-                # query position kc - 1: every compact entry is visible to the slot
-                rec[:, 2] = self.kc - 1
-                rec[:, 3] = INDEX_KEYS * np.tile(np.arange(chunks), len(lc))
-                rec[:, 4] = self.kc
-                rec[:, 5] = np.repeat(lc, chunks)
-                rec[:, 6] = 1
-                n = self.ixc_launches(s)
-                table = np.zeros((n * s.ix_slots, 8), np.int64)
-                table[:, 0] = -1
-                table[: len(rec)] = rec
-                counts["ixc"] = -(-len(rec) // s.ix_slots)
-                for j in range(n):
-                    v[f"ixc.{j}"][:] = table[j * s.ix_slots : (j + 1) * s.ix_slots]
+            # only their columns' candidate entries (the candidate source's ratio only)
+            if candidate_ratio:
+                sparse = (
+                    self.ixc_launches(s) > 0
+                    and cfg.candidate_source_layer >= 0
+                    and bool(np.all(vis[live] > self.kc))
+                )
+                counts["sparse"] = sparse
+                if sparse:
+                    v["ix_visc"][:] = np.where(live, self.kc, 0)
+                    lc = np.flatnonzero(live)
+                    chunks = self.kc // INDEX_KEYS
+                    rec = np.zeros((len(lc) * chunks, 8), np.int64)
+                    rec[:, 1] = L.INDEX_HEADS * np.repeat(lc, chunks)
+                    # query position kc - 1: every compact entry is visible to the slot
+                    rec[:, 2] = self.kc - 1
+                    rec[:, 3] = INDEX_KEYS * np.tile(np.arange(chunks), len(lc))
+                    rec[:, 4] = self.kc
+                    rec[:, 5] = np.repeat(lc, chunks)
+                    rec[:, 6] = 1
+                    n = self.ixc_launches(s)
+                    table = np.zeros((n * s.ix_slots, 8), np.int64)
+                    table[:, 0] = -1
+                    table[: len(rec)] = rec
+                    counts["ixc"] = -(-len(rec) // s.ix_slots)
+                    for j in range(n):
+                        v[f"ixc.{j}"][:] = table[j * s.ix_slots : (j + 1) * s.ix_slots]
             per = HISTORY_TOKENS // ratio // PAGE_TOKENS  # pages per HISTORY block
             pr = np.where(
                 hist[:, :, None] >= 0, hist[:, :, None] + PAIR_ROWS * np.arange(per), -1
