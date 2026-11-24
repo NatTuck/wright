@@ -632,6 +632,13 @@ pub fn fill(
         let vis: Vec<i64> = (0..t)
             .map(|c| if live(c) { (pos[c] + 1) / ratio } else { 0 })
             .collect();
+        if std::env::var("RESIN_DS41_DUMP").is_ok() && ri == 1 {
+            let g = |c: usize| if c < t { vis[c] } else { -999 };
+            let p = |c: usize| if c < t { pos[c] } else { -999 };
+            eprintln!("[filldbg] t={t} n={n} pos0={} real={} vis[0,500,512,1535,1536,1746]=[{},{},{},{},{},{}] pos[500,1746]=[{},{}] live[500,1536,1746]=[{},{},{}]",
+                rows.pos0[0], rows.real[0], g(0), g(500), g(512), g(1535), g(1536), g(1746), p(500), p(1746),
+                live(500.min(t-1)), live(1536.min(t-1)), live(1746.min(t-1)));
+        }
         for (c, &value) in vis.iter().enumerate() {
             w.set(tables.ix_vis[ri], c, value);
         }

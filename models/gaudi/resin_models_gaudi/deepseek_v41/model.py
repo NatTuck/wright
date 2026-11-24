@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
+import os as _os
 
 from resin.models.deepseek_v41 import DeepSeekV41Config
 from resin_models_gaudi.common.sampling import PARAMS, TOP_MAX
@@ -759,7 +760,7 @@ class DeepSeekV41Gaudi:
                 self.r["ixm", s],
                 layer,
                 self._ix_group_names(s, ratio, g, head, "m"),
-                copy=self._ix_tile_copy(s, g),
+                copy=self._ix_tile_copy(s, g, layer),
             )
             plain.append(merge)
             cnd.append(merge)
@@ -1079,6 +1080,17 @@ class DeepSeekV41Gaudi:
         self.ix_merge = [buf(4 * pairs), buf(4 * pairs)]
         self.ix_pos = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
         self.ix_tile = buf(4 * max(self.ix_rows(s) * s.T for s in self.shapes))
+        self.ixcap = {}
+        if _os.environ.get("RESIN_DS41_IXCAP"):
+            _rows = max(self.ix_rows(s) for s in self.shapes if not s.prefill)
+            for _l in self.cfg.index_source_layers:
+                self.ixcap[_l] = buf(4 * _rows * MAX_T)
+            self.ixcap_list = buf(4 * L.INDEX_TOP * TMAX)
+            self.ixcap_tile = buf(4 * max(self.ix_rows(s) * s.T for s in self.shapes if s.prefill))
+            _mg = max(self.ix_groups(s, r) for s in self.shapes if s.prefill for r in (1, 2))
+            self.ixcap_pos = buf(4 * _mg * L.INDEX_RUN)
+            self.ixcap_score = buf(4 * _mg * L.INDEX_RUN)
+            self.ixcap_groups = _mg
         self.logits = buf(4 * d.vocab * TMAX)
         self.logits_all = (
             buf(4 * d.vocab * TMAX * self.nranks) if self.nranks > 1 else self.logits
@@ -1308,6 +1320,116 @@ class DeepSeekV41Gaudi:
                     if _df:
                         _df.write(line + "\n")
                 break
+        if "ix_list" in self.io:
+            _os.makedirs("/tmp/moe-oracle", exist_ok=True)
+            T2 = 2048
+            il = dev.d2h(self.io["ix_list"], (512 * T2,), np.int32).reshape(T2, 512)
+            np.save(f"/tmp/moe-oracle/ixlist_{tag}_r{self.rank}.npy", il)
+            ils = dev.d2h(self.io["ix_lslots"], (8 * T2,), np.int32).reshape(T2, 8)
+            np.save(f"/tmp/moe-oracle/ixls_{tag}_r{self.rank}.npy", ils)
+            print(f"[dump {tag}] ix_list col1746 first16 {il[1746,:16].tolist()} lslots {ils[1746].tolist()}", flush=True)
+            if hasattr(self, "_trace_ixvis"):
+                for r in (1, 2):
+                    iv = dev.d2h(self._trace_ixvis[r - 1], (2048,), np.int32)
+                    np.save(f"/tmp/moe-oracle/ixvis{r}_{tag}_r{self.rank}.npy", iv)
+                    print(f"[dump {tag}] PREFILL ix_vis{r} c500/1000/1535/1536/1746/2047 = "
+                          f"{[int(iv[c]) for c in (500,1000,1535,1536,1746,2047)]}", flush=True)
+        if _os.environ.get("RESIN_DS41_IXCAP"):
+          try:
+            import numpy as _np
+            _td2 = "/tmp/index-merge-fix"; _os.makedirs(_td2, exist_ok=True)
+            _rows = max(self.ix_rows(s) for s in self.shapes if not s.prefill)
+            for _l, _cap in self.ixcap.items():
+                _a = dev.d2h(_cap, (_rows * MAX_T,), np.float32).reshape(MAX_T, _rows)
+                _np.save(f"{_td2}/ixcap_L{_l}_{tag}_r{self.rank}.npy", _a[0])
+            for _nm in ("cand_bmax", "cand_thr", "cand_list", "ix_thr", "ix_thr2"):
+                if _nm in self.io:
+                    _n = {"cand_bmax": self.kb, "cand_thr": 64, "cand_list": max(1, self.cfg.candidate_topk_blocks), "ix_thr": 64, "ix_thr2": 64}[_nm]
+                    _dt = np.int32 if _nm in ("cand_thr", "cand_list", "ix_thr", "ix_thr2") else np.float32
+                    _np.save(f"{_td2}/{_nm}_{tag}_r{self.rank}.npy", dev.d2h(self.io[_nm], (_n * MAX_T,), _dt).reshape(MAX_T, _n)[0])
+            _kc = max(1, self.kc)
+            _np.save(f"{_td2}/ix_score_sparse_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_score_sparse"], (_kc * MAX_T,), np.float32).reshape(MAX_T, _kc)[0])
+            _np.save(f"{_td2}/ix_cpos_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_cpos"], (_kc * MAX_T,), np.int32).reshape(MAX_T, _kc)[0])
+            _np.save(f"{_td2}/ixlist2_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_list"], (L.INDEX_TOP * MAX_T,), np.int32).reshape(MAX_T, L.INDEX_TOP)[0])
+            _np.save(f"{_td2}/ixlistfull_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_list"], (L.INDEX_TOP * TMAX,), np.int32).reshape(TMAX, L.INDEX_TOP))
+            _np.save(f"{_td2}/ixvisb_{tag}_r{self.rank}.npy", dev.d2h(self.table + self.tables[Shape(1, False)].off["ix_visb"], (MAX_T,), np.int32))
+            if hasattr(self, "ixcap_list"):
+                _np.save(f"{_td2}/ixlistpf_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_list, (L.INDEX_TOP * TMAX,), np.int32).reshape(TMAX, L.INDEX_TOP))
+                _prows = max(self.ix_rows(s) * s.T for s in self.shapes if s.prefill)
+                _np.save(f"{_td2}/ixtilepf_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_tile, (_prows,), np.float32))
+                if hasattr(self, "ixcap_pos"):
+                    _np.save(f"{_td2}/ixcappos_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_pos, (self.ixcap_groups * L.INDEX_RUN,), np.int32).reshape(self.ixcap_groups, L.INDEX_RUN))
+                    _np.save(f"{_td2}/ixcapscore_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_score, (self.ixcap_groups * L.INDEX_RUN,), np.float32).reshape(self.ixcap_groups, L.INDEX_RUN))
+            _rows = max(self.ix_rows(s) for s in self.shapes if not s.prefill)
+            for _bi in (0, 1):
+                _np.save(f"{_td2}/ixmerge{_bi}_{tag}_r{self.rank}.npy", dev.d2h(self.ix_merge[_bi], ((_rows + L.INDEX_RUN) * MAX_T,), np.float32).reshape(MAX_T, _rows + L.INDEX_RUN)[0, :L.INDEX_RUN + 64])
+                _np.save(f"{_td2}/ixpos{_bi}_{tag}_r{self.rank}.npy", dev.d2h(self.ix_pos[_bi], (L.INDEX_RUN * MAX_T,), np.int32).reshape(MAX_T, L.INDEX_RUN)[0])
+            _np.save(f"{_td2}/ixtile_{tag}_r{self.rank}.npy", dev.d2h(self.ix_tile, (_rows * MAX_T,), np.float32).reshape(MAX_T, _rows)[0])
+            _np.save(f"{_td2}/ixq8_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_q8"], (L.INDEX_DIM * L.INDEX_HEADS * MAX_T,), np.uint8).reshape(MAX_T, L.INDEX_DIM * L.INDEX_HEADS)[0])
+            _np.save(f"{_td2}/ixqs_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_qs"], (L.INDEX_HEADS * MAX_T,), np.float32).reshape(MAX_T, L.INDEX_HEADS)[0])
+            _np.save(f"{_td2}/ixw_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_w"], (L.INDEX_HEADS * MAX_T,), np.float32).reshape(MAX_T, L.INDEX_HEADS)[0])
+            _tb = self.tables[Shape(1, False)] if Shape(1, False) in self.tables else None
+            if _tb is not None:
+                _rec = dev.d2h(self.table + _tb.off["ix1.rec"], (8 * 64,), np.int32).reshape(64, 8)
+                _np.save(f"{_td2}/ixrec1_{tag}_r{self.rank}.npy", _rec)
+                _gb = dev.d2h(self.table + _tb.off["ix1.gb"], (64 * 32,), np.int32).reshape(64, 32)
+                _np.save(f"{_td2}/ixgb1_{tag}_r{self.rank}.npy", _gb)
+            print(f"[ixcap {tag}] saved group0 tiles L{sorted(self.ixcap)} + cand + sparse + list", flush=True)
+          except Exception as _e:
+            print(f"[ixcap {tag}] skipped: {_e}", flush=True)
+        if _os.environ.get("RESIN_DS41_KVCAP"):
+          try:
+            import numpy as _np
+            td = "/tmp/kv-quant-fix/cap"; _os.makedirs(td, exist_ok=True)
+            nb = 16  # arena blocks to capture (16384 rows covers needle pages for all owners)
+            b0, b1 = 90, min(self.arena_blocks, 330)
+            ar = dev.d2h(self.arena + b0 * 1024 * 512, ((b1 - b0) * 1024 * 512,), np.uint8)
+            _np.save(f"{td}/arena_{tag}_r{self.rank}.npy", ar)
+            _np.save(f"{td}/arenab0_{tag}_r{self.rank}.npy", np.array(b0, np.int64))
+            for o in self.geo.owners:
+                lv = dev.d2h(self.loff[o], (64,), np.int32)
+                _np.save(f"{td}/loff{o}_{tag}_r{self.rank}.npy", lv)
+            for nm in ("ix_list", "ix_lslots", "q_all"):
+                pass
+            il = dev.d2h(self.io["ix_list"], (512 * TMAX,), np.int32).reshape(TMAX, 512)
+            _np.save(f"{td}/ixlist_{tag}_r{self.rank}.npy", il)
+            ils = dev.d2h(self.io["ix_lslots"], (8 * TMAX,), np.int32).reshape(TMAX, 8)
+            _np.save(f"{td}/ixls_{tag}_r{self.rank}.npy", ils)
+            for r in (1, 2):
+                key = f"cmp_blocks{r}"
+                for _Tk, _tb in self.tables.items():
+                    _T = _Tk.T
+                    if _T > MAX_T or key not in _tb.off:
+                        continue
+                    off = _tb.off[key]
+                    cb = dev.d2h(self.table + off, (_T * self.pages,), np.int32)
+                    cb = cb.reshape(_T, -1)
+                    _np.save(f"{td}/cmpblocks{r}_T{_T}_{tag}_r{self.rank}.npy", cb)
+            D, nh = self.d.head_dim, self.d.heads
+            try:
+                kc = max(1, self.kc)
+                idx_caps = [("ix_score_sparse", np.float32, kc), ("ix_cpos", np.int32, kc),
+                            ("ix_thr", np.int32, 64), ("cand_thr", np.int32, 64),
+                            ("cand_bmax", np.float32, self.kb),
+                            ("cand_list", np.int32, max(1, self.cfg.candidate_topk_blocks)),
+                            ("ix_w", np.float32, L.INDEX_HEADS)]
+                for nm, dt, n in idx_caps:
+                    if nm in self.io:
+                        a = dev.d2h(self.io[nm], (n,), dt)
+                        _np.save(f"{td}/{nm}_{tag}_r{self.rank}.npy", a)
+                print(f"[kvcap {tag}] cfg cand_topk_blocks={self.cfg.candidate_topk_blocks} "
+                      f"cand_src={self.cfg.candidate_source_layer} index_topk={self.cfg.index_topk} "
+                      f"kc={self.kc} kb={self.kb}", flush=True)
+            except Exception as _ie:
+                print(f"[kvcap {tag}] idxcap skipped: {_ie}", flush=True)
+            try:
+                qa = dev.d2h(self.io["q_all"], (2 * D * nh * TMAX,), np.uint16).reshape(TMAX, nh * D)
+                _np.save(f"{td}/qall_{tag}_r{self.rank}.npy", qa)
+            except Exception as _qe:
+                print(f"[kvcap {tag}] qall skipped: {_qe}", flush=True)
+            print(f"[kvcap {tag}] saved arena{nb}blk ixlist qall cmpblocks loff to {td}", flush=True)
+          except Exception as _e:
+            print(f"[kvcap {tag}] capture skipped: {_e}", flush=True)
         if _df:
             _df.close()
         for k in (0, 1):
@@ -1429,7 +1551,7 @@ class DeepSeekV41Gaudi:
                 raise ValueError(f"{recipe.name}: unbound {n}")
         return _IxMergeOp(recipe, bound, copy) if copy else _Op(recipe, bound)
 
-    def _ix_tile_copy(self, s: Shape, g: int) -> tuple[list, list, list]:
+    def _ix_tile_copy(self, s: Shape, g: int, layer: int = -1) -> tuple[list, list, list]:
         """(src, size, dst) of the per-column copies that place a group's own scores (a (rows, T) tile at
         ``ix_tile``) at rows ``run`` .. of its merge buffer (a (run + rows, T) tensor), or at rows 0 .. for the
         first group, which has no running candidates."""
@@ -1439,7 +1561,20 @@ class DeepSeekV41Gaudi:
         row0 = 0 if g == 0 else run
         src = [self.ix_tile + 4 * rows * t for t in range(T)]
         dst = [self.ix_merge[g % 2] + 4 * (K * t + row0) for t in range(T)]
-        return src, [4 * rows] * T, dst
+        sizes = [4 * rows] * T
+        if (g == 0 and not s.prefill and layer in self.ixcap
+                and _os.environ.get("RESIN_DS41_IXCAP")):
+            cap = self.ixcap[layer]
+            src += [self.ix_tile + 4 * rows * t for t in range(T)]
+            dst += [cap + 4 * rows * t for t in range(T)]
+            sizes += [4 * rows] * T
+        if (s.prefill and _os.environ.get("RESIN_DS41_IXCAP") and hasattr(self, "ixcap_pos")
+                and layer == max(self.cfg.index_source_layers)):
+            # running set ENTERING group g (last column): positions + scores, before g's merge
+            src += [self.ix_pos[g % 2] + 4 * run * (T - 1), self.ix_merge[g % 2] + 4 * K * (T - 1)]
+            dst += [self.ixcap_pos + 4 * run * g, self.ixcap_score + 4 * run * g]
+            sizes += [4 * run, 4 * run]
+        return src, sizes, dst
 
     def _program(self, s: Shape) -> _Program:
         if (prog := self._programs.get(s)) is not None:
@@ -1842,6 +1977,13 @@ class DeepSeekV41Gaudi:
         if prog.ixg:
             for op in prog.ixg:
                 launch(op)
+        # DIAGNOSTIC: snapshot the fill's ix_vis tables during prefill (post-step dumps are post-decode).
+        if os.environ.get("RESIN_DS41_DUMP") and s.prefill:
+            if not hasattr(self, "_trace_ixvis"):
+                self._trace_ixvis = [self._malloc(4 * TMAX), self._malloc(4 * TMAX)]
+            _tb = self.tables[s]
+            native.copy(self._trace_ixvis[0], self.table + _tb.off["ix_vis1"], 4 * T)
+            native.copy(self._trace_ixvis[1], self.table + _tb.off["ix_vis2"], 4 * T)
         for layer, ops in enumerate(prog.layers):
             native.section(f"layer {layer}")
             ratio = self._ratio(layer)
@@ -1858,6 +2000,10 @@ class DeepSeekV41Gaudi:
             dense_or(ops, "attn", ratio)
             if "ixp" in ops:
                 index(ratio, ops)
+                if (_os.environ.get("RESIN_DS41_IXCAP") and s.prefill
+                        and layer == max(self.cfg.index_source_layers)):
+                    native.copy(self.ixcap_list, self.io["ix_list"], 4 * L.INDEX_TOP * T)
+                    native.copy(self.ixcap_tile, self.ix_tile, 4 * self.ix_rows(s) * T)
             if "out" in ops:
                 dense_or(ops, "out", ratio)
             if ccl:

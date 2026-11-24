@@ -248,6 +248,19 @@ class DeepSeekV41GaudiRunner:
         if self.native_ranks is not None:
             self.executor.attach_ranks(self.native_ranks)
         self.compiles_at_start = self._compiles_seen = self.device.compile_count
+        if __import__("os").environ.get("RESIN_DS41_DUMP"):
+            import threading, time as _t
+            def _dump_loop():
+                p = "/tmp/other-stingray/dump_now"; last = 0
+                while True:
+                    try:
+                        m = __import__("os").path.getmtime(p)
+                        if m > last:
+                            last = m; self.model.dump_step("req")
+                    except FileNotFoundError:
+                        pass
+                    _t.sleep(0.5)
+            threading.Thread(target=_dump_loop, daemon=True).start()
 
     @property
     def kv_pool_bytes(self) -> int:
