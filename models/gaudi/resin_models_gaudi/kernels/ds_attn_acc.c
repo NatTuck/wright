@@ -8,14 +8,16 @@
 // 64-dim blocks are independent work. acc_o persists across the 10 key-block launches (one block per
 // launch, MME PV in between), so there is no within-launch reuse to VLM-cache (unlike attn_sdpa_acc,
 // which merges many slots in one launch); acc_o lives in HBM / compiler-placed SRAM.
-// tensors: 0 acc_o (D, nh, Q) f32 [in/out persist]  1 sscale (nh, Q) f32  2 pv (D, nh, Q) f32
-//          (pv = the block's fresh P @ ks_blk output; writes acc_o in place)
+// tensors: 0 acc_o (D, nh, Q) f32 [in-place persist, input-only]  1 sscale (nh, Q) f32  2 pv (D, nh, Q) f32
+//          (pv = the block's fresh P @ ks_blk output; writes acc_o in place)  | 3 sink (64, 1) i32
+//          (fresh dataflow marker, member (0,0) writes 1 — the mla_slot_acc in-place convention; Synapse
+//          rejects acc_o as input0 AND output0, so acc_o is input-only and the sink chains the recurrence)
 // params: none. index space: [nh, Q]. D a multiple of 64, at most 512 (design D = 512).
 #include "common.h"
 
 #define MAXV 8
 
-void main(tensor acc_o, tensor sscale, tensor pv)
+void main(tensor acc_o, tensor sscale, tensor pv, tensor sink)
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
@@ -36,5 +38,9 @@ void main(tensor acc_o, tensor sscale, tensor pv)
                 }
             }
         }
+    }
+    if (off[0] == 0 && off[1] == 0) {
+        int5 zc = {0, 0, 0, 0, 0};
+        v_i32_st_tnsr(zc, sink, (int64)1);
     }
 }

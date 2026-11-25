@@ -15,9 +15,10 @@
 // with idx < 0 (and lanes >= B) are masked to NINF for the max and their exp is forced to exactly 0
 // for P and the sum. A block with no valid key leaves max / sum untouched (sscale = 1, P = 0).
 // The acc_o rescale + add of the block's fresh PV output is ds_attn_acc (MME batch_gemm has no beta).
-// tensors: 0 sc (B, nh, Q) f32 [raw QK, unscaled]  1 max (nh, Q) f32 [in/out persist]
-//          2 sum (nh, Q) f32 [in/out persist]  3 idx (B, Q) i32 [key indices, -1 = invalid]
-//          | 4 P (B, nh, Q) bf16  5 sscale (nh, Q) f32
+// tensors: 0 sc (B, nh, Q) f32 [raw QK, unscaled]  1 max (nh, Q) f32 [in-place persist, input-only]
+//          2 sum (nh, Q) f32 [in-place persist, input-only]  3 idx (B, Q) i32 [key indices, -1 = invalid]
+//          | 4 P (B, nh, Q) bf16  5 sscale (nh, Q) f32  6 sink (64, 1) i32 [fresh dataflow marker,
+//          member (0,0) writes 1 — mla_slot_acc in-place convention; max/sum are input-only, sink chains]
 // params: scale, nh, B. index space: [nh, Q]
 #include "common.h"
 
@@ -47,8 +48,8 @@ static inline float64 exp8(float64 x)
     return pl * as_float64(e);
 }
 
-void main(tensor sc, tensor mx, tensor sm, tensor idx, tensor P, tensor sscale, float scale, int nh,
-          int B)
+void main(tensor sc, tensor mx, tensor sm, tensor idx, tensor P, tensor sscale, tensor sink,
+          float scale, int nh, int B)
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
@@ -112,5 +113,9 @@ void main(tensor sc, tensor mx, tensor sm, tensor idx, tensor P, tensor sscale, 
             v_f32_st_tnsr_partial(stc, mx, nm, 0, 0);
             v_f32_st_tnsr_partial(stc, sm, ns, 0, 0);
         }
+    }
+    if (off[0] == 0 && off[1] == 0) {
+        int5 zc = {0, 0, 0, 0, 0};
+        v_i32_st_tnsr(zc, sink, (int64)1);
     }
 }
