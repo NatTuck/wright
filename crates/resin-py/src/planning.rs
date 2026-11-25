@@ -4,6 +4,13 @@ use resin_core::{Phase, engine::ExecutionPlan};
 use std::sync::OnceLock;
 
 pub(super) fn from_core(plan: ExecutionPlan<RequestPayload>) -> BatchPlan {
+    // A single-row prefill carries its full prompt so the runner can prefetch the next chunk's Engram
+    // gather across forwards; decode (and multi-row plans) carry none, leaving the decode path untouched.
+    let prefill_prompt = if matches!(plan.phase, Phase::Prefill) && plan.payloads.len() == 1 {
+        plan.payloads[0].prompt.as_ref().clone()
+    } else {
+        Vec::new()
+    };
     let mut sampling_params = Vec::with_capacity(plan.payloads.len());
     let mut media = Vec::with_capacity(plan.payloads.len());
     for payload in plan.payloads {
@@ -24,6 +31,7 @@ pub(super) fn from_core(plan: ExecutionPlan<RequestPayload>) -> BatchPlan {
         prefill_lengths: plan.prefill_lengths,
         token_ids: plan.token_ids,
         token_indptr: plan.token_indptr,
+        prefill_prompt,
         phase: match plan.phase {
             Phase::Prefill => BatchPhase::Prefill,
             Phase::Decode => BatchPhase::Decode,

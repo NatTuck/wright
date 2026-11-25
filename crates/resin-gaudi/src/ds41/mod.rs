@@ -1966,6 +1966,7 @@ mod tests {
     /// A HASHING Engram (real token_map / multipliers / primes / offsets, so `engram_ids` actually
     /// hashes), per-layer host tables with DIFFERENT bytes, and a prompt of in-map tokens. `rows` is
     /// large enough that every hashed id (prime modulus + offset) lands inside the table.
+    #[allow(clippy::type_complexity)]
     fn hashing_fixture(
         layers: usize,
         rows: usize,

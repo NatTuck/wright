@@ -258,6 +258,37 @@ impl Outputs {
     }
 }
 
+/// A cross-chunk Engram prefetch in flight (or ready): a background worker gathers the next prefill
+/// chunk's `eg_emb` into the executor's ring buffer while the current chunk's device submit blocks.
+/// The key (pos0, n, t) plus the exact `before`/`tokens` it gathered let the consuming fill verify the
+/// bytes are the ones it would have gathered itself, then copy them in and skip its own gather.
+struct EgPrefetch {
+    pos0: i64,
+    n: usize,
+    t: usize,
+    before: Vec<i64>,
+    tokens: Vec<i64>,
+    handle: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
+/// The next prefill chunk a prefetch should gather: its position, real token count and bucket, plus the
+/// newest tokens before it and its own tokens (all the Engram hash reads).
+struct PrefetchSpec {
+    pos0: i64,
+    n: usize,
+    t: usize,
+    before: Vec<i64>,
+    tokens: Vec<i64>,
+}
+
+/// Greatest common divisor (the cache checkpoint alignment is the groups' block-token LCM).
+fn gcd32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 #[pyclass(module = "resin._resin")]
 pub(crate) struct Ds41Executor {
     glue: Py<GaudiGlue>,
@@ -269,6 +300,11 @@ pub(crate) struct Ds41Executor {
     /// host-Engram mode: the gather needs each step's newest token on the host, so a continuation
     /// must harvest its feeding step's sample first (no device-feedback tokens), and decode is serial
     engram_host_mode: bool,
+    /// cross-chunk Engram prefetch (host mode, prefill only): the in-flight/ready next-chunk gather,
+    /// its reusable layer-major ring buffer, and the runner's switch (`RESIN_DS41_PREFETCH=0` disables)
+    eg_prefetch: Option<EgPrefetch>,
+    eg_ring: Vec<u32>,
+    eg_prefetch_on: bool,
     context: Py<Ds41Context>,
     shapes: HashMap<(usize, bool), Shaped>,
     layout: Py<CacheLayout>,
@@ -473,6 +509,170 @@ impl Ds41Executor {
             .map_err(PyRuntimeError::new_err)
     }
 
+    /// The next prefill chunk's prefetch spec, predicted by replicating the engine's chunk-end rule
+    /// (`planning.rs::schedule_ready_prefix`): a continuation chunk runs up to `tmax` tokens, but its end
+    /// rounds down to the cache checkpoint alignment (LCM of the groups' block tokens), capped at the
+    /// restorable end (`prefill_length - replay_suffix_tokens`). This matches replay-mode chunks (which
+    /// the replay suffix shortens) as well as whole chunks. The consuming fill still verifies the exact
+    /// tokens before using the bytes, so any residual mismatch only costs a fallback gather.
+    #[allow(clippy::manual_checked_ops)] // the alignment division is guarded by `alignment > 0`
+    fn prefetch_spec(
+        &self,
+        py: Python<'_>,
+        plan: &BatchPlan,
+        r: usize,
+        pos0_next: i64,
+    ) -> Option<PrefetchSpec> {
+        if !self.eg_prefetch_on || plan.phase != BatchPhase::Prefill {
+            return None;
+        }
+        self.model.engram.as_ref()?;
+        let prompt = &plan.prefill_prompt;
+        let p0 = usize::try_from(pos0_next).ok()?;
+        if prompt.is_empty() || p0 >= prompt.len() {
+            return None;
+        }
+        let prefill_len = plan.prefill_lengths[r] as usize;
+        let desired = self.tmax.min(prefill_len.saturating_sub(p0));
+        let mut end = p0 + desired;
+        let layout = self.layout.borrow(py);
+        let kv = layout.inner_native();
+        let alignment = kv.groups().iter().fold(1u32, |a, g| {
+            let b = g.block_tokens().get();
+            a / gcd32(a, b) * b
+        }) as usize;
+        let replay_suffix = kv.replay_suffix_tokens() as usize;
+        if alignment > 0 {
+            let restorable = prefill_len.saturating_sub(replay_suffix.max(1));
+            let checkpoint_end = end.min(restorable) / alignment * alignment;
+            if checkpoint_end > p0 && checkpoint_end < end {
+                end = checkpoint_end;
+            }
+        }
+        let n = end.min(prompt.len()).saturating_sub(p0);
+        if n == 0 {
+            return None;
+        }
+        let t = self.bucket(n, true).ok()?;
+        let keep = self.engram_n.min(p0);
+        let before = prompt[p0 - keep..p0].iter().map(|&x| i64::from(x)).collect();
+        let tokens = prompt[p0..p0 + n].iter().map(|&x| i64::from(x)).collect();
+        Some(PrefetchSpec { pos0: pos0_next, n, t, before, tokens })
+    }
+
+    /// Spawn the background gather of a predicted next chunk into the ring buffer, to overlap the
+    /// current chunk's blocking device submit. Any prior slot is joined first (its chunk was consumed
+    /// or abandoned), so the ring is free before the worker writes it.
+    fn launch_prefetch(&mut self, py: Python<'_>, spec: PrefetchSpec) -> PyResult<()> {
+        if let Some(prev) = self.eg_prefetch.take()
+            && let Some(handle) = prev.handle
+        {
+            let _ = handle.join();
+        }
+        let engram = match self.model.engram.as_ref() {
+            Some(e) => e.clone(),
+            None => return Ok(()),
+        };
+        let stride = 256 * (engram.n - 1) * engram.heads;
+        let words = engram.layers * self.tmax * stride;
+        if self.eg_ring.len() < words {
+            self.eg_ring = vec![0u32; words];
+        }
+        let per = spec.t * stride * 4;
+        let ring_bytes = engram.layers * per;
+        let ring_addr = self.eg_ring.as_mut_ptr() as usize;
+        // The mmap views are pinned for the runner's lifetime (self.engram_host) and read-only; their
+        // addresses stay valid after the guards drop and outlive the worker (joined before drop/reuse).
+        let guards = engram_host_guards(py, &self.engram_host);
+        let slices = engram_host_slices(&guards)?;
+        let ptrs: Vec<(usize, usize, usize, usize)> = slices
+            .iter()
+            .map(|ht| {
+                (
+                    ht.weight.as_ptr() as usize,
+                    ht.weight.len(),
+                    ht.scale.as_ptr() as usize,
+                    ht.scale.len(),
+                )
+            })
+            .collect();
+        drop(guards);
+        let before = spec.before.clone();
+        let tokens = spec.tokens.clone();
+        let (pos0, t) = (spec.pos0, spec.t);
+        let handle = std::thread::spawn(move || {
+            // SAFETY: the mmap tables (ptrs) are pinned read-only for the runner's lifetime; the ring
+            // (ring_addr) is the executor's own buffer, untouched until this handle is joined. Both
+            // outlive the worker. Only Send addresses cross the boundary; the slices are rebuilt here.
+            let hts: Vec<ds41::HostTable> = ptrs
+                .iter()
+                .map(|&(w, wl, s, sl)| ds41::HostTable {
+                    weight: unsafe { std::slice::from_raw_parts(w as *const u8, wl) },
+                    scale: unsafe { std::slice::from_raw_parts(s as *const u8, sl) },
+                })
+                .collect();
+            let out =
+                unsafe { std::slice::from_raw_parts_mut(ring_addr as *mut u8, ring_bytes) };
+            ds41::engram_prefetch_gather(&engram, &hts, &before, &tokens, pos0, t, out)
+        });
+        self.eg_prefetch = Some(EgPrefetch {
+            pos0: spec.pos0,
+            n: spec.n,
+            t: spec.t,
+            before: spec.before,
+            tokens: spec.tokens,
+            handle: Some(handle),
+        });
+        Ok(())
+    }
+
+    /// Join and validate the in-flight prefetch against this step. Returns the per-layer byte count to
+    /// copy when the ring holds exactly this step's embeddings (same pos0/n/bucket, same `before` and
+    /// tokens, worker succeeded). On a key mismatch the slot is LEFT in place (a replay kept-span fill
+    /// must not discard the next chunk's prefetch); only a matching slot is taken and joined.
+    fn take_ready_prefetch(
+        &mut self,
+        rows: &ds41::Rows<'_>,
+        positions: &[i64],
+        tokens: Option<&[i64]>,
+        shape: (usize, bool),
+    ) -> Option<usize> {
+        let engram = self.model.engram.as_ref()?;
+        let width = (engram.n - 1) * engram.heads;
+        let cur_pos0 = rows.pos0.first().copied().unwrap_or(-1);
+        let before_ok = rows.before_indptr.len() >= 2 && {
+            let (lo, hi) = (
+                rows.before_indptr[0] as usize,
+                rows.before_indptr[1] as usize,
+            );
+            hi <= rows.before.len() && rows.before[lo..hi] == self.eg_prefetch.as_ref()?.before[..]
+        };
+        let slot = self.eg_prefetch.as_ref()?;
+        let tokens_ok = tokens
+            .map(|tk| tk.len() >= slot.n && tk[..slot.n] == slot.tokens[..])
+            .unwrap_or(false);
+        let key_ok = shape.1
+            && slot.pos0 == cur_pos0
+            && slot.n == positions.len()
+            && slot.t == shape.0
+            && before_ok
+            && tokens_ok;
+        if !key_ok {
+            return None;
+        }
+        // A match: take the slot and join its worker (blocking only for any gather residual).
+        let slot = self.eg_prefetch.take()?;
+        let joined = slot.handle.map(|h| {
+            h.join()
+                .unwrap_or_else(|_| Err("an Engram prefetch worker panicked".into()))
+        });
+        if matches!(joined, Some(Ok(()))) {
+            Some(slot.t * 256 * width * 4)
+        } else {
+            None
+        }
+    }
+
     /// The next host copy of the table image, once its last upload is done.
     fn take_image(&mut self, py: Python<'_>) -> PyResult<usize> {
         let k = self.image.next;
@@ -517,21 +717,37 @@ impl Ds41Executor {
         with_tokens: bool,
         floor: Option<i64>,
     ) -> PyResult<ds41::Counts> {
+        let start = Instant::now();
+        let rows = rows.view();
+        // Cross-chunk prefetch: when a ready ring matches this prefill step exactly, the fill skips its
+        // own gather (the cloned tables carry no engram_emb) and the ring is copied in afterwards. This
+        // takes &mut self, so it runs before the immutable borrows of the tables and rotation guards.
+        let ring_per = if shape.1 && self.eg_prefetch_on {
+            self.take_ready_prefetch(&rows, positions, tokens, shape)
+        } else {
+            None
+        };
         let tables = self
             .tables
             .get(&shape)
             .ok_or_else(|| PyValueError::new_err(format!("no tables of shape {shape:?}")))?;
-        let start = Instant::now();
         let cs0 = self.cs[0].bind(py).readonly();
         let cs1 = self.cs[1].bind(py).readonly();
         let cs_all = [cs0.as_slice()?, cs1.as_slice()?];
+        let mut skip_tables;
+        let fill_tables: &ds41::Tables = if let Some(_per) = ring_per {
+            skip_tables = tables.clone();
+            skip_tables.engram_emb.clear();
+            &skip_tables
+        } else {
+            tables
+        };
         // SAFETY: host copy k's last upload is done (take_image), and no device copy reads it until this step's.
         let host = unsafe {
             self.image
                 .host
                 .bytes_mut(k * self.image.stride, tables.nbytes)
         };
-        let rows = rows.view();
         let model = &self.model;
         let host_guards = engram_host_guards(py, &self.engram_host);
         let host_tables = engram_host_slices(&host_guards)?;
@@ -539,7 +755,7 @@ impl Ds41Executor {
             .detach(|| {
                 ds41::fill(
                     model,
-                    tables,
+                    fill_tables,
                     host,
                     &rows,
                     positions,
@@ -551,6 +767,19 @@ impl Ds41Executor {
                 )
             })
             .map_err(PyValueError::new_err)?;
+        if let Some(per) = ring_per {
+            // Copy the prefetched layer regions into the image at their OWN offsets (the ring is
+            // layer-major and contiguous; the image's engram_emb offsets need not be). This runs after
+            // the fill's zeroing, so the copied embeddings survive; no other table touches these ranges.
+            // SAFETY: the ring is the executor's own buffer, its worker joined (take_ready_prefetch),
+            // and it stays allocated and untouched until the next launch.
+            let ring = unsafe {
+                std::slice::from_raw_parts(self.eg_ring.as_ptr() as *const u8, self.eg_ring.len() * 4)
+            };
+            for &(offset, e) in &tables.engram_emb {
+                host[offset..offset + per].copy_from_slice(&ring[e * per..e * per + per]);
+            }
+        }
         self.timings.fill += since(start);
         Ok(counts)
     }
@@ -1240,11 +1469,14 @@ impl Ds41Executor {
                 &before,
             );
             let positions: Vec<i64> = (0..n as i64).map(|j| p + j).collect();
+            // Predict the next chunk's Engram gather so it can overlap this chunk's device submit.
+            let next_spec = self.prefetch_spec(py, plan, r, p + n as i64);
             if replay {
                 let kept = (n as i64).min((p + n as i64 - p.max(floor)).max(0)) as usize;
                 let logits = (last && kept > 0).then(|| kept - 1);
-                let t =
-                    self.replay_chunk(py, chunk, &positions, &rows, &before, kept, floor, logits)?;
+                let t = self.replay_chunk(
+                    py, chunk, &positions, &rows, &before, kept, floor, logits, next_spec,
+                )?;
                 self.seen(py, sequence, p, chunk)?;
                 if last {
                     sampled = Some(match t {
@@ -1266,6 +1498,10 @@ impl Ds41Executor {
                 let k = self.take_image(py)?;
                 let counts = self.fill(py, k, (t, true), &rows, &positions, Some(chunk), None)?;
                 self.set_counts(&counts);
+                // Launch the next chunk's gather now so it runs under this chunk's blocking submit.
+                if let Some(spec) = next_spec {
+                    self.launch_prefetch(py, spec)?;
+                }
                 // the chunk's scored positions (`_Scorer.columns`): their columns need every column's logits
                 let which: Vec<usize> = request.map_or(Vec::new(), |req| {
                     (0..req.positions.len())
@@ -1315,6 +1551,7 @@ impl Ds41Executor {
         kept: usize,
         floor: i64,
         logits: Option<usize>,
+        next_spec: Option<PrefetchSpec>,
     ) -> PyResult<Option<usize>> {
         let cut = self
             .cut
@@ -1324,6 +1561,11 @@ impl Ds41Executor {
         let k = self.take_image(py)?;
         let counts = self.fill(py, k, (t, true), rows, positions, Some(tokens), None)?;
         self.set_counts(&counts);
+        // The full-chunk fill consumed this chunk's prefetch; launch the next chunk's gather to overlap
+        // the replay passes' blocking submits (the small kept-span fill below gathers normally).
+        if let Some(spec) = next_spec {
+            self.launch_prefetch(py, spec)?;
+        }
         self.registers[R_COLUMN] = 0;
         let mut sections = self.sections(0, cut, None);
         sections.push(self.n_layers + 4); // the owner store
@@ -1383,6 +1625,17 @@ impl Ds41Executor {
         };
         self.pass(py, k2, &pass, 0, &[compact], &[], "replay kept")?;
         Ok(Some(tk))
+    }
+}
+
+impl Drop for Ds41Executor {
+    fn drop(&mut self) {
+        // Join any in-flight prefetch worker before the ring buffer and mmap views it reads are freed.
+        if let Some(slot) = self.eg_prefetch.take()
+            && let Some(handle) = slot.handle
+        {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1569,6 +1822,10 @@ impl Ds41Executor {
             cs,
             engram_host,
             engram_host_mode,
+            eg_prefetch: None,
+            eg_ring: Vec::new(),
+            eg_prefetch_on: engram_host_mode
+                && std::env::var("RESIN_DS41_PREFETCH").map(|v| v != "0").unwrap_or(true),
             context,
             shapes: built,
             layout,

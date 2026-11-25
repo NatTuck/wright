@@ -414,6 +414,10 @@ struct BatchPlan {
     prefill_lengths: Vec<u32>,
     token_ids: Vec<u32>,
     token_indptr: Vec<u32>,
+    /// The full prompt of a single-row prefill (empty otherwise): the runner's cross-chunk Engram
+    /// prefetch reads the next chunk's tokens from it before the next plan arrives. Carried on the wire
+    /// so a follower rank prefetches the same bytes the driver gathers.
+    prefill_prompt: Vec<u32>,
     phase: BatchPhase,
     batch_id: u64,
     batch_key: Option<u64>,
@@ -430,7 +434,7 @@ struct BatchPlan {
 const PLAN_WIRE_MAGIC: &[u8; 8] = b"RSNPLAN\0";
 // Private same-build protocol: bump when the archived BatchPlan, BatchPhase,
 // CacheGroupPlan or KvGroupPlan schema, or rkyv format flags, change.
-const PLAN_WIRE_VERSION: u32 = 1;
+const PLAN_WIRE_VERSION: u32 = 2;
 const PLAN_WIRE_HEADER: usize = 20;
 
 impl BatchPlan {
@@ -720,6 +724,7 @@ impl BatchPlan {
         context_lengths: "Sequence[int] | npt.NDArray[np.uint32]",
         token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
         token_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
+        prefill_prompt: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
         prefill_lengths: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
         phase = BatchPhase::Prefill,
         batch_id = 0,
@@ -742,6 +747,7 @@ impl BatchPlan {
         context_lengths: PyArrayLike1<'_, u32>,
         token_ids: PyArrayLike1<'_, u32>,
         token_indptr: PyArrayLike1<'_, u32>,
+        prefill_prompt: Option<PyArrayLike1<'_, u32>>,
         prefill_lengths: Option<PyArrayLike1<'_, u32>>,
         phase: BatchPhase,
         batch_id: u64,
@@ -761,6 +767,7 @@ impl BatchPlan {
         let context_lengths = arrays::owned_vec(context_lengths);
         let token_ids = arrays::owned_vec(token_ids);
         let token_indptr = arrays::owned_vec(token_indptr);
+        let prefill_prompt = prefill_prompt.map(arrays::owned_vec).unwrap_or_default();
         // Malformed CSR inputs are rejected by checked() below; deriving the
         // default prefill endpoint must not underflow before that validation.
         let prefill_lengths = prefill_lengths.map(arrays::owned_vec).unwrap_or_else(|| {
@@ -829,6 +836,7 @@ impl BatchPlan {
             prefill_lengths,
             token_ids,
             token_indptr,
+            prefill_prompt,
             phase,
             batch_id,
             batch_key,
@@ -1188,6 +1196,9 @@ impl RequestLease {
 struct RequestPayload {
     sampling_params: SamplingParams,
     media: Option<Arc<Py<PyAny>>>,
+    /// The request's full prompt token ids, shared (cheap to clone) so a prefill plan can carry them to
+    /// the runner for cross-chunk Engram prefetch without perturbing the decode path's per-step clone.
+    prompt: Arc<Vec<u32>>,
 }
 
 fn core_error(error: core::Error) -> PyErr {
@@ -1717,6 +1728,7 @@ impl Engine {
         sampling_params.seed.get_or_insert_with(|| {
             default_sampling_seed(self.core.id(), self.core.next_request_id())
         });
+        let prompt = Arc::new(token_ids.clone());
         let input = core::Submission {
             prompt_logprobs: sampling_params.prompt_logprobs,
             prompt_top_logprobs: sampling_params.prompt_top_logprobs as u32,
@@ -1734,6 +1746,7 @@ impl Engine {
             payload: RequestPayload {
                 sampling_params,
                 media: media.map(Arc::new),
+                prompt,
             },
         };
         let mut handle_error = None;
