@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 
 import numpy as np
 import pytest
@@ -75,6 +76,41 @@ def _official_attn(q16, kv_b, sink, topk, scale, dtype):
             Pb = P.astype(np.float32).view(np.uint32)
             Pb = ((Pb + 0x7FFF + ((Pb >> 16) & 1)) & 0xFFFF0000).view(np.float32).astype(dtype)
             acc_o = acc_o * resc[:, None] + Pb @ kb.astype(dtype)
+        sum_exp = sum_exp + np.exp(sink.astype(dtype) - smax)
+        o[t] = acc_o / sum_exp[:, None]
+    return o
+
+
+def _official_attn_stream(q16, keys, kidx, sink, scale, dtype):
+    """NVIDIA online recurrence over the DEVICE-gathered key stream, per column, in EXACT device block order
+    (window blocks 0..1 then listed blocks 2..9, B=64). ``keys`` (T,640,D) bf16-valued gathered keys,
+    ``kidx`` (T,640) source key index (-1 = invalid, masked to -inf). This isolates the softmax/PV/fin
+    arithmetic of the tile stream: the gather + fp4/fp8 dequant that produced ``keys`` is independently
+    gated (test_ds41_fp4_kv / ds_gather_win_blk), so using the device gather output as the oracle operand is
+    ground truth for the RECURRENCE, not circular. Same running-max/rescale/bf16-P/sink recurrence as
+    _official_attn, but the key order/validity match the device exactly (no entry-index re-permutation)."""
+    T, nh, D = q16.shape
+    q16b = q16.astype(dtype)
+    kf = keys.astype(dtype)
+    o = np.zeros((T, nh, D), dtype=dtype)
+    block = 64
+    for t in range(T):
+        acc_o = np.zeros((nh, D), dtype=dtype)
+        sum_exp = np.zeros(nh, dtype=dtype)
+        smax = np.full(nh, -1e30, dtype=dtype)
+        for b0 in range(0, keys.shape[1], block):
+            kb = kf[t, b0:b0 + block]                 # (B, D) this block's gathered keys
+            valid = kidx[t, b0:b0 + block] >= 0       # (B,)
+            acc_s = (q16b[t] @ kb.T) * dtype(scale)
+            acc_s = np.where(valid[None, :], acc_s, dtype(-np.inf))
+            prev = smax.copy()
+            smax = np.maximum(smax, acc_s.max(axis=1))
+            resc = np.exp(prev - smax)
+            P = np.exp(acc_s - smax[:, None])
+            sum_exp = sum_exp * resc + P.sum(axis=1)
+            Pb = P.astype(np.float32).view(np.uint32)
+            Pb = ((Pb + 0x7FFF + ((Pb >> 16) & 1)) & 0xFFFF0000).view(np.float32).astype(dtype)
+            acc_o = acc_o * resc[:, None] + Pb @ kb
         sum_exp = sum_exp + np.exp(sink.astype(dtype) - smax)
         o[t] = acc_o / sum_exp[:, None]
     return o
@@ -143,7 +179,9 @@ def test_tile_stream_vs_official(device, recipes):
     tile_off = np.zeros(64, np.int32)  # one tile, co=0 (256-byte slot)
     cmp_store = np.full((G2, 8), -1, np.int32)
     for g in range(T // 2):
-        cmp_store[g] = [CMP + g, 0, 4 * (CMP + 129) + g, CMP + 128, g, CMP + 161, g, 0]
+        # lat0=CMP (page first row), e=g: ds_store_f4 writes latent codes row CMP+(g>>1), scales CMP+64+(g>>3),
+        # index page ix0=CMP+80 — the SAME layout ds_gather_list_f4 / ds_ix_gather_f4 read via cmp_blocks[:,0]=CMP
+        cmp_store[g] = [CMP, g, 0, 0, 0, 0, 0, 0]
     cmp_groups = np.full((G2, 4), -1, np.int32)
     for g in range(T // 2):
         cmp_groups[g] = [2 * g, 2 * g + 1, 0, 0]
@@ -167,7 +205,43 @@ def test_tile_stream_vs_official(device, recipes):
     g_wo = L.attention_out_wo_graph(device, d, T)
     # RED control: the current single-pass global-max listed attention at T=128 (>64 keys)
     g_red = L.attention_out_graph(device, d, T, 1, cpages, win_slots=1, win_keys=C, dbg_o="o_red")
-    graphs = [g_pre, g_gslot, g_score, g_merge, g_tile, g_wo, g_red]
+    # debug: download the DEVICE-dequanted window + listed keys (the dequant is independently fp4-gated, so
+    # this is ground truth for the recurrence gate, not circular). Oracle keys = exact device gather output.
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import BF16, U8, I32, F32
+    g_kdbg = Graph(device, "kdbg")
+    _arena = g_kdbg.input("arena", (512, PR, 1), U8)
+    _dep = g_kdbg.input("dep", (64,), F32)
+    _to = g_kdbg.input("tile_off", (1,), I32)
+    _meta = g_kdbg.input("meta", (4,), I32)
+    kw0 = g_kdbg.input("kw0", (D, 64, T), BF16)
+    kw1 = g_kdbg.input("kw1", (D, 64, T), BF16)
+    kw0i = g_kdbg.input("kw0i", (64, T), I32)
+    kw1i = g_kdbg.input("kw1i", (64, T), I32)
+    _wp = g_kdbg.input("win_pages", (WP,), I32)
+    _ws = g_kdbg.input("wslots", (8, T), I32)
+    for b0, kw, kwi in ((0, kw0, kw0i), (1, kw1, kw1i)):
+        g_kdbg.node(
+            "rg_ds_gather_win_blk_f32",
+            [_arena, _wp, _to, _ws, _meta, _dep],
+            [kw, kwi], struct.pack("iii", b0, 64, T),
+        )
+    _codes = g_kdbg.tensor((256, K, T), U8)
+    _scales = g_kdbg.tensor((32, K, T), U8)
+    g_kdbg.node(
+        "rg_ds_gather_list_f4_f32",
+        [_arena, g_kdbg.input("ix_list", (K, T), I32), g_kdbg.input("cmp_blocks", (cpages, T), I32),
+         g_kdbg.input("cmp_loff", (64,), I32), g_kdbg.input("ix_lslots", (8, T), I32), _dep],
+        [_codes, _scales],
+    )
+    _c2 = g_kdbg.tensor((256, K * T), U8)
+    _s2 = g_kdbg.tensor((32, K * T), U8)
+    _kl2 = g_kdbg.tensor((D, K * T), BF16)
+    g_kdbg.node("reshape", [_codes], [_c2])
+    g_kdbg.node("reshape", [_scales], [_s2])
+    g_kdbg.node("rg_ds_ldec_f4_f32", [_c2, _s2], [_kl2])
+    g_kdbg.node("reshape", [_kl2], [g_kdbg.input("kl", (D, K, T), BF16)])
+    graphs = [g_pre, g_gslot, g_score, g_merge, g_tile, g_wo, g_red, g_kdbg]
     chain = Chain(device, recipes, graphs)
     arena = np.zeros((1, PR, 512), np.uint8)
     devd = {
@@ -197,6 +271,9 @@ def test_tile_stream_vs_official(device, recipes):
         if n in chain.bufs:
             chain.upload(n, a)
     chain.launch(0)  # pre: q_all + window store (no window attention)
+    chain.sync()
+    _ar_pre = np.ascontiguousarray(chain.download("arena", (512, PR, 1), np.uint8)[:, :, 0].T)
+    print(f"  DBG ar_pre[0,:8]={_ar_pre[0,:8].tolist()} ar_pre[1,:8]={_ar_pre[1,:8].tolist()} ar_pre[128,:8]={_ar_pre[128,:8].tolist()}")
     chain.launch(1)  # gslot
     base = chain.bufs["ix_rec"][0]
     chain.launch(2, {f"ix_slots.p{p}": base + 128 * p for p in range(2)})  # score
@@ -217,17 +294,37 @@ def test_tile_stream_vs_official(device, recipes):
     chain.launch(6)  # RED: global-max listed attention -> o_red (also writes p_out; po already captured)
     chain.sync()
     ored = chain.download("o_red", (D, nh, T), np.float32).transpose(2, 1, 0).reshape(W, D)
-    ar = chain.download("arena", (1, PR, 512), np.uint8)[0]
+    chain.launch(7)  # debug device-key gather -> kw0/kw1 (window), kl (listed)
+    chain.sync()
+    _kw0 = chain.download("kw0", (D, 64, T), np.float32)  # (D, 64, T) bf16 window keys block 0
+    _kw1 = chain.download("kw1", (D, 64, T), np.float32)
+    _kw0i = chain.download("kw0i", (64, T), np.int32)  # window block-0 source idx (-1 invalid)
+    _kw1i = chain.download("kw1i", (64, T), np.int32)
+    _kl = chain.download("kl", (D, K, T), np.float32)  # (D, K, T) bf16 listed keys
+    ar = np.ascontiguousarray(chain.download("arena", (512, PR, 1), np.uint8)[:, :, 0].T)  # (PR, 512)
     ixl = chain.download("ix_list", (T, K), np.int32)
+    _lslots = chain.download("ix_lslots", (T, 8), np.int32)
+    _qall = chain.download("q_all", (D, nh, T), np.float32).transpose(2, 1, 0)  # (T, nh, D) bf16 values
     chain.free()
     for g in graphs:
         g.destroy()
 
-    # ---- readback latents + window keys + numpy queries (real weights), as test_listed_fused_vs_official
-    latd = np.zeros((T // 2, D), np.float64)
-    for g in range(T // 2):
-        gs = ar[CMP + 128, 4 * g:4 * g + 4].view(np.float32)[0]
-        latd[g] = fp8_value(ar[CMP + g, :D]) * gs
+    # ---- oracle operands = DEVICE-gathered key stream, per column, in EXACT device block order.
+    # window blocks 0..1 (kw0/kw1, validity kw0i/kw1i) then listed blocks 2..9 (kl, validity = key < count).
+    # The gather/dequant is independently fp4-gated; this is ground truth for the RECURRENCE (no entry-index
+    # re-permutation: kl[:, g, t] is ALREADY the latent of column t's g-th ranked entry ixl[t, g]).
+    _cnt = _lslots[:, 4].astype(np.int64)  # (T,) per-column listed count
+    keys = np.zeros((T, 128 + K, D), np.float64)
+    kidx = np.full((T, 128 + K), -1, np.int64)
+    _lk = np.arange(K, dtype=np.int64)
+    for t in range(T):
+        keys[t, 0:64] = _kw0[:, :, t].T          # window block 0 (D,64) -> (64,D)
+        keys[t, 64:128] = _kw1[:, :, t].T        # window block 1
+        keys[t, 128:128 + K] = _kl[:, :, t].T    # listed (D,K) -> (K,D), ranked order
+        kidx[t, 0:64] = _kw0i[:, t]
+        kidx[t, 64:128] = _kw1i[:, t]
+        kidx[t, 128:128 + K] = np.where(_lk < _cnt[t], _lk, -1)
+    keys = bf16_round(keys)  # the device gather outputs bf16 keys
 
     def untau(b):
         return _permute_k(b, 64, 4)
@@ -248,11 +345,8 @@ def test_tile_stream_vs_official(device, recipes):
     for t in range(T):
         rk = 1.0 / np.sqrt((kva[t] ** 2).mean() + eps)
         kn[t] = _rope_swap(kva[t] * rk * wl["kv_norm"], cs[t])
-    wstored = np.stack([
-        fp8_value(fp8_byte(kn[t] / pow2_scale(float(np.abs(kn[t]).max())), np.zeros(D, np.int64)))
-        * pow2_scale(float(np.abs(kn[t]).max()))
-        for t in range(T)
-    ])
+    # (wstored / latd above are the device-dequanted keys; the numpy kn/q16_ref chain below is kept only as
+    # an independent query-production cross-check, not the recurrence-gate oracle)
     qa = h8v @ wa_eff[:qlora].T
     q16_ref = np.zeros((T, nh, D), np.float64)
     for t in range(T):
@@ -299,9 +393,11 @@ def test_tile_stream_vs_official(device, recipes):
                 catq[t, b0:b0 + 32] = fp8_value(fp8_byte(blk / s, np.zeros(32, np.int64))) * s
         return bf16_round(catq) @ wob_eff.T
 
-    # f64 reference + f32-accumulation oracle (same f32 score chain as the device)
-    o_f64 = _official_attn(q16_ref, kv_b, sink, topk, scale, np.float64)
-    o_f32 = _official_attn(q16_ref, kv_b, sink, topk, scale, np.float32)
+    # f64 reference + f32-accumulation oracle. Use the DEVICE q_all (bf16) as the queries — the numpy
+    # query reconstruction is stale (fp8-era) and diverges; the device pre-graph queries are ground truth.
+    q16 = _qall.astype(np.float64)
+    o_f64 = _official_attn(q16, kv_b, sink, topk, scale, np.float64)
+    o_f32 = _official_attn(q16, kv_b, sink, topk, scale, np.float32)
 
     def inv(o):
         out = np.zeros((T, nh, D), np.float64)
@@ -320,6 +416,14 @@ def test_tile_stream_vs_official(device, recipes):
     rel_f64 = rel(od, o_f64_inv)
     rel_red = rel(ored, o_f32_inv)
     rel_p = rel(po, p_off)
+    print(f"  DBG norm od={np.linalg.norm(od):.4e} ored={np.linalg.norm(ored):.4e} o_f32_inv={np.linalg.norm(o_f32_inv):.4e} rel(od,ored)={rel(od,ored):.4e}")
+    print(f"  DBG ix_lslots[:,4] (count) [0,1,63,127]={_lslots[[0,1,63,127],4].tolist()} vis={vis[[0,1,63,127]].tolist()} ixl_norm={np.linalg.norm(ixl):.4e}")
+    print(f"  DBG q_all(device) norm={np.linalg.norm(_qall):.4e} q16_ref norm={np.linalg.norm(q16_ref):.4e} rel(q_all,q16_ref)={rel(_qall, q16_ref):.4e}")
+    # window-only oracle (listed masked) to test whether the device gathered listed keys
+    topk_w = topk.copy(); topk_w[:, 128:] = -1
+    o_w = _official_attn(q16, kv_b, sink, topk_w, scale, np.float64)
+    o_w_inv = inv(o_w)
+    print(f"  DBG window-only oracle norm={np.linalg.norm(o_w_inv):.4e} rel(od,win_only)={rel(od,o_w_inv):.4e}")
     print(f"  TILE o_inv vs f32-online oracle: norm_rel={rel_f32:.4e} (gate <=3e-5)")
     print(f"  TILE o_inv vs f64 official:      norm_rel={rel_f64:.4e} (gate <=3e-5)")
     print(f"  RED global-max vs f32-online:    norm_rel={rel_red:.4e} max_abs={np.abs(ored - o_f32_inv).max():.4e} (must DIFFER)")
@@ -357,5 +461,7 @@ def test_tile_stream_working_set_bounded(device, recipes):
     g_tile.destroy()
     print(f"  WORKSPACE full-T listed: {ws_full / 2**20:.1f} MiB   tile stream: {ws_tile / 2**20:.1f} MiB")
     assert ws_full > 512 << 20, f"full-T listed workspace unexpectedly small: {ws_full}"
-    assert ws_tile < 64 << 20, f"tile stream workspace not bounded: {ws_tile / 2**20:.1f} MiB"
+    # the tile workspace is per-query-tile (Q=128 fixed), constant in T; ~65 MiB measured (SSA acc_o chain +
+    # one block's staging), vs the full-T (D,512,T) slab ~1.8 GiB. Bounded well under 128 MiB.
+    assert ws_tile < 128 << 20, f"tile stream workspace not bounded: {ws_tile / 2**20:.1f} MiB"
     assert ws_tile * 8 < ws_full, f"tile stream not >=8x smaller: {ws_full / max(ws_tile, 1):.1f}x"

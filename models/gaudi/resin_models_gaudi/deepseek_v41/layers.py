@@ -918,7 +918,10 @@ def attention_pre_graph(
     if keys_out is not None:
         keys_out(kn)
     arena = lg.arena(blocks)
-    stored = lg.tensor((64, 1), I32)
+    # the window store's marker: when window_attn=True the window gather consumes it; when False (the bounded
+    # stream does its own window blocks) it must be a PERSISTENT output, else Synapse DCE removes the store
+    # (no consumer) and the window keys are never written to the arena.
+    stored = lg.tensor((64, 1), I32) if window_attn else lg.input("win_stored", (64, 1), I32)
     lg.node(
         "rg_mla_store_p2_f32",
         [arena, lg.input("rows", (8, T), I32), kn, lg.input("ix_none", (128, T), BF16)],
@@ -1886,46 +1889,55 @@ def attention_out_tile_graph(
     B = ATTN_KEY_BLK
     lg = LayerGraph(device, f"attn_out_tile_T{T}_Q{Q}_B{blocks}_A{arena_blocks}", d, T)
     q_tile = lg.view(lg.input("q_all", (D, nh * Q), BF16), (D, nh, Q))
-    acc_o = lg.tensor((D, nh, Q), F32)
-    mx = lg.tensor((nh, Q), F32)
-    sm = lg.tensor((nh, Q), F32)
-    lg.node("rg_ds_attn_online_init_f32", [], [acc_o, mx, sm])
-    # the reused per-block staging (ONE buffer each -> the compiler bounds the workspace to one tile, ~15 MiB)
-    ks_blk = lg.tensor((D, B, Q), BF16)
-    idx = lg.tensor((B, Q), I32)
-    codes = lg.tensor((D // 2, B, Q), U8)
-    scales = lg.tensor((D // 16, B, Q), U8)
-    codes2 = lg.tensor((D // 2, B * Q), U8)
-    scales2 = lg.tensor((D // 16, B * Q), U8)
-    ks2 = lg.tensor((D, B * Q), BF16)
-    sc = lg.tensor((B, nh, Q), F32)
-    P = lg.tensor((B, nh, Q), BF16)
-    sscale = lg.tensor((nh, Q), F32)
-    pv = lg.tensor((D, nh, Q), F32)
+    # The loop-carried online-softmax state is SSA across the blocks of ONE recipe: Synapse treats
+    # input-only tensors as immutable within a recipe (in-place writes only commit across separate
+    # launches), so each block PRODUCES the next block's state as a FRESH single-producer output.
+    # acc_o[i]/mx[i]/sm[i] are block i's state; init seeds [0], online/acc produce [i+1], fin reads
+    # [ATTN_BLOCKS]. The compiler reuses the dead [i] memory across the dep-serialized blocks (bounded
+    # working set, ~2 acc_o live), exactly as the per-block staging below.
+    acc_o = [lg.tensor((D, nh, Q), F32) for _ in range(ATTN_BLOCKS + 1)]
+    mx = [lg.tensor((nh, Q), F32) for _ in range(ATTN_BLOCKS + 1)]
+    sm = [lg.tensor((nh, Q), F32) for _ in range(ATTN_BLOCKS + 1)]
+    lg.node("rg_ds_attn_online_init_f32", [], [acc_o[0], mx[0], sm[0]])
+    # Per-block staging: each tensor has a SINGLE producer (Synapse rejects a tensor produced by multiple
+    # nodes — "producer is already registered"). The buffers are allocated per block and the compiler reuses
+    # their memory across the control-dep-serialized blocks (as index_chain does), bounding the workspace to
+    # one block's staging (~15 MiB), NOT the graph-tensor identity.
     prev = -1
     for blk in range(ATTN_BLOCKS):
+        ks_blk = lg.tensor((D, B, Q), BF16)
+        idx = lg.tensor((B, Q), I32)
+        sc = lg.tensor((B, nh, Q), F32)
+        P = lg.tensor((B, nh, Q), BF16)
+        sscale = lg.tensor((nh, Q), F32)
+        pv = lg.tensor((D, nh, Q), F32)
         if blk < ATTN_WIN_BLOCKS:
             gn = _stream_window_block(
                 lg, arena_blocks, blk, B, Q, win_pages, None, ks_blk, idx
             )
         else:
             b0 = blk - ATTN_WIN_BLOCKS  # listed key-block index 0..7
+            codes = lg.tensor((D // 2, B, Q), U8)
+            scales = lg.tensor((D // 16, B, Q), U8)
+            codes2 = lg.tensor((D // 2, B * Q), U8)
+            scales2 = lg.tensor((D // 16, B * Q), U8)
+            ks2 = lg.tensor((D, B * Q), BF16)
             gn = _stream_listed_block(
                 lg, arena_blocks, blocks, b0, B, Q, codes, scales, idx, codes2, scales2, ks2, ks_blk
             )
-        if prev >= 0:  # block i+1's gather waits for block i's accumulate (the reused ks_blk / acc_o)
+        if prev >= 0:  # block i+1's gather waits for block i's acc (the reused staging / SSA state)
             lg.g.dep(prev, gn)
         lg.node("batch_gemm", [q_tile, ks_blk], [sc], GEMM_NT)
         lg.node(
-            "rg_ds_attn_online_f32", [sc, mx, sm, idx], [P, sscale],
+            "rg_ds_attn_online_f32", [sc, mx[blk], sm[blk], idx], [P, sscale, mx[blk + 1], sm[blk + 1]],
             struct.pack("fii", d.scale, nh, B),
         )  # fmt: skip
         lg.node("batch_gemm", [P, ks_blk], [pv], GEMM_NN)
-        prev = lg.g.node("rg_ds_attn_acc_f32", [acc_o, sscale, pv], [acc_o])
+        prev = lg.g.node("rg_ds_attn_acc_f32", [acc_o[blk], sscale, pv], [acc_o[blk + 1]])
     o_tile = lg.input("o_tile", (D, nh, Q), F32)
-    lg.node(
+    fin = lg.g.node(
         "rg_ds_attn_online_fin_f32",
-        [acc_o, mx, sm, lg.input("attn_sink", (nh,), F32), lg.input("cs_inv", (128, Q), F32)],
+        [acc_o[ATTN_BLOCKS], mx[ATTN_BLOCKS], sm[ATTN_BLOCKS], lg.input("attn_sink", (nh,), F32), lg.input("cs_inv", (128, Q), F32)],
         [o_tile],
     )  # fmt: skip
     if dbg_o:

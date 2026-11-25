@@ -1146,6 +1146,8 @@ class DeepSeekV41Gaudi:
         self.io = {
             "q_all": buf(2 * D * W),
             "o_out": buf(4 * D * W),
+            "win_stored": buf(256),  # window store marker (persistent output keeps the store alive when the
+            # bounded stream skips the pre-graph's window attention; else Synapse DCE removes the store)
             "o1": buf(4 * D * W),
             "m1": buf(4 * W),
             "l1": buf(4 * W),
