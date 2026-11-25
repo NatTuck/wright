@@ -112,6 +112,12 @@ def detect(path: Path) -> Detected:
 
 def choose_preset(detected: Detected, ranks: int | None, context: int | None) -> str:
     """GLM-5.3-Flash has one preset per card count and context, with the same weights."""
+    if detected.preset == "deepseek_v41-gaudi2":
+        # the detected preset is the 8-card Engram-on-card config; 4 cards run the host-Engram TP4 preset
+        # (the 188.8 GiB Engram tables do not fit on 4 cards beside the weights + KV arena)
+        if ranks == 4:
+            return "deepseek_v41-gaudi2-tp4"
+        return detected.preset
     if detected.preset != "glm5_3_flash-gaudi2":
         return detected.preset
     if ranks == 4:
