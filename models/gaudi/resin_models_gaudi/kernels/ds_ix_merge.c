@@ -105,6 +105,65 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
         const uint64 th = v_u32_ld_tnsr_b(tc, thr);
         int5 ec = {c, 0, 0, 0, 0};
         const int want = s_i32_ld_g(gen_addr(ec, exact));
+        // An INVISIBLE tile: every visible row of the buffer is a running row (lim == tile_row0, so the group
+        // added no key of its own) and the column lists at most KS entries (lim <= KS), so ix_thr leaves its
+        // threshold at 1 and every visible row is strictly above it — the selection is exactly rows
+        // 0 .. lim - 1 in row order, i.e. the running set copied through. That is the whole of a padded tile
+        // (the chain runs ceil(tiles/G) recipes of G tiles for the MAXIMUM context, so most tiles of a short
+        // prefill are past the visible prefix) and it costs one load + three stores per 64 rows instead of the
+        // per-entry selection below. Bit-exact: the general path lists the strict class (key > thr) ascending
+        // then the tie class (key == thr) ascending, so the identity needs every visible row strict and none a
+        // tie — and that is exactly `tot == lim`, where tot is ix_bcnt's packed (strict | ties << 16) count
+        // summed over the column's blocks (a scalar load, so the test is a scalar compare).
+        int tot = 0;
+        for (int q = 0; q < (nb + 63) >> 6; q++) {
+            int5 gc = {q, c, 0, 0, 0};
+            tot += s_i32_ld_g(gen_addr(gc, gsum));
+        }
+        if (lim > 0 && lim <= tile_row0 && lim <= KS && tot == lim) {
+            if (off[0] == 0) {  // one member per column does the copy
+                for (int r = 0; r < lim; r += 64) {
+                    int5 sc = {r, c, 0, 0, 0};
+                    const float64 sv = v_f32_ld_tnsr_b(sc, score);
+                    const int64 pv = v_i32_ld_tnsr_b(sc, pos_old);
+                    const int n = lim - r - 1;
+                    if (n >= 63) {
+                        v_f32_st_tnsr(sc, sout, sv);
+                        v_i32_st_tnsr(sc, list, pv);
+                        v_i32_st_tnsr(sc, pos_out, pv);
+                    } else {
+                        v_f32_st_tnsr_partial(sc, sout, sv, n, 0);
+                        v_i32_st_tnsr_partial(sc, list, pv, n, 0);
+                        v_i32_st_tnsr_partial(sc, pos_out, pv, n, 0);
+                    }
+                }
+                {  // the slot record: the fill's count, and no tie cut (every visible entry is listed)
+                    int64 rec = 0;
+                    rec = v_i32_sel_eq_i32_b(lane, (int64)0, (int64)0, rec);
+                    rec = v_i32_sel_eq_i32_b(lane, (int64)1, (int64)(H * c), rec);
+                    rec = v_i32_sel_eq_i32_b(lane, (int64)2, (int64)KS, rec);
+                    rec = v_i32_sel_eq_i32_b(lane, (int64)4, (int64)want, rec);
+                    rec = v_i32_sel_eq_i32_b(lane, (int64)5, (int64)c, rec);
+                    rec = v_i32_sel_eq_i32_b(lane, (int64)7, (int64)0x7FFFFFFF, rec);
+                    int5 rc = {0, c, 0, 0, 0};
+                    v_i32_st_tnsr_partial(rc, slots, rec, 7, 0);
+                }
+                for (int i = lim & ~63; i < KS; i += 64) {  // the slots past the listed entries
+                    const int first = i < lim ? lim - i : 0;
+                    int5 oc = {i + first, c, 0, 0, 0};
+                    if (first) {
+                        v_f32_st_tnsr_partial(oc, sout, ninf, 63 - first, first);
+                        v_i32_st_tnsr_partial(oc, list, none32, 63 - first, first);
+                        v_i32_st_tnsr_partial(oc, pos_out, none32, 63 - first, first);
+                    } else {
+                        v_f32_st_tnsr(oc, sout, ninf);
+                        v_i32_st_tnsr(oc, list, none32);
+                        v_i32_st_tnsr(oc, pos_out, none32);
+                    }
+                }
+            }
+            continue;
+        }
         for (int m = off[0]; m < end[0]; m++) {
             const int b0 = m * nb / NM, b1 = (m + 1) * nb / NM;
             // list offsets: strict keys before b0, all strict keys, ties before b0, all ties

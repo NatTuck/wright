@@ -1424,13 +1424,23 @@ def index_chain_graph(
             scored = masked
         # tile 0 starts fresh unless this is a continuation recipe (carry) reading the incoming running set
         run0 = run if (i > 0 or carry) else 0
-        lg.node("rg_ds_ix_assemble_f32", [rprev, scored], [m], struct.pack("ii", run0, rows))
+        prev = lg.g.node("rg_ds_ix_assemble_f32", [rprev, scored], [m], struct.pack("ii", run0, rows))
         vis, exact = lg.tensor((T,), I32), lg.tensor((T,), I32)
         thr = lg.tensor((64, T), I32)
         cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
-        lg.node("rg_ix_gvis_f32", [seen, base], [vis, exact], struct.pack("iii", run, rows, run))
-        lg.node("rg_ix_thr_f32", [m, vis], [thr], struct.pack("i", run))
-        lg.node("rg_ix_bcnt_f32", [m, vis, thr], [cnt, gsum])
+        if stop == "assemble":  # RESIN_IX_STOP diagnostic: stop after the merge-buffer assemble
+            continue
+        prev = lg.g.node(
+            "rg_ix_gvis_f32", [seen, base], [vis, exact], struct.pack("iii", run, rows, run)
+        )
+        if stop == "gvis":
+            continue
+        prev = lg.g.node("rg_ix_thr_f32", [m, vis], [thr], struct.pack("i", run))
+        if stop == "thr":
+            continue
+        prev = lg.g.node("rg_ix_bcnt_f32", [m, vis, thr], [cnt, gsum])
+        if stop == "bcnt":
+            continue
         # only the last tile's list is the column's final one; earlier merges list into scratch. The last
         # tile's running set lands in the persistent ix_rout/ix_pout so the next G-tile recipe can carry it.
         lo, li = (lslots, ilist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((run, T), I32))
