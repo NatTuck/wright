@@ -139,10 +139,20 @@ void main(tensor y, tensor yt, tensor c, tensor sx, tensor ids, tensor hq, tenso
             const int n = 128 * q < w0 ? 128 : t;
             v_f8_st_tnsr_partial(qc, hq, pack_nat128(HB[2 * q] * inv, HB[2 * q + 1] * inv), n - 1, 0);
 #else
+#ifdef LIN
+            // LIN: hq in natural order (the natural-order activation)
             if (128 * q < w0)
                 v_f8_st_tnsr_partial(qc, hq, pack_lin(HB[2 * q] * inv, HB[2 * q + 1] * inv, 0.0f, 0.0f), 127, 0);
             else
                 v_f8_st_tnsr_partial(qc, hq, pack_lin(HB[w0 / 64] * inv, 0.0f, 0.0f, 0.0f), t - 1, 0);
+#else
+            // base build: pair order (pack_nat128), as ds_xq.c and the header document; the w2 weight is
+            // stored with pair_rows so out[2i+j] = x[64j+i].  (glm5_3_flash's rg_ds_xact_f32 uses this.)
+            if (128 * q < w0)
+                v_f8_st_tnsr_partial(qc, hq, pack_nat128(HB[2 * q] * inv, HB[2 * q + 1] * inv), 127, 0);
+            else
+                v_f8_st_tnsr_partial(qc, hq, pack_nat128(HB[w0 / 64] * inv, HB[w0 / 64 + 1] * inv), t - 1, 0);
+#endif
 #endif
             if (q == 0)
                 STORE_TOKEN_SCALE(hs, s, sc)

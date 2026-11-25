@@ -1328,10 +1328,14 @@ class DeepSeekV41Gaudi:
                             query_block=qb, capture=capture, dense=DENSE_KEYS, scores=self.ix_rows(s),
                         )  # fmt: skip
                 else:
+                    # window_attn=False for EVERY shape: prefill's bounded stream and decode's fused listed
+                    # path both gather their own window blocks from the arena, so the pre-graph window
+                    # attention part (o1/m1/l1) is dead work (decode used to compute it twice); win_stored,
+                    # a persistent output, keeps the window STORE alive without a consumer.
                     graphs[key] = L.attention_pre_graph(
                         dev, d, T, s.win_slots, s.win_keys, nb, ratio=ratio, owner=owner, source=source,
                         groups=s.groups2 if ratio > 1 else T, state_rows=R, residual=residual, query_block=qb,
-                        capture=capture, window_attn=not s.prefill,
+                        capture=capture, window_attn=False,
                     )  # fmt: skip
             if not WINDOW_ONLY and any(cfg.compress_ratios[i] for i in range(self.n_layers)):
                 rows, top = self.ix_rows(s), cfg.candidate_topk_blocks
@@ -1355,17 +1359,9 @@ class DeepSeekV41Gaudi:
                             dev, d, T, s.blocks, INDEX_KEYS, nb, L.INDEX_RUN, IX_CHAIN_G,
                             query_block=qb, parts=1, cpages=self.pages, carry=carry, kind=kind,
                         )  # fmt: skip
-                graphs["ixm", s] = L.index_merge_graph(dev, d, T, rows, L.INDEX_RUN)
-                # the candidate blocks the source layer publishes, and the sparse reindex arm over them
-                # (prefill and decode alike: the block/mask/gather kernels are per column, shape-agnostic)
-                graphs["ixb", s] = L.index_blocks_graph(dev, d, T, rows)
-                graphs["ixk", s] = L.index_mask_graph(dev, d, T, rows)
-                graphs["ixbs", s] = L.index_block_select_graph(
-                    dev, d, T, self.kb, top, False
-                )
-                graphs["ixbl", s] = L.index_block_select_graph(
-                    dev, d, T, self.kb, top, True
-                )
+                # (the old index_merge / index_blocks / index_mask / index_block_select graphs were dead — built
+                # and compiled but never launched; the bucketed chain above publishes the candidate blocks and
+                # the sparse arm selects from them, so they are removed to drop ~5x12 dead compiled recipes.)
                 if self.ixc_launches(s):
                     # the sparse arm scores one column's candidate entries per slot (query_block=1) over ONE
                     # query-block batch of sparse_batch columns; the step runs ixsc_batches batches, each binding

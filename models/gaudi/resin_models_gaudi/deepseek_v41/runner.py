@@ -243,20 +243,17 @@ class DeepSeekV41GaudiRunner:
             self.forward = _timed_forward
         if __import__("os").environ.get("RESIN_DS41_IXCAP"):
             _fwd2 = self.forward
-            _flag = "/tmp/other-stingray/dump_decode"
+            _os = __import__("os")
+            _flag = _os.environ.get("RESIN_DS41_IXCAP_FLAG", "")
             def _cap_forward(plan, *args, **kwargs):
                 out = _fwd2(plan, *args, **kwargs)
-                try:
-                    if __import__("os").path.exists(_flag):
-                        _ph = str(getattr(plan, "phase", "")).upper()
-                        if "PREFILL" in _ph:
-                            self.model.dump_full("prefill")
-                        elif "DECODE" in _ph:
-                            __import__("os").remove(_flag)
-                            self.model.dump_full("dec0")
-                except Exception as _e:
-                    with open("/tmp/index-merge-fix/hook.log", "a") as _hf:
-                        _hf.write(f"err {_e}\n")
+                if _flag and _os.path.exists(_flag):
+                    _ph = str(getattr(plan, "phase", "")).upper()
+                    if "PREFILL" in _ph:
+                        self.model.dump_full("prefill")
+                    elif "DECODE" in _ph:
+                        _os.remove(_flag)
+                        self.model.dump_full("dec0")
                 return out
             self.forward = _cap_forward
         self.enqueue = self.executor.enqueue
@@ -268,17 +265,19 @@ class DeepSeekV41GaudiRunner:
         self.compiles_at_start = self._compiles_seen = self.device.compile_count
         if __import__("os").environ.get("RESIN_DS41_DUMP"):
             import threading, time as _t
-            def _dump_loop():
-                p = "/tmp/other-stingray/dump_now"; last = 0
-                while True:
-                    try:
-                        m = __import__("os").path.getmtime(p)
-                        if m > last:
-                            last = m; self.model.dump_step("req")
-                    except FileNotFoundError:
-                        pass
-                    _t.sleep(0.5)
-            threading.Thread(target=_dump_loop, daemon=True).start()
+            _dump_path = __import__("os").environ.get("RESIN_DS41_DUMP_PATH", "")
+            if _dump_path:
+                def _dump_loop():
+                    p = _dump_path; last = 0
+                    while True:
+                        try:
+                            m = __import__("os").path.getmtime(p)
+                            if m > last:
+                                last = m; self.model.dump_step("req")
+                        except FileNotFoundError:
+                            pass
+                        _t.sleep(0.5)
+                threading.Thread(target=_dump_loop, daemon=True).start()
 
     @property
     def kv_pool_bytes(self) -> int:
