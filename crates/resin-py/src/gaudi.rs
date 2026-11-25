@@ -346,6 +346,8 @@ impl Ds41Fill {
             slots: item(layout, "slots")?,
             rows: item(layout, "rows")?,
             lat: item(layout, "lat")?,
+            wslots: item(layout, "wslots")?,
+            win_pos: item(layout, "win_pos")?,
             ix_visb: item(layout, "ix_visb")?,
             ix_visc: item(layout, "ix_visc")?,
             ixsc_rec: item(layout, "ixsc_rec")?,

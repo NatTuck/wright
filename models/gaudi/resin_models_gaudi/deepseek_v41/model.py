@@ -258,6 +258,11 @@ class _Tables:
             add(f"rows.{layer}", i32, T, 8)
         for layer in range(layers):
             add(f"lat.{layer}", i32, shape.win_slots, shape.win_keys // PAGE_TOKENS)
+        # the bounded attention stream's window gather tables: per-column visible key count (field 4 = klen)
+        # and each layer's GLOBAL positional window page table (win_pos[pos>>7] = first latent arena row)
+        add("wslots", i32, T, 8)
+        for layer in range(layers):
+            add(f"win_pos.{layer}", i32, model.pages)
         if (
             model.stages and not shape.prefill
         ):  # a draft step's block keys, their slots, the anchors
@@ -310,6 +315,7 @@ class _Tables:
             for n in (
                 "cmp_blocks1", "cmp_blocks2",
                 "ix1.rec", "ix2.rec", "ix1.gb", "ix2.gb",
+                *(f"win_pos.{layer}" for layer in range(layers)),
             )
         )  # fmt: skip
         self.zero, a = [], 0
@@ -860,6 +866,39 @@ class DeepSeekV41Gaudi:
             ops["ixsp_tail"] = []
         return ops
 
+    def _attn_tile_ops(self, s: Shape, layer: int, common: dict, tail: dict, t) -> list:
+        """The bounded attention stream's per-query-tile launches: T/Q tiles, each binding tile_off + its
+        q_all / cs_inv / o_out column slice (mirrors ixsc_batches). The listed gather reads the FULL ix_list /
+        ix_lslots / cmp_blocks at column tile_off+q; the window gather reads the global positional win_pages
+        table + the per-column wslots klen + meta (pos0). The tiles write o_out's columns, then out_wo projects
+        the full T output."""
+        d, T = self.d, s.T
+        D, nh = d.head_dim, d.heads
+        Q = min(L.ATTN_TILE_Q, T)
+        cs = "cs1" if self._ratio(layer) else "cs0"
+        ops = []
+        for tile in range(T // Q):
+            co = tile * Q
+            ops.append(
+                self._op(
+                    self.r["out_tile", s],
+                    layer,
+                    {
+                        **common,
+                        **tail,
+                        "q_all": self.io["q_all"] + 2 * D * nh * co,
+                        "ix_list": self.io["ix_list"],
+                        "ix_lslots": self.io["ix_lslots"],
+                        "tile_off": self.attn_tile_off[s] + 256 * tile,
+                        "cs_inv": t(cs + "_inv") + 4 * 128 * co,
+                        "o_tile": self.io["o_out"] + 4 * D * nh * co,
+                        "win_pages": t(f"win_pos.{layer}"),
+                        "wslots": t("wslots"),
+                    },
+                )
+            )
+        return ops
+
     # ------------------------------------------------------------------ weights
     def _load(self, barrier) -> dict[str, int]:
         cfg, src, sl = self.cfg, self.src, self.sl
@@ -1082,6 +1121,17 @@ class DeepSeekV41Gaudi:
         self.c_identity = {
             t: const(identity(t)) for t in (*DECODE_BUCKETS, *PREFILL_BUCKETS)
         }
+        # the bounded attention stream's per-tile step-column offset (tile*Q), each tile in its own 256-byte
+        # (64 i32) slot so the tile_off section base is 256-aligned for every tile (sections validate at 256)
+        self.attn_tile_off = {}
+        for s in self.shapes:
+            if s.prefill:
+                Q = min(L.ATTN_TILE_Q, s.T)
+                nt = s.T // Q
+                a = np.zeros((nt, 64), np.int32)
+                for tile in range(nt):
+                    a[tile, 0] = tile * Q
+                self.attn_tile_off[s] = const(a)
         self.loff = {
             o: const(np.array([self.geo.owner_offset(o), -1] + [0] * 62, np.int32))
             for o in self.geo.owners
@@ -1095,6 +1145,7 @@ class DeepSeekV41Gaudi:
         W = nh * T
         self.io = {
             "q_all": buf(2 * D * W),
+            "o_out": buf(4 * D * W),
             "o1": buf(4 * D * W),
             "m1": buf(4 * W),
             "l1": buf(4 * W),
@@ -1259,7 +1310,7 @@ class DeepSeekV41Gaudi:
                     graphs[key] = L.attention_pre_graph(
                         dev, d, T, s.win_slots, s.win_keys, nb, ratio=ratio, owner=owner, source=source,
                         groups=s.groups2 if ratio > 1 else T, state_rows=R, residual=residual, query_block=qb,
-                        capture=capture,
+                        capture=capture, window_attn=not s.prefill,
                     )  # fmt: skip
             if not WINDOW_ONLY and any(cfg.compress_ratios[i] for i in range(self.n_layers)):
                 rows, top = self.ix_rows(s), cfg.candidate_topk_blocks
@@ -1306,9 +1357,18 @@ class DeepSeekV41Gaudi:
                     graphs["sel", s, "user", "sparse"] = L.index_select_graph(
                         dev, d, sb, self.kc, "user", top, sparse=True
                     )
-                graphs["out", s] = L.attention_out_graph(
-                    dev, d, T, nb, self.pages, win_slots=s.win_slots, win_keys=s.win_keys
-                )
+                if s.prefill:
+                    # the bounded online attention stream: one query-tile recipe (10 key-blocks unrolled,
+                    # loop-carried acc_o/max/sum) launched T/Q times per layer, then one wo_a/wo_b recipe
+                    graphs["out_tile", s] = L.attention_out_tile_graph(
+                        dev, d, T, nb, self.pages, win_slots=s.win_slots, win_keys=s.win_keys,
+                        win_pages=self.pages,
+                    )  # fmt: skip
+                    graphs["out_wo", s] = L.attention_out_wo_graph(dev, d, T)
+                else:
+                    graphs["out", s] = L.attention_out_graph(
+                        dev, d, T, nb, self.pages, win_slots=s.win_slots, win_keys=s.win_keys
+                    )
                 if self.dense(s):
                     graphs["out", s, "dense"] = L.attention_out_graph(
                         dev, d, T, nb, self.pages, dense=DENSE_KEYS, scores=self.ix_rows(s),
@@ -1350,8 +1410,8 @@ class DeepSeekV41Gaudi:
         owner = layer in cfg.kv_source_layers
         source = layer in cfg.index_source_layers
         if (
-            not owner and not source
-        ):  # one launch: no index launches between its two parts
+            not owner and not source and not s.prefill
+        ):  # decode: one launch (no index launches between its two parts); prefill streams the out part
             return ("attn", s, ratio, owner, source, residual, capture)
         return ("pre", s, ratio, owner, source, residual, capture)
 
@@ -1933,9 +1993,16 @@ class DeepSeekV41Gaudi:
                         ops.update(
                             self._ix_ops(s, ratio, layer, owner, head, tail, t)
                         )
-                    ops["out"] = self._op(
-                        self.r["out", s], layer, {**common, **tail, "p_out": p[pnext]}
-                    )
+                    if s.prefill:
+                        ops["out_tiles"] = self._attn_tile_ops(s, layer, common, tail, t)
+                        ops["out_wo"] = self._op(
+                            self.r["out_wo", s], layer,
+                            {"o_out": self.io["o_out"], "p_out": p[pnext]},
+                        )
+                    else:
+                        ops["out"] = self._op(
+                            self.r["out", s], layer, {**common, **tail, "p_out": p[pnext]}
+                        )
                     if ("out", s, "dense") in self.r:
                         ops["out_dense"] = self._op(
                             self.r["out", s, "dense"],
@@ -2235,7 +2302,23 @@ class DeepSeekV41Gaudi:
                         native.copy(cp["p_lslots"], (self.io["ix_lslots"], 7, sb), sb)
                         native.copy(cp["p_tile"], (self.ix_tile, 7, tb), tb)
                         native.copy(cp["p_x"], (ops["x_ffn"], 7, xb), xb)
-            if "out" in ops:
+            if "out_tiles" in ops:
+                # the bounded stream: T/Q tile launches then the wo projection; the dense arm (short context)
+                # is the alternative the counts register selects
+                if ratio in _R_DENSE and "out_dense" in ops:
+                    native.select([(_R_DENSE[ratio], 2)], [0, 1])
+                    native.arm()
+                    for op in ops["out_tiles"]:
+                        launch(op)
+                    launch(ops["out_wo"])
+                    native.arm()
+                    launch(ops["out_dense"])
+                    native.end()
+                else:
+                    for op in ops["out_tiles"]:
+                        launch(op)
+                    launch(ops["out_wo"])
+            elif "out" in ops:
                 dense_or(ops, "out", ratio)
             if ccl:
                 reduce(ops["p_attn"])
@@ -2377,6 +2460,8 @@ class DeepSeekV41Gaudi:
                     "slots": off["slots"],
                     "rows": [off[f"rows.{layer}"] for layer in layers],
                     "lat": [off[f"lat.{layer}"] for layer in layers],
+                    "wslots": off["wslots"],
+                    "win_pos": [off[f"win_pos.{layer}"] for layer in layers],
                     "ix_visb": off["ix_visb"],
                     "ix_visc": off["ix_visc"],
                     "ixsc_rec": off["ixsc.rec"],

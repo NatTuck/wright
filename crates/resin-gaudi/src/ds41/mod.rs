@@ -224,6 +224,10 @@ pub struct Tables {
     /// per layer (and DSpark stage)
     pub rows: Vec<usize>,
     pub lat: Vec<usize>,
+    /// the bounded attention stream's window gather: per-column visible key count (8, T) field 4 = klen,
+    /// and per layer the GLOBAL positional window page table (WP,) (win_pos[pos>>7] = first latent arena row)
+    pub wslots: usize,
+    pub win_pos: Vec<usize>,
     pub ix_visb: usize,
     /// the padded block counts of the ratio that is not the candidate source's (`_visb`)
     pub ix_visb2: usize,
@@ -529,6 +533,34 @@ pub fn fill(
     }
 
     prof.mark("rows");
+    // the bounded attention stream's window gather tables. wslots (8, T): field 4 = each column's visible
+    // key count klen = pos+1 (the causal window includes the column's own position). win_pos.{layer} (WP,):
+    // the GLOBAL positional window page table, win_pos[pp] = first latent arena row of this layer's 129-row
+    // page holding absolute positions [128*pp .. +127], -1 non-resident. The window gather reads pos>>7 for
+    // pos in [pos0-127, pos0+T-1] (NVIDIA get_window_topk_idxs: window [t-127, t]); prefix pages point at the
+    // cached window blocks. Prefill only (the stream is prefill); decode keeps the small single-launch path.
+    w.fill(tables.wslots, t * 8, 0);
+    for &c in &cols {
+        w.set(tables.wslots, c * 8 + 4, pos[c] + 1);
+    }
+    if tables.prefill {
+        let wp = model.pages;
+        let wf = rows.window_first[0];
+        let win0 = window(0);
+        let pg_lo = (positions[0] - (sliding - 1)).max(0) / page;
+        let pg_hi = last[0] / page;
+        for (&table, &offset) in tables.win_pos.iter().zip(&model.layer_rows) {
+            w.fill(table, wp, -1);
+            for pg in pg_lo..=pg_hi {
+                let block = pg - wf;
+                if block >= 0 && (block as usize) < window_width && (pg as usize) < wp {
+                    let base = padded(win0, window_width, block, 0)?;
+                    w.set(table, pg as usize, base + offset);
+                }
+            }
+        }
+    }
+    prof.mark("win_pos");
     // compressor: ratio-2 groups (completed at odd positions) and pending tokens, ratio-1 entries
     let odd: Vec<usize> = cols.iter().copied().filter(|&c| pos[c] % 2 == 1).collect();
     let groups2 = tables.groups2;

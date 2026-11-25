@@ -755,8 +755,13 @@ __all__ = [
     "LayerGraph",
     "NS",
     "attention_out_graph",
+    "attention_out_tile_graph",
+    "attention_out_wo_graph",
     "attention_pre_graph",
     "attention_window_graph",
+    "ATTN_TILE_Q",
+    "ATTN_KEY_BLK",
+    "ATTN_BLOCKS",
     "engram_gather_graph",
     "engram_graph",
     "embed_graph",
@@ -871,6 +876,7 @@ def attention_pre_graph(
     capture: bool = False,
     keys_out=None,
     store_out=None,
+    window_attn: bool = True,
 ) -> Graph:
     """A compressed layer's first launch: the residual, site and collapse, the queries (``q_all``), the window keys'
     store, the window part of the attention (``o1``, ``m1``, ``l1``), and
@@ -925,48 +931,49 @@ def attention_pre_graph(
     q16 = lg.ds_rope(
         lg.view(q, (D, W)), cs, nh, ts=sq, out=lg.input("q_all", (D, W), BF16)
     )
-    table = lg.input("slots", (8, S), I32)
-    lp, rp = (
-        lg.input("lat_pages", (C // PAGE, S), I32),
-        lg.input("rope_pages", (C // PAGE, S), I32),
-    )
-    qs = lg.view(
-        q16, (D, M, S)
-    )  # slot s holds columns M s .. M s + M - 1 (the host's slot order)
-    ks = lg.tensor((D, C, S), BF16)
-    lg.node(
-        "rg_mla_gather_f32", [arena, lp, rp, table, stored], [ks], struct.pack("i", 0)
-    )
-    sc = lg.tensor((C, M, S), F32)
-    lg.node("batch_gemm", [qs, ks], [sc], GEMM_NT)
-    P, mx, ls = (
-        lg.tensor((C, M, S), BF16),
-        lg.tensor((Mp, S), F32),
-        lg.tensor((Mp, S), F32),
-    )
-    lg.node(
-        "rg_ds_slot_pw1_f32"
-        if M <= 64
-        else "rg_ds_slot_pw_f32",  # few columns: one member each
-        [sc, table],
-        [P, mx, ls],
-        struct.pack("fi", d.scale, nh),
-    )
-    pv = lg.tensor((D, M, S), F32)
-    lg.node("batch_gemm", [P, ks], [pv], GEMM_NN)
-    if qb == 1:  # a slot per column
-        ml = _slot_merge(W, T)
-    else:  # few columns: one member each; else a scan of the slots
-        ml = "rg_ds_slot_ml1_f32" if W <= 32 else "rg_ds_slot_ml_f32"
-    lg.node(
-        ml,
-        [pv, mx, ls, table],
-        [
-            lg.input("o1", (D, W, 1), F32),
-            lg.input("m1", (W, 1), F32),
-            lg.input("l1", (W, 1), F32),
-        ],
-    )
+    if window_attn:  # the window attention part (o1/m1/l1); the bounded stream does its own window blocks
+        table = lg.input("slots", (8, S), I32)
+        lp, rp = (
+            lg.input("lat_pages", (C // PAGE, S), I32),
+            lg.input("rope_pages", (C // PAGE, S), I32),
+        )
+        qs = lg.view(
+            q16, (D, M, S)
+        )  # slot s holds columns M s .. M s + M - 1 (the host's slot order)
+        ks = lg.tensor((D, C, S), BF16)
+        lg.node(
+            "rg_mla_gather_f32", [arena, lp, rp, table, stored], [ks], struct.pack("i", 0)
+        )
+        sc = lg.tensor((C, M, S), F32)
+        lg.node("batch_gemm", [qs, ks], [sc], GEMM_NT)
+        P, mx, ls = (
+            lg.tensor((C, M, S), BF16),
+            lg.tensor((Mp, S), F32),
+            lg.tensor((Mp, S), F32),
+        )
+        lg.node(
+            "rg_ds_slot_pw1_f32"
+            if M <= 64
+            else "rg_ds_slot_pw_f32",  # few columns: one member each
+            [sc, table],
+            [P, mx, ls],
+            struct.pack("fi", d.scale, nh),
+        )
+        pv = lg.tensor((D, M, S), F32)
+        lg.node("batch_gemm", [P, ks], [pv], GEMM_NN)
+        if qb == 1:  # a slot per column
+            ml = _slot_merge(W, T)
+        else:  # few columns: one member each; else a scan of the slots
+            ml = "rg_ds_slot_ml1_f32" if W <= 32 else "rg_ds_slot_ml_f32"
+        lg.node(
+            ml,
+            [pv, mx, ls, table],
+            [
+                lg.input("o1", (D, W, 1), F32),
+                lg.input("m1", (W, 1), F32),
+                lg.input("l1", (W, 1), F32),
+            ],
+        )
     if owner:
         _compress_store(lg, arena, h32, ratio=ratio, groups=G, state_rows=state_rows)
     if source:
@@ -1779,6 +1786,163 @@ def _dense_fused(
         [o], struct.pack("ii", nh, qb),
     )  # fmt: skip
     return o
+
+
+# ------------------------------------------------------------------ bounded online attention stream
+# The listed compressed attention as a bounded query-tile x key-block online-softmax stream (design §1):
+# ONE query-tile of Q columns attends over the unified 640-key set (window 128 + listed 512) streamed as
+# 10 blocks of B = 64, reusing one bounded ks_blk operand buffer. acc_o / max / sum are loop-carried
+# device-resident across the 10 blocks (the exact NVIDIA sparse_attn recurrence: scale before max, bf16 P
+# cast before PV, f32 accumulate, sink in the denominator only). The full-T (D, 512, T) gathered slab and
+# the (512, nh, T) score / P / pv slabs never exist: the working set is one tile's (~15 MiB live). The step
+# launches T / Q tile recipes per layer (each binding tile_off + its q_all / cs_inv / o_out column slice),
+# then one wo_a / wo_b recipe over the full T output (attention_out_wo_graph). PREFILL only; decode keeps
+# the small single-launch path (attention_out_graph).
+ATTN_TILE_Q = 128  # query-tile columns (the batch_gemm batch dim S = Q, nh a separate matrix dim)
+ATTN_KEY_BLK = 64  # keys per block (NVIDIA's block)
+ATTN_WIN_BLOCKS = WINDOW // ATTN_KEY_BLK  # 2 window blocks (128 keys, fp8 -> bf16, causal mask)
+ATTN_LIST_BLOCKS = INDEX_TOP // ATTN_KEY_BLK  # 8 listed blocks (512 keys, fp4 -> bf16, count mask)
+ATTN_BLOCKS = ATTN_WIN_BLOCKS + ATTN_LIST_BLOCKS  # 10 blocks in the unified stream
+
+
+def _stream_listed_block(
+    lg: LayerGraph, arena_blocks: int, blocks: int, b0: int, B: int, Q: int,
+    codes: Tensor, scales: Tensor, idx: Tensor, codes2: Tensor, scales2: Tensor,
+    ks2: Tensor, ks_blk: Tensor,
+) -> int:
+    """One listed key-block (b0) of a query-tile into the REUSED staging: gather the fp4 codes+scales of the
+    block's B listed latents for the tile's Q columns (ds_gather_list_blk_f4, runtime tile_off) plus the
+    block's per-column key indices idx (B, Q) (-1 past the column's count), then dequant to ks_blk (D, B, Q)
+    bf16 (ds_ldec_f4, the separate SRAM-slicable producer). Returns the gather node index (for the block
+    control dependency)."""
+    gn = lg.g.node(
+        "rg_ds_gather_list_blk_f4_f32",
+        [lg.arena(arena_blocks), lg.input("ix_list", (INDEX_TOP, lg.T), I32),
+         lg.input("cmp_blocks", (blocks, lg.T), I32), lg.input("cmp_loff", (64,), I32),
+         lg.input("ix_lslots", (8, lg.T), I32), lg.input("tile_off", (1,), I32), lg.dep()],
+        [codes, scales, idx],
+        struct.pack("iii", b0, B, Q),
+    )  # fmt: skip
+    lg.node("reshape", [codes], [codes2])
+    lg.node("reshape", [scales], [scales2])
+    lg.node("rg_ds_ldec_f4_f32", [codes2, scales2], [ks2])
+    lg.node("reshape", [ks2], [ks_blk])
+    return gn
+
+
+def _stream_window_block(
+    lg: LayerGraph, arena_blocks: int, b0: int, B: int, Q: int, win_pages: int,
+    win_dep: Tensor | None, ks_blk: Tensor, idx: Tensor,
+) -> int:
+    """One window key-block (b0 in 0..1) of a query-tile into the REUSED staging (attn-gather's committed
+    ds_gather_win_blk, option A): gather the fp8 window latents of the block's B positions for the tile's Q
+    columns, dequant fp8 -> bf16 in the gather (mla_gather mode-0 convention), into ks_blk (D, B, Q) bf16,
+    plus idx (B, Q) = each column's window key absolute position (-1 when invalid, the causal mask). Column
+    s = tile_off + q (tile_off the STEP-COLUMN offset, uniform with the listed gather); window key k is at
+    absolute position pos = pos0 + s - (WINDOW-1) + b0*B + k (pos0 from meta; NVIDIA get_window_topk_idxs:
+    window [t-127, t] includes the column's own position); valid iff pos >= 0 && pos < klen && the
+    position's page exists. ``win_pages`` (WP,) i32 is the GLOBAL positional page table
+    (win_pages[pos>>7] = first latent arena row of this layer's 129-row page, -1 = zeros); ``wslots`` (8, T)
+    i32 field 4 = each column's visible key count. Returns the gather node index."""
+    gn = lg.g.node(
+        "rg_ds_gather_win_blk_f32",
+        [lg.arena(arena_blocks), lg.input("win_pages", (win_pages,), I32),
+         lg.input("tile_off", (1,), I32), lg.input("wslots", (8, lg.T), I32), lg.meta(),
+         win_dep if win_dep is not None else lg.dep()],
+        [ks_blk, idx],
+        struct.pack("iii", b0, B, Q),
+    )  # fmt: skip
+    return gn
+
+
+def attention_out_tile_graph(
+    device: Device,
+    dims: Dims,
+    tokens: int,
+    arena_blocks: int,
+    blocks: int,
+    *,
+    win_slots: int,
+    win_keys: int,
+    win_pages: int = 0,
+    tile_q: int = 0,
+    dbg_o: str = "",
+) -> Graph:
+    """ONE query-tile of the bounded listed attention stream: ``tile_q`` columns (default min(ATTN_TILE_Q, T))
+    attend over the unified 640-key set as ATTN_BLOCKS unrolled key-blocks of B = 64, the online-softmax
+    accumulator acc_o / max / sum loop-carried device-resident across every block (window blocks 0..1 then
+    listed blocks 2..9, ONE recurrence — no split-then-merge). The staging tensors (ks_blk / sc / P / pv /
+    idx / codes / scales) are reused across blocks; a control dependency serializes block i+1's gather after
+    block i's accumulate (Phase 1 single ks_blk buffer; Phase 2 double-buffers for TPC-gather ∥ MME-GEMM).
+
+    The tile's q_all / cs_inv / o_tile are bound to the tile's column slice of the persistent buffers; the
+    listed gather reads the FULL ix_list / ix_lslots / cmp_blocks at column tile_off + q (tile_off a runtime
+    input). ``o_tile`` (D, nh, Q) f32 is the normalized inverse-roped output (ds_attn_online_fin, f32 to keep
+    the o_inv fidelity gate); the caller binds it to o_out's columns [tile_off .. +Q]. ``dbg_o`` names an
+    optional persistent f32 mirror of o_tile for the fidelity gate."""
+    d, T = dims, tokens
+    D, nh = d.head_dim, d.heads
+    Q = tile_q or min(ATTN_TILE_Q, T)
+    B = ATTN_KEY_BLK
+    lg = LayerGraph(device, f"attn_out_tile_T{T}_Q{Q}_B{blocks}_A{arena_blocks}", d, T)
+    q_tile = lg.view(lg.input("q_all", (D, nh * Q), BF16), (D, nh, Q))
+    acc_o = lg.tensor((D, nh, Q), F32)
+    mx = lg.tensor((nh, Q), F32)
+    sm = lg.tensor((nh, Q), F32)
+    lg.node("rg_ds_attn_online_init_f32", [], [acc_o, mx, sm])
+    # the reused per-block staging (ONE buffer each -> the compiler bounds the workspace to one tile, ~15 MiB)
+    ks_blk = lg.tensor((D, B, Q), BF16)
+    idx = lg.tensor((B, Q), I32)
+    codes = lg.tensor((D // 2, B, Q), U8)
+    scales = lg.tensor((D // 16, B, Q), U8)
+    codes2 = lg.tensor((D // 2, B * Q), U8)
+    scales2 = lg.tensor((D // 16, B * Q), U8)
+    ks2 = lg.tensor((D, B * Q), BF16)
+    sc = lg.tensor((B, nh, Q), F32)
+    P = lg.tensor((B, nh, Q), BF16)
+    sscale = lg.tensor((nh, Q), F32)
+    pv = lg.tensor((D, nh, Q), F32)
+    prev = -1
+    for blk in range(ATTN_BLOCKS):
+        if blk < ATTN_WIN_BLOCKS:
+            gn = _stream_window_block(
+                lg, arena_blocks, blk, B, Q, win_pages, None, ks_blk, idx
+            )
+        else:
+            b0 = blk - ATTN_WIN_BLOCKS  # listed key-block index 0..7
+            gn = _stream_listed_block(
+                lg, arena_blocks, blocks, b0, B, Q, codes, scales, idx, codes2, scales2, ks2, ks_blk
+            )
+        if prev >= 0:  # block i+1's gather waits for block i's accumulate (the reused ks_blk / acc_o)
+            lg.g.dep(prev, gn)
+        lg.node("batch_gemm", [q_tile, ks_blk], [sc], GEMM_NT)
+        lg.node(
+            "rg_ds_attn_online_f32", [sc, mx, sm, idx], [P, sscale],
+            struct.pack("fii", d.scale, nh, B),
+        )  # fmt: skip
+        lg.node("batch_gemm", [P, ks_blk], [pv], GEMM_NN)
+        prev = lg.g.node("rg_ds_attn_acc_f32", [acc_o, sscale, pv], [acc_o])
+    o_tile = lg.input("o_tile", (D, nh, Q), F32)
+    lg.node(
+        "rg_ds_attn_online_fin_f32",
+        [acc_o, mx, sm, lg.input("attn_sink", (nh,), F32), lg.input("cs_inv", (128, Q), F32)],
+        [o_tile],
+    )  # fmt: skip
+    if dbg_o:
+        lg.node("memcpy", [o_tile], [lg.input(dbg_o, (D, nh, Q), F32)])
+    return lg.g
+
+
+def attention_out_wo_graph(device: Device, dims: Dims, tokens: int) -> Graph:
+    """The bounded stream's output projection over the full T: the tiles' inverse-roped outputs ``o_out``
+    (D, nh*T) f32 -> wo_a per group (FP8) -> wo_b -> this rank's partial ``p_out``. Identical to the tail of
+    the single-launch attention_out_graph (_attention_out), run as its own recipe after the T/Q tile launches."""
+    d, T = dims, tokens
+    D, nh = d.head_dim, d.heads
+    lg = LayerGraph(device, f"attn_out_wo_T{T}", d, T)
+    o = lg.input("o_out", (D, nh * T), F32)
+    _attention_out(lg, o)
+    return lg.g
 
 
 def attention_out_graph(

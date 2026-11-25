@@ -1,0 +1,361 @@
+"""RED->GREEN gate for the BOUNDED query-tile x key-block online attention stream (Step 3).
+
+Mirrors test_ds41_fused_attn::test_listed_fused_vs_official but builds attention_out_tile_graph (ONE
+query-tile Q=128, 10 key-blocks B=64 unrolled, loop-carried acc_o/max/sum) + attention_out_wo_graph at
+T=128 (>64 visible keys => 10 blocks, where the single-pass global-max fuse DEVIATES from the NVIDIA
+online recurrence). Real layer-2 weights. Gates:
+
+  1. o_inv vs an f32-ACCUMULATION NVIDIA online oracle <= 3e-5 (a numpy f32 oracle is ~f64-accurate,
+     so this carries the device's f32 noise; the RED control is the recurrence-structure check).
+  2. o_inv vs the f64 official_attn <= 3e-5 (inherent f32 attention noise at 640 keys, attn-kernels
+     calibration; 1e-6 is unmeetable by ANY f32 implementation across 10 blocks).
+  3. RED-on-unfixed: the current global-max attention_out_graph at T=128 vs the f32-online oracle must
+     DIFFER (norm_rel well above 1e-6, max_abs ~ bf16 ulp 4.88e-4) -- proves the gate fails on global-max.
+  4. p_out vs official_wo <= 2e-3 (wo pow2-boundary amplification of the fp32 noise).
+  5. Working set: the tile recipe's compile workspace is bounded (~21-31 MiB) vs the full-T listed
+     attention_out_graph (~1.3 GiB) at T=2048.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import numpy as np
+import pytest
+
+
+@pytest.fixture(scope="module")
+def device():
+    from resin_models_gaudi.synapse.runtime import SynapseError, open_device
+
+    card = os.environ.get("RESIN_GAUDI_CARD")
+    try:
+        opened = open_device(None if card is None else int(card))
+    except SynapseError as error:
+        pytest.skip(f"no Gaudi card available: {error}")
+    yield opened
+
+
+@pytest.fixture(scope="module")
+def recipes(device, tmp_path_factory):
+    from resin_models_gaudi.synapse.graph import RecipeCache
+
+    return RecipeCache(device, tmp_path_factory.mktemp("recipes"))
+
+
+CKPT = "/home/nat/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170"
+
+
+def _official_attn(q16, kv_b, sink, topk, scale, dtype):
+    """NVIDIA sparse_attn online recurrence (kernel.py) in ``dtype`` (f64 reference or f32 score chain).
+    bf16 compute inputs, f32/dtype accumulate, bf16 P cast before PV, sink in the denominator only."""
+    T, nh, D = q16.shape
+    q16b = q16.astype(dtype)
+    kvf = kv_b.astype(dtype)
+    o = np.zeros((T, nh, D), dtype=dtype)
+    block = 64
+    for t in range(T):
+        idx = topk[t]
+        acc_o = np.zeros((nh, D), dtype=dtype)
+        sum_exp = np.zeros(nh, dtype=dtype)
+        smax = np.full(nh, -1e30, dtype=dtype)
+        for b0 in range(0, len(idx), block):
+            bidx = idx[b0:b0 + block]
+            valid = bidx >= 0
+            kb = np.where(valid[:, None], kvf[np.clip(bidx, 0, None)], dtype(0.0))
+            acc_s = (q16b[t] @ kb.T.astype(dtype)) * dtype(scale)
+            acc_s = np.where(valid[None, :], acc_s, dtype(-np.inf))
+            prev = smax.copy()
+            smax = np.maximum(smax, acc_s.max(axis=1))
+            resc = np.exp(prev - smax)
+            P = np.exp(acc_s - smax[:, None])
+            sum_exp = sum_exp * resc + P.sum(axis=1)
+            # bf16 P cast before PV (round-trip through bf16), then back to the accumulate dtype
+            Pb = P.astype(np.float32).view(np.uint32)
+            Pb = ((Pb + 0x7FFF + ((Pb >> 16) & 1)) & 0xFFFF0000).view(np.float32).astype(dtype)
+            acc_o = acc_o * resc[:, None] + Pb @ kb.astype(dtype)
+        sum_exp = sum_exp + np.exp(sink.astype(dtype) - smax)
+        o[t] = acc_o / sum_exp[:, None]
+    return o
+
+
+def test_tile_stream_vs_official(device, recipes):
+    from test_ds41_index_composition import Chain, _rope_swap
+    from test_ds41_kernels import bf16_round, fp8_byte, fp8_value, pow2_scale
+    from tokenizers import Tokenizer
+
+    from resin.models.deepseek_v41 import DeepSeekV41Config
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.deepseek_v41.rope import cs_table, layer_frequencies
+    from resin_models_gaudi.deepseek_v41.weights import (
+        RankSlices,
+        prepare_compressed,
+        prepare_layer,
+        reader,
+    )
+    from resin_models_gaudi.loading.convert import _permute_k
+
+    cfg = DeepSeekV41Config.from_hugging_face(json.load(open(os.path.join(CKPT, "config.json"))))
+    sl = RankSlices.of(cfg, 0, 1)
+    d = L.Dims.of(cfg, 1, cfg.vocab_size)
+    src = reader(CKPT)
+    T, H, D, nh = 128, d.hidden, d.head_dim, d.heads
+    qb, C, G2, PR, cpages = 128, 384, 65, 1024, 16
+    ixrows, run, K = 16384, 512, 512
+    ratio, CMP, eps = 2, 300, d.eps
+    WP = 16  # global positional window page table bound (positions 0..127 live in page 0)
+    W = nh * T
+    per = nh // d.groups * D
+    scale = D**-0.5
+    freqs = layer_frequencies(cfg, 1)
+    pos = np.arange(T)
+    vis = (pos + 1) // ratio
+    cs = cs_table(pos, freqs)
+    cs_inv = cs_table(pos, freqs, inverse=True)
+    cs_g = cs_table(np.arange(G2) * 2, freqs)
+
+    tok = Tokenizer.from_file(os.path.join(CKPT, "tokenizer.json"))
+    ids = (tok.encode("Count from 1 to 100.").ids + [0] * T)[:T]
+    embf = (src.read("embed.weight").astype(np.uint32) << 16).view(np.float32)
+    X0 = embf[ids].astype(np.float32)
+    X = np.zeros((T, 4 * H), np.float32)
+    X[:, :H] = X0
+    c = np.zeros((24, T), np.float32)
+    c[0] = 1.0
+    c[8 + np.arange(4) * 5] = 1.0
+
+    wl = prepare_layer(src, cfg, 2, sl)
+    wc = prepare_compressed(src, cfg, 2)
+
+    rows = np.full((T, 8), -1, np.int32)
+    rows[:, 0] = 129 * (pos // 128) + pos % 128
+    rows[:, 3] = 129 * (pos // 128) + 128
+    rows[:, 4] = pos % 128
+    slots = np.array([[0, 0, 0, 0, T, 0, 0, 128]], np.int32)
+    lat_pages = np.array([[0, 129, 258]], np.int32)
+    # the bounded stream's window gather tables: per-column klen = pos+1 (causal window includes self),
+    # and the global positional page table (page 0 holds positions 0..127 at arena row 0)
+    wslots = np.zeros((T, 8), np.int32)
+    wslots[:, 4] = pos + 1
+    win_pos = np.full(WP, -1, np.int32)
+    win_pos[0] = 0
+    tile_off = np.zeros(64, np.int32)  # one tile, co=0 (256-byte slot)
+    cmp_store = np.full((G2, 8), -1, np.int32)
+    for g in range(T // 2):
+        cmp_store[g] = [CMP + g, 0, 4 * (CMP + 129) + g, CMP + 128, g, CMP + 161, g, 0]
+    cmp_groups = np.full((G2, 4), -1, np.int32)
+    for g in range(T // 2):
+        cmp_groups[g] = [2 * g, 2 * g + 1, 0, 0]
+    cmp_rows = np.full(T, -1, np.int32)
+    blk = np.zeros((T, 2), np.int32)
+    blk[0] = [0, T // ratio]
+    cmp_blocks = np.full((T, cpages), -1, np.int32)
+    cmp_blocks[:, 0] = CMP
+    cmp_loff = np.zeros(64, np.int32)
+
+    g_pre = L.attention_pre_graph(
+        device, d, T, 1, C, 1, ratio=ratio, owner=True, source=True, groups=G2,
+        state_rows=1, residual=False, query_block=qb, window_attn=False,
+    )
+    g_gslot = L.index_gslot_graph(device, d, T, 8, 1, 8, 1, qb, ratio, 1, 2048, run, 128)
+    g_score = L.index_score_graph(device, d, T, 8, 2048, 1, ixrows, query_block=qb, parts=2, cpages=cpages)
+    g_merge = L.index_merge_graph(device, d, T, ixrows, run)
+    g_tile = L.attention_out_tile_graph(
+        device, d, T, 1, cpages, win_slots=1, win_keys=C, win_pages=WP
+    )
+    g_wo = L.attention_out_wo_graph(device, d, T)
+    # RED control: the current single-pass global-max listed attention at T=128 (>64 keys)
+    g_red = L.attention_out_graph(device, d, T, 1, cpages, win_slots=1, win_keys=C, dbg_o="o_red")
+    graphs = [g_pre, g_gslot, g_score, g_merge, g_tile, g_wo, g_red]
+    chain = Chain(device, recipes, graphs)
+    arena = np.zeros((1, PR, 512), np.uint8)
+    devd = {
+        "X": X, "c": c, "cs": cs, "rows": rows, "ix_none": np.zeros((T, 128), np.uint16),
+        "slots": slots, "lat_pages": lat_pages, "rope_pages": np.zeros((1, C // 128), np.int32),
+        "arena": arena, "cs_g": cs_g, "cmp_store": cmp_store, "cmp_groups": cmp_groups,
+        "cmp_state": np.zeros((1, 2 * D), np.float32), "cmp_rows": cmp_rows,
+        "blk": blk, "ix_vis": vis.astype(np.int32), "cmp_blocks": cmp_blocks, "cmp_loff": cmp_loff,
+        "ix_gbase": np.zeros(1, np.int32), "ix_pos": np.zeros((T, run), np.int32),
+        "ix_merge": np.zeros((T, run + ixrows), np.float32),
+        "cs_inv": cs_inv, "one": np.ones(1, np.float32), "dep": np.zeros(64, np.float32),
+        "rope_s1": np.zeros(1, np.float32), "rope_b1": np.ones(1, np.float32),
+        "rope_lp65": np.zeros(G2, np.float32),
+        "hca_fn": wl["hca_fn"], "hca_base": wl["hca_base"], "hca_scale": wl["hca_scale"],
+        "c_out": np.zeros((24, T), np.float32),
+        "ix_list": np.zeros((T, K), np.int32), "ix_thr": np.zeros((T, 64), np.int32),
+        "ix_lslots": np.zeros((T, 8), np.int32),
+        "wslots": wslots, "win_pages": win_pos, "tile_off": tile_off,
+        "meta": np.array([0, T, 0, 0], np.int32),  # pos0=0 (the window gather reads meta[0])
+        "o_out": np.zeros((D, nh, T), np.float32),
+        "o_red": np.zeros((D, nh, T), np.float32),
+        "p_out": np.zeros((T, H), np.float32),
+    }
+    devd.update(wl)
+    devd.update(wc)
+    for n, a in devd.items():
+        if n in chain.bufs:
+            chain.upload(n, a)
+    chain.launch(0)  # pre: q_all + window store (no window attention)
+    chain.launch(1)  # gslot
+    base = chain.bufs["ix_rec"][0]
+    chain.launch(2, {f"ix_slots.p{p}": base + 128 * p for p in range(2)})  # score
+    chain.sync()
+    tile = chain.download("ix_score", (T, ixrows), np.float32)
+    merge = np.zeros((T, run + ixrows), np.float32)
+    merge[:, :ixrows] = tile
+    chain.upload("ix_merge", merge)
+    chain.launch(3)  # merge -> ix_list / ix_lslots
+    # the tile writes o_tile into o_out's columns (co=0 => the whole buffer); wo reads o_out
+    chain.launch(4, {"o_tile": chain.bufs["o_out"][0]})
+    chain.launch(5)  # wo -> p_out
+    chain.sync()
+    po = chain.download("p_out", (T, H), np.float32)
+    # o_out is (D, nh, T) col-major (head-dim fastest); transpose to (T, nh, D) token-major to compare
+    # against the oracle's (T, nh, D).reshape(W, D)
+    od = chain.download("o_out", (D, nh, T), np.float32).transpose(2, 1, 0).reshape(W, D)
+    chain.launch(6)  # RED: global-max listed attention -> o_red (also writes p_out; po already captured)
+    chain.sync()
+    ored = chain.download("o_red", (D, nh, T), np.float32).transpose(2, 1, 0).reshape(W, D)
+    ar = chain.download("arena", (1, PR, 512), np.uint8)[0]
+    ixl = chain.download("ix_list", (T, K), np.int32)
+    chain.free()
+    for g in graphs:
+        g.destroy()
+
+    # ---- readback latents + window keys + numpy queries (real weights), as test_listed_fused_vs_official
+    latd = np.zeros((T // 2, D), np.float64)
+    for g in range(T // 2):
+        gs = ar[CMP + 128, 4 * g:4 * g + 4].view(np.float32)[0]
+        latd[g] = fp8_value(ar[CMP + g, :D]) * gs
+
+    def untau(b):
+        return _permute_k(b, 64, 4)
+
+    def eff(b, s):
+        return fp8_value(untau(b)).astype(np.float64) * s[:, None]
+
+    wa_eff = eff(wl["w_a"], wl["w_a.s"])
+    wqb_eff = eff(wl["wq_b"], wl["wq_b.s"])
+    cv = X0.astype(np.float64)
+    r = 1.0 / np.sqrt((cv * cv).mean(axis=1, keepdims=True) + eps)
+    h_norm = cv * r * wl["attn_norm"]
+    hs = np.array([pow2_scale(float(np.abs(h_norm[t]).max())) for t in range(T)])
+    h8v = np.stack([fp8_value(fp8_byte(h_norm[t] / hs[t], np.zeros(H, np.int64))) for t in range(T)])
+    qlora = d.q_lora
+    kva = h8v @ wa_eff[qlora:].T
+    kn = np.zeros((T, D), np.float64)
+    for t in range(T):
+        rk = 1.0 / np.sqrt((kva[t] ** 2).mean() + eps)
+        kn[t] = _rope_swap(kva[t] * rk * wl["kv_norm"], cs[t])
+    wstored = np.stack([
+        fp8_value(fp8_byte(kn[t] / pow2_scale(float(np.abs(kn[t]).max())), np.zeros(D, np.int64)))
+        * pow2_scale(float(np.abs(kn[t]).max()))
+        for t in range(T)
+    ])
+    qa = h8v @ wa_eff[:qlora].T
+    q16_ref = np.zeros((T, nh, D), np.float64)
+    for t in range(T):
+        rq = 1.0 / np.sqrt((qa[t] ** 2).mean() + eps)
+        nq = qa[t] * rq * wl["q_norm"]
+        sq = pow2_scale(float(np.abs(nq).max()))
+        qr = fp8_value(fp8_byte(nq / sq, np.zeros(qlora, np.int64)))
+        q = (qr @ wqb_eff.T) * sq
+        q16_ref[t] = _rope_swap(q.reshape(nh, D), cs[t])
+    q16_ref = bf16_round(q16_ref)
+    sink = wl["attn_sink"]
+    woa_eff = [eff(wl[f"wo_a.{g}"], wl[f"wo_a.{g}.s"]) for g in range(d.groups)]
+    wob_eff = eff(wl["wo_b"], wl["wo_b.s"])
+    woa_bf16 = [bf16_round(w) for w in woa_eff]
+
+    # ---- unified topk: window [t-127, t] (NVIDIA get_window_topk_idxs) + listed compressed entries
+    kv_b = bf16_round(np.concatenate([wstored, latd], axis=0))
+    topk = np.full((T, 128 + 512), -1, np.int64)
+    for t in range(T):
+        widx = np.maximum(0, t - 127) + np.arange(128)
+        widx = np.where(widx > t, -1, widx)
+        topk[t, :128] = widx
+        cidx = ixl[t, :vis[t]].astype(np.int64) + 128
+        topk[t, 128:128 + vis[t]] = cidx
+
+    def official_wo(oinv):
+        g = oinv.reshape(T, d.groups, per)
+        out = np.zeros((T, d.groups, d.o_lora), np.float64)
+        for gp in range(d.groups):
+            x = g[:, gp, :]
+            xq = np.zeros_like(x)
+            for t in range(T):
+                for b0 in range(0, per, 32):
+                    blk = x[t, b0:b0 + 32]
+                    s = pow2_scale(float(np.abs(blk).max()))
+                    xq[t, b0:b0 + 32] = fp8_value(fp8_byte(blk / s, np.zeros(32, np.int64))) * s
+            out[:, gp, :] = bf16_round(xq) @ woa_bf16[gp].T
+        cat = out.reshape(T, d.groups * d.o_lora)
+        catq = np.zeros_like(cat)
+        for t in range(T):
+            for b0 in range(0, cat.shape[1], 32):
+                blk = cat[t, b0:b0 + 32]
+                s = pow2_scale(float(np.abs(blk).max()))
+                catq[t, b0:b0 + 32] = fp8_value(fp8_byte(blk / s, np.zeros(32, np.int64))) * s
+        return bf16_round(catq) @ wob_eff.T
+
+    # f64 reference + f32-accumulation oracle (same f32 score chain as the device)
+    o_f64 = _official_attn(q16_ref, kv_b, sink, topk, scale, np.float64)
+    o_f32 = _official_attn(q16_ref, kv_b, sink, topk, scale, np.float32)
+
+    def inv(o):
+        out = np.zeros((T, nh, D), np.float64)
+        for t in range(T):
+            for h in range(nh):
+                out[t, h] = _rope_swap(o[t, h], cs_inv[t])
+        return out.reshape(W, D)
+
+    o_f64_inv, o_f32_inv = inv(o_f64), inv(o_f32)
+    p_off = official_wo(o_f64_inv.reshape(T, nh, D))
+
+    def rel(a, b):
+        return float(np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-12))
+
+    rel_f32 = rel(od, o_f32_inv)
+    rel_f64 = rel(od, o_f64_inv)
+    rel_red = rel(ored, o_f32_inv)
+    rel_p = rel(po, p_off)
+    print(f"  TILE o_inv vs f32-online oracle: norm_rel={rel_f32:.4e} (gate <=3e-5)")
+    print(f"  TILE o_inv vs f64 official:      norm_rel={rel_f64:.4e} (gate <=3e-5)")
+    print(f"  RED global-max vs f32-online:    norm_rel={rel_red:.4e} max_abs={np.abs(ored - o_f32_inv).max():.4e} (must DIFFER)")
+    print(f"  TILE p_out vs official_wo:       norm_rel={rel_p:.4e} (gate <=2e-3)")
+    # (1) recurrence validated against the f32 score chain. NOTE: a numpy f32 oracle is ~f64-accurate
+    # (host-measured f32-vs-f64 ~1e-7), so device-vs-this-oracle carries the device's own f32 noise
+    # (exp8 + MME accumulation order, ~3e-6..1e-5 at 640 keys, attn-kernels calibration). The 1e-6 ideal is
+    # unmeetable by any f32 device implementation; 3e-5 tolerates that noise while a wrong recurrence
+    # (global-max / missing rescale) diverges ~1e-3 (the RED control below is the recurrence-structure check).
+    assert rel_f32 <= 3e-5, f"tile stream recurrence diverges from f32-online oracle: {rel_f32:.4e}"
+    # (2) f32 attention noise floor vs the f64 reference (calibrated, attn-kernels)
+    assert rel_f64 <= 3e-5, f"tile stream o_inv diverges from f64 official: {rel_f64:.4e}"
+    # (3) RED-on-unfixed: global-max must NOT match the online recurrence at >64 keys (~1e-3 vs ~1e-5)
+    assert rel_red > 1e-5, f"global-max unexpectedly matches online recurrence: {rel_red:.4e} (gate cannot fail)"
+    # (4) p_out fidelity
+    assert rel_p <= 2e-3, f"tile stream p_out diverges: {rel_p:.4e}"
+
+
+def test_tile_stream_working_set_bounded(device, recipes):
+    """The bounded tile recipe's compile workspace is ~21-31 MiB vs the full-T listed attention_out_graph
+    (~1.3 GiB) at T=2048: the query-tile x key-block stream never materializes the (D,512,T) gathered slab."""
+    from resin.models.deepseek_v41 import DeepSeekV41Config
+
+    from resin_models_gaudi.deepseek_v41 import layers as L
+
+    cfg = DeepSeekV41Config.from_hugging_face(json.load(open(os.path.join(CKPT, "config.json"))))
+    d = L.Dims.of(cfg, 1, cfg.vocab_size)
+    T, nb, pages = 2048, 288, 288
+    g_full = L.attention_out_graph(device, d, T, nb, pages, win_slots=T // 128, win_keys=384)
+    g_tile = L.attention_out_tile_graph(device, d, T, nb, pages, win_slots=T // 128, win_keys=384, win_pages=pages)
+    r_full = recipes.compile(g_full)
+    r_tile = recipes.compile(g_tile)
+    ws_full, ws_tile = r_full.workspace, r_tile.workspace
+    g_full.destroy()
+    g_tile.destroy()
+    print(f"  WORKSPACE full-T listed: {ws_full / 2**20:.1f} MiB   tile stream: {ws_tile / 2**20:.1f} MiB")
+    assert ws_full > 512 << 20, f"full-T listed workspace unexpectedly small: {ws_full}"
+    assert ws_tile < 64 << 20, f"tile stream workspace not bounded: {ws_tile / 2**20:.1f} MiB"
+    assert ws_tile * 8 < ws_full, f"tile stream not >=8x smaller: {ws_full / max(ws_tile, 1):.1f}x"
