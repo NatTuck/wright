@@ -5,19 +5,19 @@
 // official acc_o = acc_o * sscale + P @ ks_blk is split into the PV GEMM writing pv and this add):
 //   acc_o[d, h, c] = acc_o[d, h, c] * sscale[h, c] + pv[d, h, c]
 // One member per (head h, query-tile column c) (index space [nh, Q]); the D loop is unrolled so the
-// 64-dim blocks are independent work. acc_o persists across the 10 key-block launches (one block per
-// launch, MME PV in between), so there is no within-launch reuse to VLM-cache (unlike attn_sdpa_acc,
-// which merges many slots in one launch); acc_o lives in HBM / compiler-placed SRAM.
-// tensors: 0 acc_o (D, nh, Q) f32 [in-place persist, input-only]  1 sscale (nh, Q) f32  2 pv (D, nh, Q) f32
-//          (pv = the block's fresh P @ ks_blk output; writes acc_o in place)  | 3 sink (64, 1) i32
-//          (fresh dataflow marker, member (0,0) writes 1 — the mla_slot_acc in-place convention; Synapse
-//          rejects acc_o as input0 AND output0, so acc_o is input-only and the sink chains the recurrence)
+// 64-dim blocks are independent work. The loop-carried acc_o is SSA across the 10 key-blocks of ONE
+// recipe: this node READS acc_o (block i's state, input-only) and WRITES a FRESH acc_o_out (block i+1's
+// state). Synapse treats input-only tensors as immutable within a recipe, so the recurrence must produce
+// a fresh output per block (single producer); the compiler reuses the dead acc_o[i] memory across the
+// control-dep-serialized blocks, bounding the working set.
+// tensors: 0 acc_o (D, nh, Q) f32 [block i state, read-only input]  1 sscale (nh, Q) f32  2 pv (D, nh, Q) f32
+//          (pv = the block's fresh P @ ks_blk output)  | 3 acc_o_out (D, nh, Q) f32 [block i+1 state, fresh]
 // params: none. index space: [nh, Q]. D a multiple of 64, at most 512 (design D = 512).
 #include "common.h"
 
 #define MAXV 8
 
-void main(tensor acc_o, tensor sscale, tensor pv, tensor sink)
+void main(tensor acc_o, tensor sscale, tensor pv, tensor acc_o_out)
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
@@ -34,13 +34,9 @@ void main(tensor acc_o, tensor sscale, tensor pv, tensor sink)
                     oc[0] = 64 * j;
                     const float64 a = v_f32_ld_tnsr_b(oc, acc_o);
                     const float64 p = v_f32_ld_tnsr_b(oc, pv);
-                    v_f32_st_tnsr(oc, acc_o, v_f32_mac_b(a, (float64)ss, p));
+                    v_f32_st_tnsr(oc, acc_o_out, v_f32_mac_b(a, (float64)ss, p));
                 }
             }
         }
-    }
-    if (off[0] == 0 && off[1] == 0) {
-        int5 zc = {0, 0, 0, 0, 0};
-        v_i32_st_tnsr(zc, sink, (int64)1);
     }
 }

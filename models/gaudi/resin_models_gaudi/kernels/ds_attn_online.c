@@ -15,10 +15,12 @@
 // with idx < 0 (and lanes >= B) are masked to NINF for the max and their exp is forced to exactly 0
 // for P and the sum. A block with no valid key leaves max / sum untouched (sscale = 1, P = 0).
 // The acc_o rescale + add of the block's fresh PV output is ds_attn_acc (MME batch_gemm has no beta).
-// tensors: 0 sc (B, nh, Q) f32 [raw QK, unscaled]  1 max (nh, Q) f32 [in-place persist, input-only]
-//          2 sum (nh, Q) f32 [in-place persist, input-only]  3 idx (B, Q) i32 [key indices, -1 = invalid]
-//          | 4 P (B, nh, Q) bf16  5 sscale (nh, Q) f32  6 sink (64, 1) i32 [fresh dataflow marker,
-//          member (0,0) writes 1 — mla_slot_acc in-place convention; max/sum are input-only, sink chains]
+// tensors: 0 sc (B, nh, Q) f32 [raw QK, unscaled]  1 max (nh, Q) f32 [block i state, read-only input]
+//          2 sum (nh, Q) f32 [block i state, read-only input]  3 idx (B, Q) i32 [key indices, -1 = invalid]
+//          | 4 P (B, nh, Q) bf16  5 sscale (nh, Q) f32  6 max_out (nh, Q) f32  7 sum_out (nh, Q) f32
+//          (max_out/sum_out = block i+1 state, FRESH outputs — the loop-carried max/sum are SSA across the
+//          10 blocks of ONE recipe: Synapse treats input-only tensors as immutable within a recipe, so each
+//          block produces the next state as a fresh single-producer output; reads of max/sum stay inputs)
 // params: scale, nh, B. index space: [nh, Q]
 #include "common.h"
 
@@ -48,8 +50,8 @@ static inline float64 exp8(float64 x)
     return pl * as_float64(e);
 }
 
-void main(tensor sc, tensor mx, tensor sm, tensor idx, tensor P, tensor sscale, tensor sink,
-          float scale, int nh, int B)
+void main(tensor sc, tensor mx, tensor sm, tensor idx, tensor P, tensor sscale, tensor mx_out,
+          tensor sm_out, float scale, int nh, int B)
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
@@ -110,12 +112,8 @@ void main(tensor sc, tensor mx, tensor sm, tensor idx, tensor P, tensor sscale, 
             NL_REDUCE_ADD(sv, IDX, ts);
             const float64 ns = v_f32_mac_b((float64)ps, ss, ts);
             v_f32_st_tnsr_partial(stc, sscale, ss, 0, 0);
-            v_f32_st_tnsr_partial(stc, mx, nm, 0, 0);
-            v_f32_st_tnsr_partial(stc, sm, ns, 0, 0);
+            v_f32_st_tnsr_partial(stc, mx_out, nm, 0, 0);
+            v_f32_st_tnsr_partial(stc, sm_out, ns, 0, 0);
         }
-    }
-    if (off[0] == 0 && off[1] == 0) {
-        int5 zc = {0, 0, 0, 0, 0};
-        v_i32_st_tnsr(zc, sink, (int64)1);
     }
 }

@@ -3,7 +3,9 @@
 // DeepSeek-V4.1 online-attention accumulator reset before a query tile's first key block:
 // acc_o = 0, max = -1e30 (the official finite init: a column with NO valid key keeps max = -1e30,
 // sum = 0 and outputs 0, never NaN), sum = 0. One member per (head h, query-tile column c).
-// tensors: 0 acc_o (D, nh, Q) f32  1 max (nh, Q) f32  2 sum (nh, Q) f32
+// tensors: 0 acc_o (D, nh, Q) f32  1 max (nh, Q) f32  2 sum (nh, Q) f32  (FRESH outputs, the SSA chain's
+//          block-0 state; online/acc each produce the next block's state as a fresh output — Synapse
+//          treats input-only tensors as immutable within one recipe, so loop-carried state must be SSA)
 // params: none. index space: [nh, Q]. D a multiple of 64, at most 512 (design D = 512).
 #include "common.h"
 
