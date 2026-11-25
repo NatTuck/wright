@@ -1175,11 +1175,14 @@ class DeepSeekV41Gaudi:
             "cmp_stored": buf(256),
             "ix_sink": buf(256 * 8),  # (a part's sink each, prefill index launches)
             "ix_thr": buf(4 * 64 * T),
-            "eg_emb": buf(4 * 256 * J * T),
             # decode: each rank's rows of the Engram wkv product, and all of them gathered
             "eg_kv": buf(4 * self.eg_rows_r * MAX_T),
             "eg_kv_all": buf(4 * self.eg_rows_r * MAX_T * d.ranks),
         }
+        # eg_emb is the card-engram embedding scratch; host-engram keeps embeddings in the step table, so the
+        # (256*J, T) f32 buffer is unused there — drop it (design §3.2).
+        if self.engram == "card":
+            self.io["eg_emb"] = buf(4 * 256 * J * T)
         if self.stages:  # DSpark: the target layers' stream means, the draft tokens, the inject stores' sinks
             for k in range(len(self.cfg.dspark_target_layer_ids)):
                 self.io[f"dsp_main{k}"] = buf(4 * H * TMAX)
