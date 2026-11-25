@@ -88,7 +88,7 @@ void main(tensor score, tensor vis, tensor thr, tensor cnt, tensor gsum, tensor 
 {
     int5 zc = {0, 0, 0, 0, 0};
     const int base = s_i32_ld_g(gen_addr(zc, gbase));
-    const int tile_row0 = base > 0 ? run : 0;
+    const int tile_row0 = base < run ? base : run;  // running rows actually filled (matches ix_gvis row0)
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
     const int64 lane = (int64)read_lane_id_4b_b();

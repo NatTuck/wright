@@ -193,6 +193,10 @@ static bool geom_elem64(const HabanaKernelParams* p, uint64_t is[5], uint32_t* r
 static bool geom_k512(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, false, 0, 0) + 511) / 512; is[1] = sz(p, false, 0, 1); *rank = 2; return true;
 }
+// ds_ix_bmax_nat: input 0 is the (K/8, 8, T) reshape of the tile scores, so K = dim0*8 and the column is dim2
+static bool geom_bmax_nat(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = (sz(p, false, 0, 0) * 8 + 511) / 512; is[1] = sz(p, false, 0, 2); *rank = 2; return true;
+}
 // ix_rcnt: (64, M, T) partial counts, one member per (slice, column)
 static bool geom_rcnt(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = sz(p, true, 0, 1); is[1] = sz(p, true, 0, 2); *rank = 2; return true;
@@ -449,6 +453,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_mk_add")) return geom_mk_add;
     if (is("ds_ix_merge")) return geom_ix_list;
     if (is("ds_ix_assemble")) return geom_elem64;
+    if (is("ds_ix_bmax_nat")) return geom_k512;
     if (is("ds_ix_bmax")) return geom_k512;
     if (is("ds_ix_pin")) return geom_columns;
     if (is("ds_ix_gather_f4")) return geom_ix_gather_f4;

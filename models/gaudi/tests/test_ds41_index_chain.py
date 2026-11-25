@@ -497,10 +497,161 @@ def test_chain_padded_stride_small_decode(device, recipes, T):
             g.destroy()
 
 
+def test_chain_running_blocks_matches_full(device, recipes):
+    """Part A: the bmax chain keeps a running top-2048 BLOCK list while streaming block-maxima tiles (no full
+    (kb,T) cand_bmax published). Its cand_list/cand_slots == ixbl over the full block maxima, bit-exact."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+
+    d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+               experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+               route_scale=1.5, ranks=1)
+    rng = np.random.default_rng(51)
+    B, top = 4, L.INDEX_BLOCKS
+    T, qb, S, C, run = 16, 1, 16, 2048, L.INDEX_RUN
+    KT = B * C
+    kb = KT // 8
+    ID, IH = L.INDEX_DIM, L.INDEX_HEADS
+    W = IH * T
+    PR, NB, PAIR = 1024, 16, 97
+    pages = KT // 128
+    pattern = np.array([KT, 5000, 900, 700, 3000, 1500, KT - 1, 4096], np.int32)
+    vis = np.minimum(np.resize(pattern, T), KT).astype(np.int32)
+    pos = vis - 1
+    blk = np.zeros((T, 2), np.int32)
+    blk[:, 0] = pos
+    blk[:, 1] = vis
+    visb = np.minimum(-(-vis // 8), kb).astype(np.int32)
+    ixkeys = rng.standard_normal((KT, ID)).astype(np.float32)
+    rows = np.full((8, KT), -1, np.int32)
+    rows[0] = (np.arange(KT) // 128) * PAIR
+    rows[1] = np.arange(KT) % 128
+    cmp_blocks = np.full((T, pages), -1, np.int32)
+    for c in range(T):
+        npg = -(-int(vis[c]) // 128)
+        cmp_blocks[c, :npg] = np.arange(npg) * PAIR
+    loff = np.zeros(64, np.int32)
+    qb8 = rng.integers(0, 0x78, (W, ID), dtype=np.uint8)
+    qb8 = np.where(rng.integers(0, 2, (W, ID)), qb8 | 0x80, qb8).astype(np.uint8)
+    ix_w = rng.uniform(0.2, 1.0, (T, IH)).astype(np.float32)
+
+    gstore = Graph(device, "t_rb_store")
+    at = gstore.input("arena", (512, PR, NB), U8)
+    gstore.node("rg_ds_store_f4_f32",
+                [at, gstore.input("rows", (8, KT), I32), gstore.input("lat", (512, KT), F32),
+                 gstore.input("ix", (ID, KT), F32)], [gstore.input("sink", (64, 1), I32)])
+    sa = {n: _malloc_upload(device, a) for n, a in {
+        "arena": np.zeros((NB, PR, 512), np.uint8), "sink": np.zeros((1, 64), np.int32), "rows": rows,
+        "lat": np.zeros((KT, 512), np.float32), "ix": np.ascontiguousarray(ixkeys)}.items()}
+    rs = recipes.compile(gstore)
+    for n in rs.persistent:
+        rs.bind(n, sa[n])
+    rs.launch(); device.sync()
+    arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
+    for a in sa.values():
+        device.free(a)
+    gstore.destroy()
+
+    gslot = L.index_gslot_graph(device, d, T, S, 1, 1, T, qb, 1, B, C, run, 128)
+    gchain = L.index_chain_graph(device, d, T, S, C, NB, run, B, query_block=qb, cpages=pages, kind="bmax")
+    gscore = L.index_score_graph(device, d, T, S, C, NB, C, query_block=qb, parts=1, cpages=pages)
+    gblk = L.index_blocks_graph(device, d, T, C)
+    gsel = L.index_block_select_graph(device, d, T, kb, top, True)
+    gfull = L.index_select_graph(device, d, T, KT)
+    common = {"arena": arena, "cmp_blocks": cmp_blocks, "cmp_loff": loff,
+              "ix_q8": np.ascontiguousarray(qb8), "ix_qs": np.ones(W, np.float32), "ix_w": ix_w, "ix_vis": vis}
+    addr = {n: _malloc_upload(device, a) for n, a in common.items()}
+    addr["blk"] = _malloc_upload(device, blk)
+    addr["dep"] = _malloc_upload(device, np.zeros(64, np.float32))
+    addr["ix_sink"] = addr["ix_sink.p0"] = _malloc_upload(device, np.zeros((1, 64), np.int32))
+    rec = _malloc_upload(device, np.zeros((B * S, 8), np.int32))
+    gb = _malloc_upload(device, np.zeros((B, 64), np.int32))
+    bb = _malloc_upload(device, np.zeros((B, 64), np.int32))
+    device.h2d(bb, np.ascontiguousarray(np.array([[i * (C // 8)] + [0] * 63 for i in range(B)], np.int32)))
+    rinit = _malloc_upload(device, np.zeros((T, run), np.float32))
+    pinit = _malloc_upload(device, np.zeros((T, run), np.int32))
+    rout = _malloc_upload(device, np.zeros((T, run), np.float32))
+    pout = _malloc_upload(device, np.zeros((T, run), np.int32))
+    brinit = _malloc_upload(device, np.zeros((T, top), np.float32))
+    bpinit = _malloc_upload(device, np.zeros((T, top), np.int32))
+    brout = _malloc_upload(device, np.zeros((T, top), np.float32))
+    bpout = _malloc_upload(device, np.zeros((T, top), np.int32))
+    lst = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lsl = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    clist = _malloc_upload(device, np.zeros((T, top), np.int32))
+    cslots = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    cthr = _malloc_upload(device, np.zeros((T, 64), np.int32))
+    visb_a = _malloc_upload(device, visb)
+    tile = _malloc_upload(device, np.zeros((T, C), np.float32))
+    big = _malloc_upload(device, np.zeros((T, KT), np.float32))
+    bmaxfull = _malloc_upload(device, np.zeros((T, kb), np.float32))
+    lst_r = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lsl_r = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    thr_r = _malloc_upload(device, np.zeros((T, 64), np.int32))
+    clist_r = _malloc_upload(device, np.zeros((T, top), np.int32))
+    cslots_r = _malloc_upload(device, np.zeros((T, 8), np.int32))
+
+    def launch(g, bind):
+        rc = recipes.compile(g)
+        for n in rc.persistent:
+            rc.bind(n, bind[n])
+        rc.launch(); device.sync()
+
+    try:
+        launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
+        bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout,
+                "ix_list": lst, "ix_lslots": lsl, "ix_visb": visb_a, "cand_list": clist,
+                "cand_slots": cslots, "cand_thr": cthr, "ix_brinit": brinit, "ix_bpinit": bpinit,
+                "ix_brout": brout, "ix_bpout": bpout}
+        for i in range(B):
+            bind[f"ix_s{i}.p0"] = rec + 4 * 8 * S * i
+            bind[f"ix_gb{i}"] = gb + 256 * i
+            bind[f"ix_gbb{i}"] = bb + 256 * i
+        launch(gchain, bind)
+        got_cl = device.d2h(clist, (T, top), np.int32)
+        got_cs = device.d2h(cslots, (T, 8), np.int32)
+        got_lst = device.d2h(lst, (T, run), np.int32)
+        # reference: per-tile scores -> per-tile block maxima -> full cand_bmax -> ixbl
+        for i in range(B):
+            launch(gscore, {**addr, "ix_slots": rec + 4 * 8 * S * i, "ix_score": tile})
+            launch(gblk, {"ix_tile": tile, "ix_vis": addr["ix_vis"], "ix_gbase": gb + 256 * i,
+                          "ix_bmax": bmaxfull + 4 * T * (C // 8) * i})
+            tl = device.d2h(tile, (T, C), np.float32)
+            bg = device.d2h(big, (T, KT), np.float32)
+            bg[:, i * C:(i + 1) * C] = tl
+            device.h2d(big, np.ascontiguousarray(bg))
+        launch(gsel, {"cand_bmax": bmaxfull, "ix_visb": visb_a, "cand_thr": thr_r,
+                      "cand_list": clist_r, "cand_slots": cslots_r})
+        want_cl = device.d2h(clist_r, (T, top), np.int32)
+        want_cs = device.d2h(cslots_r, (T, 8), np.int32)
+        launch(gfull, {"ix_score": big, "ix_vis": addr["ix_vis"], "ix_list": lst_r,
+                       "ix_lslots": lsl_r, "ix_thr": thr_r})
+        want_lst = device.d2h(lst_r, (T, run), np.int32)
+        for c in range(T):
+            n = int(want_cs[c, 4])
+            assert n == min(int(visb[c]), top), (c, n, int(visb[c]))
+            assert int(got_cs[c, 4]) == n, (c, got_cs[c, 4], n)
+            assert got_cl[c, :n].tolist() == want_cl[c, :n].tolist(), (
+                "blocks", c, "setdiff", sorted(set(got_cl[c, :n].tolist()) ^ set(want_cl[c, :n].tolist()))[:20],
+                "order_only", sorted(got_cl[c, :n].tolist()) == sorted(want_cl[c, :n].tolist()))
+            nk = int(want_cs[c, 4])  # key list check below uses full selection
+        for c in range(T):
+            n = min(int(vis[c]), run)
+            assert got_lst[c, :n].tolist() == want_lst[c, :n].tolist(), ("keys", c)
+        print(f"\nrunning-blocks B={B}: cand_list == full block selection AND ix_list == full, {T} cols bit-exact")
+    finally:
+        for a in set([rec, gb, bb, rinit, pinit, rout, pout, brinit, bpinit, brout, bpout, lst, lsl,
+                      clist, cslots, cthr, visb_a, tile, big, bmaxfull, lst_r, lsl_r, thr_r, clist_r,
+                      cslots_r, *addr.values()]):
+            device.free(a)
+        for g in (gslot, gchain, gscore, gblk, gsel, gfull):
+            g.destroy()
+
+
 def test_chain_bmax_mask_matches_full(device, recipes):
-    """Candidate-source ("bmax") and consumer ("mask") chain kinds, end to end: the bmax chain's selection ==
-    one-pass full selection and it publishes cand_bmax; ixbl selects the candidate blocks (cand_thr/cand_list);
-    the mask chain (reading cand_bmax + cand_thr) == one-pass selection over the scores masked to those blocks."""
+    """Candidate-source ("bmax") running top-2048 blocks feeds the consumer ("mask") chain: the mask chain reads
+    cand_list/cand_slots (no full cand_bmax) and == one-pass selection over the scores masked to those blocks."""
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
@@ -509,7 +660,7 @@ def test_chain_bmax_mask_matches_full(device, recipes):
                experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
                route_scale=1.5, ranks=1)
     rng = np.random.default_rng(31)
-    B, top = 4, 64
+    B, top = 16, L.INDEX_BLOCKS
     T, qb, S, C, run = 16, 1, 16, 2048, L.INDEX_RUN
     KT = B * C
     kb = KT // 8
@@ -522,6 +673,7 @@ def test_chain_bmax_mask_matches_full(device, recipes):
     blk = np.zeros((T, 2), np.int32)
     blk[:, 0] = pos
     blk[:, 1] = vis
+    visb = np.full(T, kb, np.int32)
     ixkeys = rng.standard_normal((KT, ID)).astype(np.float32)
     rows = np.full((8, KT), -1, np.int32)
     rows[0] = (np.arange(KT) // 128) * PAIR
@@ -555,7 +707,6 @@ def test_chain_bmax_mask_matches_full(device, recipes):
     gslot = L.index_gslot_graph(device, d, T, S, 1, 1, T, qb, 1, B, C, run, 128)
     gbmax = L.index_chain_graph(device, d, T, S, C, NB, run, B, query_block=qb, cpages=pages, kind="bmax")
     gmask = L.index_chain_graph(device, d, T, S, C, NB, run, B, query_block=qb, cpages=pages, kind="mask")
-    gsel = L.index_block_select_graph(device, d, T, kb, top, True)
     gscore = L.index_score_graph(device, d, T, S, C, NB, C, query_block=qb, parts=1, cpages=pages)
     gfull = L.index_select_graph(device, d, T, KT)
     common = {"arena": arena, "cmp_blocks": cmp_blocks, "cmp_loff": loff,
@@ -566,17 +717,22 @@ def test_chain_bmax_mask_matches_full(device, recipes):
     addr["ix_sink"] = addr["ix_sink.p0"] = _malloc_upload(device, np.zeros((1, 64), np.int32))
     rec = _malloc_upload(device, np.zeros((B * S, 8), np.int32))
     gb = _malloc_upload(device, np.zeros((B, 64), np.int32))
+    bb = _malloc_upload(device, np.zeros((B, 64), np.int32))
+    device.h2d(bb, np.ascontiguousarray(np.array([[i * (C // 8)] + [0] * 63 for i in range(B)], np.int32)))
     rinit = _malloc_upload(device, np.zeros((T, run), np.float32))
     pinit = _malloc_upload(device, np.zeros((T, run), np.int32))
     rout = _malloc_upload(device, np.zeros((T, run), np.float32))
     pout = _malloc_upload(device, np.zeros((T, run), np.int32))
+    brinit = _malloc_upload(device, np.zeros((T, top), np.float32))
+    bpinit = _malloc_upload(device, np.zeros((T, top), np.int32))
+    brout = _malloc_upload(device, np.zeros((T, top), np.float32))
+    bpout = _malloc_upload(device, np.zeros((T, top), np.int32))
     lst = _malloc_upload(device, np.zeros((T, run), np.int32))
     lsl = _malloc_upload(device, np.zeros((T, 8), np.int32))
-    bmax = _malloc_upload(device, np.zeros((T, kb), np.float32))
-    cthr = _malloc_upload(device, np.zeros((T, 64), np.int32))
     clist = _malloc_upload(device, np.zeros((T, top), np.int32))
     cslots = _malloc_upload(device, np.zeros((T, 8), np.int32))
-    visb = _malloc_upload(device, np.full(T, kb, np.int32))
+    cthr = _malloc_upload(device, np.zeros((T, 64), np.int32))
+    visb_a = _malloc_upload(device, visb)
     tile = _malloc_upload(device, np.zeros((T, C), np.float32))
     big = _malloc_upload(device, np.zeros((T, KT), np.float32))
     lst_r = _malloc_upload(device, np.zeros((T, run), np.int32))
@@ -588,17 +744,6 @@ def test_chain_bmax_mask_matches_full(device, recipes):
         for n in rc.persistent:
             rc.bind(n, bind[n])
         rc.launch(); device.sync()
-
-    def chain_bind(kind):
-        bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout,
-                "ix_list": lst, "ix_lslots": lsl}
-        if kind == "mask":
-            bind["cand_thr"] = cthr
-        for i in range(B):
-            bind[f"ix_s{i}.p0"] = rec + 4 * 8 * S * i
-            bind[f"ix_gb{i}"] = gb + 256 * i
-            bind[f"ix_bmax{i}"] = bmax + 4 * T * (C // 8) * i
-        return bind
 
     try:
         launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
@@ -613,31 +758,54 @@ def test_chain_bmax_mask_matches_full(device, recipes):
                        "ix_lslots": lsl_r, "ix_thr": thr_r})
         want = device.d2h(lst_r, (T, run), np.int32)
         want_slots = device.d2h(lsl_r, (T, 8), np.int32)
-        # bmax chain: selection == full, and it publishes the block maxima
-        launch(gbmax, chain_bind("bmax"))
+        # bmax chain: running top-2048 blocks -> cand_list; key selection == full
+        bbind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout,
+                 "ix_list": lst, "ix_lslots": lsl, "ix_visb": visb_a, "cand_list": clist,
+                 "cand_slots": cslots, "cand_thr": cthr, "ix_brinit": brinit, "ix_bpinit": bpinit,
+                 "ix_brout": brout, "ix_bpout": bpout}
+        for i in range(B):
+            bbind[f"ix_s{i}.p0"] = rec + 4 * 8 * S * i
+            bbind[f"ix_gb{i}"] = gb + 256 * i
+            bbind[f"ix_gbb{i}"] = bb + 256 * i
+        launch(gbmax, bbind)
         got = device.d2h(lst, (T, run), np.int32)
         for c in range(T):
             n = int(want_slots[c, 4])
             assert got[c, :n].tolist() == want[c, :n].tolist(), ("bmax chain != full", c)
-        # the source tail selects the candidate blocks (threshold + list)
-        launch(gsel, {"cand_bmax": bmax, "ix_visb": visb, "cand_thr": cthr,
-                      "cand_list": clist, "cand_slots": cslots})
+        # the running cand_list must == the natural-order top-2048 block selection over the full block maxima:
+        # strict positives (max>0) in ascending block index, then zero ties (max==0) in ascending block index.
+        # (Block maxima are mostly zero, so the tie cut at 2048 is order-defined; the running merge's natural row
+        # order is the defined tie-break, distinct from the permuted ds_ix_bmax/ixbl order.)
+        bg0 = device.d2h(big, (T, KT), np.float32)
+        bm_np = bg0.reshape(T, KT // 8, 8).max(axis=2)
+        bm_np[:, (KT - 1) // 8] = 3.0e38
         cl = device.d2h(clist, (T, top), np.int32)
         cs = device.d2h(cslots, (T, 8), np.int32)
-        # mask chain: scores masked to the candidate blocks, then the running merge
-        launch(gmask, chain_bind("mask"))
+        ref_np = np.zeros((T, top), np.int32)
+        for c in range(T):
+            posb = np.flatnonzero(bm_np[c] > 0).tolist()
+            zerb = np.flatnonzero(bm_np[c] == 0).tolist()
+            ref_np[c, :top] = (posb + zerb)[:top]
+            n = int(cs[c, 4])
+            assert n == min(int(visb[c]), top), (c, n, int(visb[c]))
+            assert cl[c, :n].tolist() == ref_np[c, :n].tolist(), ("bmax cand_list != natural ref", c,
+                "setdiff", sorted(set(cl[c, :n].tolist()) ^ set(ref_np[c, :n].tolist()))[:20])
+        # mask chain: reads cand_list/cand_slots, masks the tile scores to those blocks, running merge
+        mbind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout,
+                 "ix_list": lst, "ix_lslots": lsl, "cand_list": clist, "cand_slots": cslots}
+        for i in range(B):
+            mbind[f"ix_s{i}.p0"] = rec + 4 * 8 * S * i
+            mbind[f"ix_gb{i}"] = gb + 256 * i
+        launch(gmask, mbind)
         gotm = device.d2h(lst, (T, run), np.int32)
         gotm_slots = device.d2h(lsl, (T, 8), np.int32)
-        # oracle: mask the full scores to the candidate blocks, then one-pass selection. ix_cmask keeps every
-        # block whose max >= cand_thr (the top-th largest block max), INCLUDING ties at the threshold — more than
-        # the exactly-top cand_list when scores tie — so mask by the block-max threshold, not list membership.
+        # oracle: mask the full scores to the cand_list blocks (membership), then one-pass selection
         bg = device.d2h(big, (T, KT), np.float32)
         for c in range(T):
-            bmax_c = bg[c].reshape(KT // 8, 8).max(axis=1)
-            bmax_c[(int(vis[c]) - 1) // 8] = 3.0e38  # the pin: the column's newest visible block
-            thr_val = np.sort(bmax_c)[-top]
-            entry_keep = np.repeat(bmax_c >= thr_val, 8)
-            bg[c, ~entry_keep] = -3.0e38
+            n = int(cs[c, 4])
+            keep = np.zeros(KT // 8, bool)
+            keep[cl[c, :n]] = True
+            bg[c, ~np.repeat(keep, 8)] = -3.0e38
         device.h2d(big, np.ascontiguousarray(bg))
         launch(gfull, {"ix_score": big, "ix_vis": addr["ix_vis"], "ix_list": lst_r,
                        "ix_lslots": lsl_r, "ix_thr": thr_r})
@@ -646,13 +814,16 @@ def test_chain_bmax_mask_matches_full(device, recipes):
         for c in range(T):
             n = int(wantm_slots[c, 4])
             assert int(gotm_slots[c, 4]) == n, (c, gotm_slots[c, 4], n)
-            assert gotm[c, :n].tolist() == wantm[c, :n].tolist(), ("mask chain != masked full", c)
-        print(f"\nbmax+mask B={B}: source selection == full; consumer mask == masked full, {T} cols bit-exact")
+            assert gotm[c, :n].tolist() == wantm[c, :n].tolist(), (
+                "mask chain != masked full", c,
+                "setdiff", sorted(set(gotm[c, :n].tolist()) ^ set(wantm[c, :n].tolist()))[:20],
+                "order_only", sorted(gotm[c, :n].tolist()) == sorted(wantm[c, :n].tolist()))
+        print(f"\nbmax+mask B={B}: source selection == full; consumer mask(cand_list) == masked full, bit-exact")
     finally:
-        for a in set([rec, gb, rinit, pinit, rout, pout, lst, lsl, bmax, cthr, clist, cslots, visb,
-                      tile, big, lst_r, lsl_r, thr_r, *addr.values()]):
+        for a in set([rec, gb, bb, rinit, pinit, rout, pout, brinit, bpinit, brout, bpout, lst, lsl,
+                      clist, cslots, cthr, visb_a, tile, big, lst_r, lsl_r, thr_r, *addr.values()]):
             device.free(a)
-        for g in (gslot, gbmax, gmask, gsel, gscore, gfull):
+        for g in (gslot, gbmax, gmask, gscore, gfull):
             g.destroy()
 
 

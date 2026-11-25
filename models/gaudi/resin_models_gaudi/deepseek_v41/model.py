@@ -578,16 +578,15 @@ class DeepSeekV41Gaudi:
 
     @property
     def workspace_reserve(self) -> int:
-        """Bytes kept out of the arena for the step tables and the shared workspace. The indexer's scores are
-        tiled (index_merge_graph: one group's running candidates and its own keys), so the only term that grows
-        with the context is the published block maxima (kb, TMAX) as f32, which the candidate blocks and the
-        layers that read them share."""
+        """Bytes kept out of the arena for the step tables and the shared workspace. The indexer's scores AND
+        block maxima are tiled (the chain keeps a device-resident running top-512 / top-2048), so no term grows
+        with the context as a published (kb, TMAX) array — the candidate block list is bounded (INDEX_BLOCKS, T)."""
         pairs = max((L.INDEX_RUN + self.ix_rows(s)) * s.T for s in self.shapes)
         decode = [s for s in self.shapes if not s.prefill]
         bpairs = max((L.INDEX_BLOCKS + self.ix_tp(s) * L.BLOCK_TILE) * s.T for s in decode)
         return max(
             WORKSPACE_RESERVE,
-            4 * TMAX * self.kb + 8 * pairs + 8 * L.INDEX_RUN * TMAX + 4 * bpairs + (1 << 30),
+            8 * pairs + 8 * L.INDEX_RUN * TMAX + 4 * bpairs + (1 << 30),
         )
 
     def _malloc(self, nbytes: int) -> int:
@@ -796,30 +795,38 @@ class DeepSeekV41Gaudi:
                     "ix_list": self.io["ix_list"],
                     "ix_lslots": self.io["ix_lslots"],
                 }
-                if kind == "mask":
-                    names["cand_thr"] = self.io["cand_thr"]
+                if kind == "bmax":
+                    # running top-INDEX_BLOCKS BLOCK list carried across recipes (ix_brbuf/ix_bpbuf); the last
+                    # tile lists cand_list/cand_slots/cand_thr directly — no full (kb, T) cand_bmax published.
+                    names.update(
+                        ix_visb=self.table + tb.off[self._visb(ratio)],
+                        cand_list=self.io["cand_list"],
+                        cand_slots=self.io["cand_slots"],
+                        cand_thr=self.io["cand_thr"],
+                        ix_brinit=self.ix_brbuf[k % 2],
+                        ix_bpinit=self.ix_bpbuf[k % 2],
+                        ix_brout=self.ix_brbuf[(k + 1) % 2],
+                        ix_bpout=self.ix_bpbuf[(k + 1) % 2],
+                    )
+                elif kind == "mask":
+                    names.update(
+                        cand_list=self.io["cand_list"],
+                        cand_slots=self.io["cand_slots"],
+                    )
                 for i in range(IX_CHAIN_G):
                     tt = k * IX_CHAIN_G + i
                     names[f"ix_gb{i}"] = self.table + tb.off[f"ix{ratio}.gb"] + 256 * tt
                     names[f"ix_s{i}.p0"] = (
                         self.table + tb.off[f"ix{ratio}.rec"] + 4 * 8 * stride * tt
                     )
-                    if kind in ("bmax", "mask"):
-                        names[f"ix_bmax{i}"] = self.io["cand_bmax"] + 4 * T * L.BLOCK_TILE * tt
+                    if kind == "bmax":
+                        names[f"ix_gbb{i}"] = self.ix_bbase + 256 * tt
                 out.append(self._op(self.r["ixchain", s, kind, k > 0], layer, names))
             return out
 
         ops: dict = {"ixp": chain_ops("plain"), "ixc2": chain_ops("mask" if cand == "user" else "bmax")}
-        sel = {
-            "ix_visb": self.table + self.tables[s].off[self._visb(ratio)],
-            "cand_bmax": self.io["cand_bmax"],
-            "cand_thr": self.io["cand_thr"],
-            "cand_list": self.io["cand_list"],
-            "cand_slots": self.io["cand_slots"],
-        }
-        ops["ixc_tail"] = (
-            [self._op(self.r["ixbl", s], layer, sel)] if cand == "source" else []
-        )
+        # the running block merge lists cand_list itself (last tile), so no separate ixbl selection tail.
+        ops["ixc_tail"] = []
         if cand == "user" and self.ixc_launches(s):
             # query-block batches: each scores only its own columns into the bounded (kc, sparse_batch) staging,
             # then selects; the column slices keep every bound section 256-byte aligned (sparse_batch a mult of 64)
@@ -1157,7 +1164,6 @@ class DeepSeekV41Gaudi:
             "ix_thr2": buf(4 * 64 * T),
             "ix_list": buf(4 * L.INDEX_TOP * T),
             "ix_lslots": buf(4 * 8 * T),
-            "cand_bmax": buf(4 * self.kb * T),
             # the sparse arm's compact scores and positions, bounded to ONE query-block batch (kc, SPARSE_BATCH):
             # each batch scores only its own columns, so the staging never grows with the step's T (the OOM fix)
             "ix_score_sparse": buf(4 * max(1, self.kc) * SPARSE_BATCH),
@@ -1190,6 +1196,16 @@ class DeepSeekV41Gaudi:
         # in the context (run rows, not kmax) — the hierarchical merge's running set never leaves the device.
         self.ix_rbuf = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
         self.ix_pbuf = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
+        # the candidate source's running top-INDEX_BLOCKS BLOCK list, carried across G-tile recipes exactly like
+        # ix_rbuf/ix_pbuf (recipe k reads [k%2], writes [(k+1)%2]). Bounded (INDEX_BLOCKS, T), not (kb, TMAX): the
+        # full block-maxima array is never published. ix_bbase[tt] = tt*BLOCK_TILE (the tile's first block index).
+        self.ix_brbuf = [buf(4 * L.INDEX_BLOCKS * T) for _ in range(2)]
+        self.ix_bpbuf = [buf(4 * L.INDEX_BLOCKS * T) for _ in range(2)]
+        _ntiles = max(self.ix_chain_recipes(r) * IX_CHAIN_G for r in (1, 2))
+        _bb = np.zeros((_ntiles, 64), np.int32)
+        for _tt in range(_ntiles):
+            _bb[_tt, 0] = _tt * L.BLOCK_TILE
+        self.ix_bbase = const(_bb)
         self.ix_tile = buf(4 * max(self.ix_rows(s) * s.T for s in self.shapes))
         self.ixcap = {}
         if _os.environ.get("RESIN_DS41_IXCAP"):

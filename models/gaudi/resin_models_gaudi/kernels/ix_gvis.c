@@ -15,7 +15,9 @@ void main(tensor ixvis, tensor base, tensor vis, tensor exact, int run, int rows
     const int5 end = off + get_index_space_size();
     int5 zc = {0, 0, 0, 0, 0};
     const int b = s_i32_ld_g(gen_addr(zc, base));
-    const int row0 = b > 0 ? run : 0;
+    const int row0 = b < run ? b : run;  // the running rows actually filled (min(base, run)): a tile group whose
+    // base < run (e.g. the block merge's early tiles, base=tile*256 < run=2048) has only `base` real running rows,
+    // the rest NINF padding that must not be counted visible; the key merge has base>=run so row0=run as before.
     scalar_cache_reset();
     for (int c = off[0]; c < end[0]; c++) {
         int5 vc = {c, 0, 0, 0, 0};

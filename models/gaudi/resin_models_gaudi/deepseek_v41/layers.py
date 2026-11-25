@@ -1327,7 +1327,23 @@ def index_chain_graph(
     lslots, ilist = lg.input("ix_lslots", (8, T), I32), lg.input("ix_list", (run, T), I32)
     rout = lg.input("ix_rout", (run, T), F32)
     pout = lg.input("ix_pout", (run, T), I32)
-    cthr = lg.input("cand_thr", (64, T), I32) if kind == "mask" else None
+    if kind == "mask":
+        clist_m = lg.input("cand_list", (INDEX_BLOCKS, T), I32)
+        cslots_m = lg.input("cand_slots", (8, T), I32)
+    # kind=bmax also keeps a running top-INDEX_BLOCKS BLOCK list (the candidate blocks) while it streams the
+    # tiles' block maxima, so the full (kb, T) cand_bmax array is never published: the block merge folds each
+    # tile's rows//8 block maxima into a device-resident top-INDEX_BLOCKS, and the last tile lists cand_list.
+    if kind == "bmax":
+        visb = lg.input("ix_visb", (T,), I32)
+        clist = lg.input("cand_list", (INDEX_BLOCKS, T), I32)
+        cslots = lg.input("cand_slots", (8, T), I32)
+        cthr_out = lg.input("cand_thr", (64, T), I32)
+        brinit = lg.input("ix_brinit", (INDEX_BLOCKS, T), F32)
+        bpinit = lg.input("ix_bpinit", (INDEX_BLOCKS, T), I32)
+        brout = lg.input("ix_brout", (INDEX_BLOCKS, T), F32)
+        bpout = lg.input("ix_bpout", (INDEX_BLOCKS, T), I32)
+        brprev, bpprev = brinit, bpinit
+        bprev = -1
     prev = -1
     rprev, pprev = rinit, pinit
     for i in range(tiles):
@@ -1387,14 +1403,20 @@ def index_chain_graph(
         if prev >= 0:  # tile i starts only after tile i-1's merge (the running set it reads)
             for n in first_nodes:
                 lg.g.dep(prev, n)
+        if kind == "bmax" and bprev >= 0:  # also after tile i-1's BLOCK merge (its running block set)
+            for n in first_nodes:
+                lg.g.dep(bprev, n)
         scored = tile
-        if kind == "bmax":  # the candidate source publishes this tile's block maxima (its cand_bmax slice)
-            bmax = lg.input(f"ix_bmax{i}", (rows // 8, T), F32)
-            lg.node("rg_ds_ix_bmax_f32", [tile, seen, base], [bmax])
-        elif kind == "mask":  # the consumer masks this tile's scores to the published candidate blocks
-            bmax = lg.input(f"ix_bmax{i}", (rows // 8, T), F32)
+        tile_bmax = None
+        if kind == "bmax":  # the candidate source's tile block maxima feed the running top-INDEX_BLOCKS below
+            tile_bmax = lg.tensor((rows // 8, T), F32)
+            # natural block order (row == block) for the running block merge's row-based vis/position arithmetic:
+            # the kernel reads the tile's (rows, T) scores directly (lane == key), reduces blocks of 8, transposes
+            # the permuted 8x8 to natural.
+            lg.node("rg_ds_ix_bmax_nat_f32", [tile, seen, base], [tile_bmax])
+        elif kind == "mask":  # the consumer masks this tile's scores to the running top-2048 candidate blocks
             masked = lg.tensor((rows, T), F32)
-            lg.node("rg_ix_cmask_f32", [tile, seen, bmax, cthr, base], [masked])
+            lg.node("rg_ix_cmask_list_f32", [tile, seen, clist_m, cslots_m, base], [masked])
             scored = masked
         # tile 0 starts fresh unless this is a continuation recipe (carry) reading the incoming running set
         run0 = run if (i > 0 or carry) else 0
@@ -1416,6 +1438,31 @@ def index_chain_graph(
             struct.pack("iiii", max(1, 48 // T), run, heads, run),
         )
         rprev, pprev = rn, pn
+        if kind == "bmax":
+            # running top-INDEX_BLOCKS BLOCK merge: fold this tile's rows//8 block maxima into the device-resident
+            # candidate-block set. Block positions are block indices (bbase = tile*rows//8), so cand_list lists
+            # blocks exactly as one pass over the full (kb, T) maxima would — no full array is ever published.
+            bbase = lg.input(f"ix_gbb{i}", (1,), I32)
+            bK = INDEX_BLOCKS + rows // 8
+            bm = lg.tensor((bK, T), F32)
+            brun0 = INDEX_BLOCKS if carry else min(i * (rows // 8), INDEX_BLOCKS)
+            lg.node("rg_ds_ix_assemble_f32", [brprev, tile_bmax], [bm], struct.pack("ii", brun0, rows // 8))
+            bvis, bexact = lg.tensor((T,), I32), lg.tensor((T,), I32)
+            bthr = cthr_out if i == tiles - 1 else lg.tensor((64, T), I32)
+            bcnt = lg.tensor((bK // 64, T), I32)
+            bgsum = lg.tensor((-(-bK // 4096), T), I32)
+            lg.node("rg_ix_gvis_f32", [visb, bbase], [bvis, bexact], struct.pack("iii", INDEX_BLOCKS, rows // 8, INDEX_BLOCKS))
+            lg.node("rg_ix_thr_f32", [bm, bvis], [bthr], struct.pack("i", INDEX_BLOCKS))
+            lg.node("rg_ix_bcnt_f32", [bm, bvis, bthr], [bcnt, bgsum])
+            blo, bli = (cslots, clist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((INDEX_BLOCKS, T), I32))
+            brn, bpn = (brout, bpout) if i == tiles - 1 else (lg.tensor((INDEX_BLOCKS, T), F32), lg.tensor((INDEX_BLOCKS, T), I32))
+            bprev = lg.g.node(
+                "rg_ds_ix_merge_f32",
+                [bm, bvis, bthr, bcnt, bgsum, bexact, bpprev, bbase],
+                [blo, bli, brn, bpn],
+                struct.pack("iiii", max(1, 48 // T), INDEX_BLOCKS, 0, INDEX_BLOCKS),
+            )
+            brprev, bpprev = brn, bpn
     return lg.g
 
 
