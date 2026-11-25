@@ -1279,20 +1279,30 @@ def index_chain_graph(
     parts: int = 1,
     cpages: int = 0,
     heads: int = 0,
+    carry: bool = False,
+    kind: str = "plain",
 ) -> Graph:
     """The unrolled tiled index chain: ``tiles`` tiles of gather + dequant + score GEMM + acc + assemble + merge
     in ONE recipe, the running top-``run`` carried device-resident in double-buffered buffers. Each tile's acc
-    writes its scores to ``ix_tile``; ``ds_ix_assemble`` places the previous running set (rows 0 .. run) and the
-    tile (rows run ..) into the tile's merge buffer — a single-producer device replacement for the host
+    writes its scores to a graph-local tile; ``ds_ix_assemble`` places the previous running set (rows 0 .. run)
+    and the tile (rows run ..) into the tile's merge buffer — a single-producer device replacement for the host
     copy_multi — and the merge folds it into the next running set. No (kmax, T) score array. The staging tensors
     are reused across tiles (a control dependency serializes the tiles), so the workspace is one tile's,
     constant in the context. ``ix_gb{i}`` is tile i's first key and ``ix_s{i}.p{p}`` its part p's slot records
-    (ds_ix_gslot builds them on the device)."""
+    (ds_ix_gslot builds them on the device).
+
+    ``carry`` marks a continuation recipe of a G-tile bucketed walk: its tile 0 folds the incoming running set
+    (``ix_rinit``/``ix_pinit``, the previous recipe's ``ix_rout``/``ix_pout``) instead of starting fresh, so
+    ceil(B/G) recipes carry one device-resident top-``run`` across the whole context with O(1) host metadata.
+    ``kind`` adds the candidate-source block maxima ("bmax": each tile publishes ``ix_bmax{i}``, its slice of
+    cand_bmax) or the consumer candidate mask ("mask": each tile's scores are masked to the published blocks
+    ``ix_bmax{i}`` + ``cand_thr`` before the merge). The last tile's running set lands in the persistent
+    ``ix_rout``/``ix_pout`` (the next recipe reads them) and its list in ``ix_list``/``ix_lslots``."""
     d, T, S, C = dims, tokens, slots, keys
     qb = query_block or T
     prefill = qb % 8 == 0 and C % 1024 == 0
     P = 1  # one part: the acc's score slab is a single-producer graph-local tensor the assemble reads
-    lg = LayerGraph(device, f"ix_chain_T{T}_S{S}_C{C}_Q{qb}_B{tiles}_p{P}", d, T)
+    lg = LayerGraph(device, f"ix_chain_T{T}_S{S}_C{C}_Q{qb}_B{tiles}_p{P}_{kind}{'c' if carry else ''}", d, T)
     M = INDEX_HEADS * qb
     W = INDEX_HEADS * T
     Sp = S // P
@@ -1305,6 +1315,9 @@ def index_chain_graph(
     rinit = lg.input("ix_rinit", (run, T), F32)
     pinit = lg.input("ix_pinit", (run, T), I32)
     lslots, ilist = lg.input("ix_lslots", (8, T), I32), lg.input("ix_list", (run, T), I32)
+    rout = lg.input("ix_rout", (run, T), F32)
+    pout = lg.input("ix_pout", (run, T), I32)
+    cthr = lg.input("cand_thr", (64, T), I32) if kind == "mask" else None
     prev = -1
     rprev, pprev = rinit, pinit
     for i in range(tiles):
@@ -1364,22 +1377,35 @@ def index_chain_graph(
         if prev >= 0:  # tile i starts only after tile i-1's merge (the running set it reads)
             for n in first_nodes:
                 lg.g.dep(prev, n)
-        lg.node("rg_ds_ix_assemble_f32", [rprev, tile], [m], struct.pack("ii", 0 if i == 0 else run, rows))
+        scored = tile
+        if kind == "bmax":  # the candidate source publishes this tile's block maxima (its cand_bmax slice)
+            bmax = lg.input(f"ix_bmax{i}", (rows // 8, T), F32)
+            lg.node("rg_ds_ix_bmax_f32", [tile, seen, base], [bmax])
+        elif kind == "mask":  # the consumer masks this tile's scores to the published candidate blocks
+            bmax = lg.input(f"ix_bmax{i}", (rows // 8, T), F32)
+            masked = lg.tensor((rows, T), F32)
+            lg.node("rg_ix_cmask_f32", [tile, seen, bmax, cthr, base], [masked])
+            scored = masked
+        # tile 0 starts fresh unless this is a continuation recipe (carry) reading the incoming running set
+        run0 = run if (i > 0 or carry) else 0
+        lg.node("rg_ds_ix_assemble_f32", [rprev, scored], [m], struct.pack("ii", run0, rows))
         vis, exact = lg.tensor((T,), I32), lg.tensor((T,), I32)
         thr = lg.tensor((64, T), I32)
         cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
         lg.node("rg_ix_gvis_f32", [seen, base], [vis, exact], struct.pack("iii", run, rows, run))
         lg.node("rg_ix_thr_f32", [m, vis], [thr], struct.pack("i", run))
         lg.node("rg_ix_bcnt_f32", [m, vis, thr], [cnt, gsum])
-        # only the last tile's list is the column's final one; earlier merges list into scratch
+        # only the last tile's list is the column's final one; earlier merges list into scratch. The last
+        # tile's running set lands in the persistent ix_rout/ix_pout so the next G-tile recipe can carry it.
         lo, li = (lslots, ilist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((run, T), I32))
+        rn, pn = (rout, pout) if i == tiles - 1 else (rnext, pnext)
         prev = lg.g.node(
             "rg_ds_ix_merge_f32",
             [m, vis, thr, cnt, gsum, exact, pprev, base],
-            [lo, li, rnext, pnext],
+            [lo, li, rn, pn],
             struct.pack("iiii", max(1, 48 // T), run, heads, run),
         )
-        rprev, pprev = rnext, pnext
+        rprev, pprev = rn, pn
     return lg.g
 
 

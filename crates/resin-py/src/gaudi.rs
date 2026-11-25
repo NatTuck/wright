@@ -327,6 +327,7 @@ impl Ds41Fill {
             ix_slots: item(layout, "ix_slots")?,
             ix_tp: item(layout, "ix_tp")?,
             ix_lpg: item(layout, "ix_lpg")?,
+            ix_chain_g: item(layout, "ix_chain_g")?,
             ix_rows: item(layout, "ix_rows")?,
             blk: item::<(usize, usize)>(layout, "blk")?.into(),
             ix_rec: item::<(usize, usize)>(layout, "ix_rec")?.into(),

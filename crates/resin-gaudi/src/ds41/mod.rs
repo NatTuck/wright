@@ -194,6 +194,8 @@ pub struct Tables {
     /// groups a step may need per ratio
     pub ix_tp: usize,
     pub ix_lpg: usize,
+    /// tiles per bucketed index-chain recipe (the plain/candidate arms take ceil(chunks / ix_chain_g) launches)
+    pub ix_chain_g: usize,
     pub ix_rows: usize,
     /// per ratio (2, T): per query block its first column's position and the entries its last column sees. The
     /// merge, the block kernels and `ds_ix_gslot` derive every per-group value from this and `ix_vis` on the
@@ -795,18 +797,17 @@ pub fn fill(
             let k = col_row[c] as usize;
             w.copy_words(blocks, c * pages_n, &row_bufs[k]);
         }
-        // the tiled chain: how many merge groups this step needs, and so how many of each arm's launches it takes.
-        // Each group's merge is a _IxMergeOp that emits TWO native ops (copy_multi + launch), so the plain arm
-        // is ix_lpg score launches + 2 per group; the candidate arm adds one block-max/cand-mask op (prefill and
-        // decode alike).
-        let tp = tables.ix_tp as i64;
-        let used = ((chunks + tp - 1) / tp) as usize;
-        counts.ix[ri] = used * (tables.ix_lpg + 2);
-        counts.pf[ri] = used * (tables.ix_lpg + 3);
+        // the bucketed G-tile chain: each arm takes ceil(chunks / ix_chain_g) recipe launches (each ONE launch
+        // carrying the device-resident running top-512; the candidate's block-max/mask is inside the recipe, and
+        // the source's block-publish tail runs after the take). O(tiles/G) launches, O(1) host metadata.
+        let g = tables.ix_chain_g.max(1) as i64;
+        let used = ((chunks + g - 1) / g) as usize;
+        counts.ix[ri] = used;
+        counts.pf[ri] = used;
         if std::env::var("RESIN_DS41_DEBUG_COUNTS").is_ok() {
             eprintln!(
-                "[fill ri={}] chunks={} tp={} used={} ix_lpg={} ix_tp={} => counts.ix={} counts.pf={}",
-                ri, chunks, tp, used, tables.ix_lpg, tables.ix_tp, counts.ix[ri], counts.pf[ri]
+                "[fill ri={}] chunks={} chain_g={} used={} => counts.ix={} counts.pf={}",
+                ri, chunks, g, used, counts.ix[ri], counts.pf[ri]
             );
         }
     }
@@ -1504,6 +1505,7 @@ mod tests {
             ix_slots: 8,
             ix_tp: 1,
             ix_lpg: 1,
+            ix_chain_g: 8,
             ix_rows: 2048,
             nbytes: 200000,
             meta: 0,

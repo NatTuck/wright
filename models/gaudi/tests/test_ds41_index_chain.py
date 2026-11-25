@@ -124,6 +124,8 @@ def test_unrolled_chain_matches_full(device, recipes, B):
     gb_r = _malloc_upload(device, np.zeros((B, 64), np.int32))
     rinit = _malloc_upload(device, np.zeros((T, run), np.float32))
     pinit = _malloc_upload(device, np.zeros((T, run), np.int32))
+    rout = _malloc_upload(device, np.zeros((T, run), np.float32))
+    pout = _malloc_upload(device, np.zeros((T, run), np.int32))
     lst = _malloc_upload(device, np.zeros((T, run), np.int32))
     lsl = _malloc_upload(device, np.zeros((T, 8), np.int32))
     tile = _malloc_upload(device, np.zeros((T, C), np.float32))
@@ -144,7 +146,7 @@ def test_unrolled_chain_matches_full(device, recipes, B):
         launch(gslot_c, {"blk": addr["blk"], "ix_rec": rec_c, "ix_gbase": gb_c})
         launch(gslot_r, {"blk": addr["blk"], "ix_rec": rec_r, "ix_gbase": gb_r})
         # ---- the unrolled chain: ONE launch
-        bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_tile": tile,
+        bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout, "ix_tile": tile,
                 "ix_list": lst, "ix_lslots": lsl}
         for i in range(B):
             bind[f"ix_s{i}.p0"] = rec_c + 4 * 8 * S * i
@@ -245,10 +247,292 @@ def test_unrolled_chain_matches_full(device, recipes, B):
             assert got2[c, :n].tolist() == want2[c, :n].tolist(), ("RED chain!=ref", B, c)
         print(f"B={B}: RED control OK (scores changed; chain tracks reference under perturbed inputs)")
     finally:
-        for a in set([rec_c, gb_c, rec_r, gb_r, rinit, pinit, snk, lst, lsl, tile, big, lst_r, lsl_r, thr_r,
+        for a in set([rec_c, gb_c, rec_r, gb_r, rinit, pinit, rout, pout, snk, lst, lsl, tile, big, lst_r, lsl_r, thr_r,
                       *addr.values()]):
             device.free(a)
         for g in (gslot_c, gslot_r, gchain, gscore, gfull):
+            g.destroy()
+
+
+@pytest.mark.parametrize("G", [1, 2, 4], ids=["G1", "G2", "G4"])
+def test_chain_carry_matches_full(device, recipes, G):
+    """G-tile bucketed walk: two recipes of G tiles carry ONE device-resident running top-512 (recipe 0 fresh,
+    recipe 1 reads recipe 0's ix_rout/ix_pout) == one-pass full selection over B=2G tiles. This is the Part C
+    mechanism: ceil(B/G) launches, O(1) host metadata, no (kmax, T) array."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+
+    d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+               experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+               route_scale=1.5, ranks=1)
+    rng = np.random.default_rng(21)
+    B = 2 * G
+    T, qb, S, C, run = 16, 1, 16, 2048, L.INDEX_RUN
+    KT = B * C
+    ID, IH = L.INDEX_DIM, L.INDEX_HEADS
+    W = IH * T
+    PR, NB, PAIR = 1024, 16, 97
+    pages = KT // 128
+    pattern = np.array([KT, 5000, 900, 700, 3000, 1500, KT - 1, 4096], np.int32)
+    vis = np.minimum(np.resize(pattern, T), KT).astype(np.int32)
+    pos = vis - 1
+    blk = np.zeros((T, 2), np.int32)
+    blk[:, 0] = pos
+    blk[:, 1] = vis
+    ixkeys = rng.standard_normal((KT, ID)).astype(np.float32)
+    rows = np.full((8, KT), -1, np.int32)
+    rows[0] = (np.arange(KT) // 128) * PAIR
+    rows[1] = np.arange(KT) % 128
+    cmp_blocks = np.full((T, pages), -1, np.int32)
+    for c in range(T):
+        npg = -(-int(vis[c]) // 128)
+        cmp_blocks[c, :npg] = np.arange(npg) * PAIR
+    loff = np.zeros(64, np.int32)
+    qb8 = rng.integers(0, 0x78, (W, ID), dtype=np.uint8)
+    qb8 = np.where(rng.integers(0, 2, (W, ID)), qb8 | 0x80, qb8).astype(np.uint8)
+    ix_w = rng.uniform(0.2, 1.0, (T, IH)).astype(np.float32)
+
+    gstore = Graph(device, "t_carry_store")
+    at = gstore.input("arena", (512, PR, NB), U8)
+    gstore.node("rg_ds_store_f4_f32",
+                [at, gstore.input("rows", (8, KT), I32), gstore.input("lat", (512, KT), F32),
+                 gstore.input("ix", (ID, KT), F32)], [gstore.input("sink", (64, 1), I32)])
+    sa = {n: _malloc_upload(device, a) for n, a in {
+        "arena": np.zeros((NB, PR, 512), np.uint8), "sink": np.zeros((1, 64), np.int32), "rows": rows,
+        "lat": np.zeros((KT, 512), np.float32), "ix": np.ascontiguousarray(ixkeys)}.items()}
+    rs = recipes.compile(gstore)
+    for n in rs.persistent:
+        rs.bind(n, sa[n])
+    rs.launch(); device.sync()
+    arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
+    for a in sa.values():
+        device.free(a)
+    gstore.destroy()
+
+    gslot = L.index_gslot_graph(device, d, T, S, 1, 1, T, qb, 1, B, C, run, 128)
+    g0 = L.index_chain_graph(device, d, T, S, C, NB, run, G, query_block=qb, cpages=pages, carry=False)
+    g1 = L.index_chain_graph(device, d, T, S, C, NB, run, G, query_block=qb, cpages=pages, carry=True)
+    gfull = L.index_select_graph(device, d, T, KT)
+    common = {"arena": arena, "cmp_blocks": cmp_blocks, "cmp_loff": loff,
+              "ix_q8": np.ascontiguousarray(qb8), "ix_qs": np.ones(W, np.float32), "ix_w": ix_w, "ix_vis": vis}
+    addr = {n: _malloc_upload(device, a) for n, a in common.items()}
+    addr["blk"] = _malloc_upload(device, blk)
+    addr["dep"] = _malloc_upload(device, np.zeros(64, np.float32))
+    rec = _malloc_upload(device, np.zeros((B * S, 8), np.int32))
+    gb = _malloc_upload(device, np.zeros((B, 64), np.int32))
+    addr["ix_sink"] = addr["ix_sink.p0"] = _malloc_upload(device, np.zeros((1, 64), np.int32))
+    rbuf = [_malloc_upload(device, np.zeros((T, run), np.float32)) for _ in range(2)]
+    pbuf = [_malloc_upload(device, np.zeros((T, run), np.int32)) for _ in range(2)]
+    lst = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lsl = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    big = _malloc_upload(device, np.zeros((T, KT), np.float32))
+    tile = _malloc_upload(device, np.zeros((T, C), np.float32))
+    lst_r = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lsl_r = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    thr_r = _malloc_upload(device, np.zeros((T, 64), np.int32))
+    gscore = L.index_score_graph(device, d, T, S, C, NB, C, query_block=qb, parts=1, cpages=pages)
+
+    def launch(g, bind):
+        rc = recipes.compile(g)
+        for n in rc.persistent:
+            rc.bind(n, bind[n])
+        rc.launch(); device.sync()
+
+    try:
+        launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
+        # recipe k processes tiles [k*G, k*G+G); it reads rbuf[k%2] and writes rbuf[(k+1)%2]
+        for k, g in enumerate((g0, g1)):
+            bind = {**addr, "ix_rinit": rbuf[k % 2], "ix_pinit": pbuf[k % 2],
+                    "ix_rout": rbuf[(k + 1) % 2], "ix_pout": pbuf[(k + 1) % 2],
+                    "ix_list": lst, "ix_lslots": lsl}
+            for i in range(G):
+                t = k * G + i
+                bind[f"ix_s{i}.p0"] = rec + 4 * 8 * S * t
+                bind[f"ix_gb{i}"] = gb + 256 * t
+            launch(g, bind)
+        got = device.d2h(lst, (T, run), np.int32)
+        got_slots = device.d2h(lsl, (T, 8), np.int32)
+        for i in range(B):
+            launch(gscore, {**addr, "ix_slots": rec + 4 * 8 * S * i, "ix_score": tile})
+            tl = device.d2h(tile, (T, C), np.float32)
+            bg = device.d2h(big, (T, KT), np.float32)
+            bg[:, i * C:(i + 1) * C] = tl
+            device.h2d(big, np.ascontiguousarray(bg))
+        launch(gfull, {"ix_score": big, "ix_vis": addr["ix_vis"], "ix_list": lst_r,
+                       "ix_lslots": lsl_r, "ix_thr": thr_r})
+        want = device.d2h(lst_r, (T, run), np.int32)
+        want_slots = device.d2h(lsl_r, (T, 8), np.int32)
+        for c in range(T):
+            n = int(want_slots[c, 4])
+            assert n == min(int(vis[c]), run), (c, n, int(vis[c]))
+            assert int(got_slots[c, 4]) == n, (c, got_slots[c, 4], n)
+            a, b = got[c, :n].tolist(), want[c, :n].tolist()
+            assert a == b, (G, c, a[:12], b[:12], len(set(a) ^ set(b)))
+        print(f"\ncarry G={G} B={B}: two-recipe device-resident carry == full selection, {T} cols bit-exact")
+    finally:
+        for a in set([rec, gb, *rbuf, *pbuf, lst, lsl, big, tile, lst_r, lsl_r, thr_r, *addr.values()]):
+            device.free(a)
+        for g in (gslot, g0, g1, gscore, gfull):
+            g.destroy()
+
+
+def test_chain_bmax_mask_matches_full(device, recipes):
+    """Candidate-source ("bmax") and consumer ("mask") chain kinds, end to end: the bmax chain's selection ==
+    one-pass full selection and it publishes cand_bmax; ixbl selects the candidate blocks (cand_thr/cand_list);
+    the mask chain (reading cand_bmax + cand_thr) == one-pass selection over the scores masked to those blocks."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+
+    d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+               experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+               route_scale=1.5, ranks=1)
+    rng = np.random.default_rng(31)
+    B, top = 4, 64
+    T, qb, S, C, run = 16, 1, 16, 2048, L.INDEX_RUN
+    KT = B * C
+    kb = KT // 8
+    ID, IH = L.INDEX_DIM, L.INDEX_HEADS
+    W = IH * T
+    PR, NB, PAIR = 1024, 16, 97
+    pages = KT // 128
+    vis = np.full(T, KT, np.int32)
+    pos = vis - 1
+    blk = np.zeros((T, 2), np.int32)
+    blk[:, 0] = pos
+    blk[:, 1] = vis
+    ixkeys = rng.standard_normal((KT, ID)).astype(np.float32)
+    rows = np.full((8, KT), -1, np.int32)
+    rows[0] = (np.arange(KT) // 128) * PAIR
+    rows[1] = np.arange(KT) % 128
+    cmp_blocks = np.full((T, pages), -1, np.int32)
+    for c in range(T):
+        npg = -(-int(vis[c]) // 128)
+        cmp_blocks[c, :npg] = np.arange(npg) * PAIR
+    loff = np.zeros(64, np.int32)
+    qb8 = rng.integers(0, 0x78, (W, ID), dtype=np.uint8)
+    qb8 = np.where(rng.integers(0, 2, (W, ID)), qb8 | 0x80, qb8).astype(np.uint8)
+    ix_w = rng.uniform(0.2, 1.0, (T, IH)).astype(np.float32)
+
+    gstore = Graph(device, "t_bm_store")
+    at = gstore.input("arena", (512, PR, NB), U8)
+    gstore.node("rg_ds_store_f4_f32",
+                [at, gstore.input("rows", (8, KT), I32), gstore.input("lat", (512, KT), F32),
+                 gstore.input("ix", (ID, KT), F32)], [gstore.input("sink", (64, 1), I32)])
+    sa = {n: _malloc_upload(device, a) for n, a in {
+        "arena": np.zeros((NB, PR, 512), np.uint8), "sink": np.zeros((1, 64), np.int32), "rows": rows,
+        "lat": np.zeros((KT, 512), np.float32), "ix": np.ascontiguousarray(ixkeys)}.items()}
+    rs = recipes.compile(gstore)
+    for n in rs.persistent:
+        rs.bind(n, sa[n])
+    rs.launch(); device.sync()
+    arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
+    for a in sa.values():
+        device.free(a)
+    gstore.destroy()
+
+    gslot = L.index_gslot_graph(device, d, T, S, 1, 1, T, qb, 1, B, C, run, 128)
+    gbmax = L.index_chain_graph(device, d, T, S, C, NB, run, B, query_block=qb, cpages=pages, kind="bmax")
+    gmask = L.index_chain_graph(device, d, T, S, C, NB, run, B, query_block=qb, cpages=pages, kind="mask")
+    gsel = L.index_block_select_graph(device, d, T, kb, top, True)
+    gscore = L.index_score_graph(device, d, T, S, C, NB, C, query_block=qb, parts=1, cpages=pages)
+    gfull = L.index_select_graph(device, d, T, KT)
+    common = {"arena": arena, "cmp_blocks": cmp_blocks, "cmp_loff": loff,
+              "ix_q8": np.ascontiguousarray(qb8), "ix_qs": np.ones(W, np.float32), "ix_w": ix_w, "ix_vis": vis}
+    addr = {n: _malloc_upload(device, a) for n, a in common.items()}
+    addr["blk"] = _malloc_upload(device, blk)
+    addr["dep"] = _malloc_upload(device, np.zeros(64, np.float32))
+    addr["ix_sink"] = addr["ix_sink.p0"] = _malloc_upload(device, np.zeros((1, 64), np.int32))
+    rec = _malloc_upload(device, np.zeros((B * S, 8), np.int32))
+    gb = _malloc_upload(device, np.zeros((B, 64), np.int32))
+    rinit = _malloc_upload(device, np.zeros((T, run), np.float32))
+    pinit = _malloc_upload(device, np.zeros((T, run), np.int32))
+    rout = _malloc_upload(device, np.zeros((T, run), np.float32))
+    pout = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lst = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lsl = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    bmax = _malloc_upload(device, np.zeros((T, kb), np.float32))
+    cthr = _malloc_upload(device, np.zeros((T, 64), np.int32))
+    clist = _malloc_upload(device, np.zeros((T, top), np.int32))
+    cslots = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    visb = _malloc_upload(device, np.full(T, kb, np.int32))
+    tile = _malloc_upload(device, np.zeros((T, C), np.float32))
+    big = _malloc_upload(device, np.zeros((T, KT), np.float32))
+    lst_r = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lsl_r = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    thr_r = _malloc_upload(device, np.zeros((T, 64), np.int32))
+
+    def launch(g, bind):
+        rc = recipes.compile(g)
+        for n in rc.persistent:
+            rc.bind(n, bind[n])
+        rc.launch(); device.sync()
+
+    def chain_bind(kind):
+        bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout,
+                "ix_list": lst, "ix_lslots": lsl}
+        if kind == "mask":
+            bind["cand_thr"] = cthr
+        for i in range(B):
+            bind[f"ix_s{i}.p0"] = rec + 4 * 8 * S * i
+            bind[f"ix_gb{i}"] = gb + 256 * i
+            bind[f"ix_bmax{i}"] = bmax + 4 * T * (C // 8) * i
+        return bind
+
+    try:
+        launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
+        # full scores + one-pass full selection (the oracle)
+        for i in range(B):
+            launch(gscore, {**addr, "ix_slots": rec + 4 * 8 * S * i, "ix_score": tile})
+            tl = device.d2h(tile, (T, C), np.float32)
+            bg = device.d2h(big, (T, KT), np.float32)
+            bg[:, i * C:(i + 1) * C] = tl
+            device.h2d(big, np.ascontiguousarray(bg))
+        launch(gfull, {"ix_score": big, "ix_vis": addr["ix_vis"], "ix_list": lst_r,
+                       "ix_lslots": lsl_r, "ix_thr": thr_r})
+        want = device.d2h(lst_r, (T, run), np.int32)
+        want_slots = device.d2h(lsl_r, (T, 8), np.int32)
+        # bmax chain: selection == full, and it publishes the block maxima
+        launch(gbmax, chain_bind("bmax"))
+        got = device.d2h(lst, (T, run), np.int32)
+        for c in range(T):
+            n = int(want_slots[c, 4])
+            assert got[c, :n].tolist() == want[c, :n].tolist(), ("bmax chain != full", c)
+        # the source tail selects the candidate blocks (threshold + list)
+        launch(gsel, {"cand_bmax": bmax, "ix_visb": visb, "cand_thr": cthr,
+                      "cand_list": clist, "cand_slots": cslots})
+        cl = device.d2h(clist, (T, top), np.int32)
+        cs = device.d2h(cslots, (T, 8), np.int32)
+        # mask chain: scores masked to the candidate blocks, then the running merge
+        launch(gmask, chain_bind("mask"))
+        gotm = device.d2h(lst, (T, run), np.int32)
+        gotm_slots = device.d2h(lsl, (T, 8), np.int32)
+        # oracle: mask the full scores to the candidate blocks, then one-pass selection. ix_cmask keeps every
+        # block whose max >= cand_thr (the top-th largest block max), INCLUDING ties at the threshold — more than
+        # the exactly-top cand_list when scores tie — so mask by the block-max threshold, not list membership.
+        bg = device.d2h(big, (T, KT), np.float32)
+        for c in range(T):
+            bmax_c = bg[c].reshape(KT // 8, 8).max(axis=1)
+            bmax_c[(int(vis[c]) - 1) // 8] = 3.0e38  # the pin: the column's newest visible block
+            thr_val = np.sort(bmax_c)[-top]
+            entry_keep = np.repeat(bmax_c >= thr_val, 8)
+            bg[c, ~entry_keep] = -3.0e38
+        device.h2d(big, np.ascontiguousarray(bg))
+        launch(gfull, {"ix_score": big, "ix_vis": addr["ix_vis"], "ix_list": lst_r,
+                       "ix_lslots": lsl_r, "ix_thr": thr_r})
+        wantm = device.d2h(lst_r, (T, run), np.int32)
+        wantm_slots = device.d2h(lsl_r, (T, 8), np.int32)
+        for c in range(T):
+            n = int(wantm_slots[c, 4])
+            assert int(gotm_slots[c, 4]) == n, (c, gotm_slots[c, 4], n)
+            assert gotm[c, :n].tolist() == wantm[c, :n].tolist(), ("mask chain != masked full", c)
+        print(f"\nbmax+mask B={B}: source selection == full; consumer mask == masked full, {T} cols bit-exact")
+    finally:
+        for a in set([rec, gb, rinit, pinit, rout, pout, lst, lsl, bmax, cthr, clist, cslots, visb,
+                      tile, big, lst_r, lsl_r, thr_r, *addr.values()]):
+            device.free(a)
+        for g in (gslot, gbmax, gmask, gsel, gscore, gfull):
             g.destroy()
 
 
@@ -322,6 +606,8 @@ def test_unrolled_chain_prefill(device, recipes, B):
     gb = _malloc_upload(device, np.zeros((B, 64), np.int32))
     rinit = _malloc_upload(device, np.zeros((T, run), np.float32))
     pinit = _malloc_upload(device, np.zeros((T, run), np.int32))
+    rout = _malloc_upload(device, np.zeros((T, run), np.float32))
+    pout = _malloc_upload(device, np.zeros((T, run), np.int32))
     lst = _malloc_upload(device, np.zeros((T, run), np.int32))
     lsl = _malloc_upload(device, np.zeros((T, 8), np.int32))
     tile = _malloc_upload(device, np.zeros((T, C), np.float32))
@@ -339,7 +625,7 @@ def test_unrolled_chain_prefill(device, recipes, B):
 
     try:
         launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
-        bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_list": lst, "ix_lslots": lsl}
+        bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout, "ix_list": lst, "ix_lslots": lsl}
         for i in range(B):
             for p in range(P):
                 bind[f"ix_s{i}.p{p}"] = rec + 4 * 8 * S * i + 4 * 8 * Sp * p
@@ -368,7 +654,7 @@ def test_unrolled_chain_prefill(device, recipes, B):
             assert a == b, (B, c, a[:12], b[:12], len(set(a) ^ set(b)))
         print(f"\nprefill B={B} qb={qb} parts={P}: chain == full selection, {T} columns bit-exact")
     finally:
-        for a in set([rec, gb, rinit, pinit, snk, lst, lsl, tile, big, lst_r, lsl_r, thr_r, *addr.values()]):
+        for a in set([rec, gb, rinit, pinit, rout, pout, snk, lst, lsl, tile, big, lst_r, lsl_r, thr_r, *addr.values()]):
             device.free(a)
         for g in (gslot, gchain, gscore, gfull):
             g.destroy()

@@ -78,6 +78,7 @@ TMAX = PREFILL_BUCKETS[-1]
 QUERY_BLOCK = 128  # prefill columns per window slot
 INDEX_KEYS = 2048  # index keys per index slot
 SPARSE_BATCH = 64  # columns per sparse query-block batch: the compact (kc, batch) staging bounds the OOM term
+IX_CHAIN_G = 8  # tiles per bucketed index-chain recipe: ceil(tiles/G) launches carry one device-resident top-512
 PREFILL_IX_SLOTS = 16
 PREFILL_IX_PARTS = 4  # a prefill index launch's slots in parts (index_score_graph)
 # a prefill step whose every column sees more than PREFILTER_MIN entries picks each column's top 512 from the
@@ -285,11 +286,12 @@ class _Tables:
         for r in (1, 2):
             add(f"ix_vis{r}", i32, T)
             add(f"cmp_blocks{r}", i32, T, model.pages)
-            # every merge group's slot records (lane 7: the tile's first index page) and the groups' first keys
-            add(f"ix{r}.rec", i32, shape.ix_slots * model.ix_launches(shape, r), 8)
-            # per-group first key, each group in its own 256-byte (64 i32) slot so the merge/block recipes'
-            # ix_gbase section base (base + 256*g) is 256-aligned for every group (sections validate at 256).
-            add(f"ix{r}.gb", i32, model.ix_groups(shape, r), 64)
+            # the bucketed chain's per-TILE slot records (one slot per query block, lane 7: the tile's first
+            # index page) and per-tile first keys: ix_tiles_padded tiles so every G-tile recipe binds whole ranges
+            add(f"ix{r}.rec", i32, model.ix_rec_stride(shape) * model.ix_tiles_padded(r), 8)
+            # per-tile first key, each tile in its own 256-byte (64 i32) slot so the chain's ix_gb{i} section
+            # base (base + 256*t) is 256-aligned for every tile (sections validate at 256).
+            add(f"ix{r}.gb", i32, model.ix_tiles_padded(r), 64)
         for layer in model.engram_layers:
             if model.engram == "host":
                 add(f"eg.{layer}", f32, T, 256 * J)
@@ -695,6 +697,27 @@ class DeepSeekV41Gaudi:
         """index launches a step of ``shape`` may need for ratio-``ratio`` keys"""
         return self.ix_groups(shape, ratio) * self.ix_lpg(shape)
 
+    def ix_chunks(self, ratio: int) -> int:
+        """index-key tiles (of ``INDEX_KEYS``) the whole context spans at ratio-``ratio``"""
+        return -(-self.kmax // ratio // INDEX_KEYS)
+
+    def ix_chain_recipes(self, ratio: int) -> int:
+        """G-tile bucketed chain recipes a full-context step takes: ceil(tiles / IX_CHAIN_G). Each recipe is one
+        launch carrying the device-resident running top-512, so the plain/candidate arms are O(tiles/G) launches
+        (not one merge per tile) with O(1) host metadata."""
+        return -(-self.ix_chunks(ratio) // IX_CHAIN_G)
+
+    def ix_tiles_padded(self, ratio: int) -> int:
+        """tiles the per-tile gslot builds records for: the recipe count times G (the last recipe's tail tiles
+        are padding the merge masks by ix_vis), so every recipe binds whole G-tile record/gbase ranges"""
+        return self.ix_chain_recipes(ratio) * IX_CHAIN_G
+
+    def ix_rec_stride(self, shape: Shape) -> int:
+        """record columns per tile in the per-tile gslot's table: the query-block count rounded up to a multiple
+        of 8 so each tile's slot-table section base (rec + 32*stride*t) is 256-aligned (sections validate at 256).
+        The chain reads only ``shape.blocks`` slots of it; the gslot's tail columns are padding it never reads."""
+        return -(-shape.blocks // 8) * 8
+
     def _ix_group_names(
         self, s: Shape, ratio: int, g: int, head: dict, kind: str
     ) -> dict:
@@ -744,41 +767,43 @@ class DeepSeekV41Gaudi:
         and its merge), the candidate arm (with the group's block maxima, or its candidate mask, and the tail that
         publishes the blocks), and the sparse reindex path's launches and selection."""
         cfg = self.cfg
-        groups, per = self.ix_groups(s, ratio), self.ix_lpg(s)
         cs = cfg.candidate_source_layer
         cand = "" if cs < 0 or layer < cs else "source" if layer == cs else "user"
-        plain: list = []
-        cnd: list = []
-        for g in range(groups):
-            acc = [
-                self._op(
-                    self.r["ix", s],
-                    layer,
-                    self._ix_names(
-                        s, ratio, g * per + l, owner, head, scratch=cand == "user"
-                    ),
-                )
-                for l in range(per)
-            ]
-            plain.extend(acc)
-            cnd.extend(acc)
-            kind = "k" if cand == "user" else "b"
-            cnd.append(
-                self._op(
-                    self.r[f"ix{kind}", s],
-                    layer,
-                    self._ix_group_names(s, ratio, g, head, kind),
-                )
-            )
-            merge = self._op(
-                self.r["ixm", s],
-                layer,
-                self._ix_group_names(s, ratio, g, head, "m"),
-                copy=self._ix_tile_copy(s, g, layer),
-            )
-            plain.append(merge)
-            cnd.append(merge)
-        ops: dict = {"ixp": plain, "ixc2": cnd}
+        # the bucketed G-tile chain: ceil(tiles/G) recipes, each ONE launch carrying the device-resident running
+        # top-512 (recipe k reads ix_rbuf[k%2], writes ix_rbuf[(k+1)%2]). The plain arm scans every tile; the
+        # candidate arm adds the source's per-tile block maxima ("bmax") or the consumer's candidate mask ("mask").
+        nrec, stride, T = self.ix_chain_recipes(ratio), self.ix_rec_stride(s), s.T
+        tb = self.tables[s]
+
+        def chain_ops(kind: str) -> list:
+            out: list = []
+            for k in range(nrec):
+                names = {
+                    **head,
+                    "ix_vis": self.table + tb.off[f"ix_vis{ratio}"],
+                    "cmp_blocks": self.table + tb.off[f"cmp_blocks{ratio}"],
+                    "cmp_loff": self.loff[owner],
+                    "ix_rinit": self.ix_rbuf[k % 2],
+                    "ix_pinit": self.ix_pbuf[k % 2],
+                    "ix_rout": self.ix_rbuf[(k + 1) % 2],
+                    "ix_pout": self.ix_pbuf[(k + 1) % 2],
+                    "ix_list": self.io["ix_list"],
+                    "ix_lslots": self.io["ix_lslots"],
+                }
+                if kind == "mask":
+                    names["cand_thr"] = self.io["cand_thr"]
+                for i in range(IX_CHAIN_G):
+                    tt = k * IX_CHAIN_G + i
+                    names[f"ix_gb{i}"] = self.table + tb.off[f"ix{ratio}.gb"] + 256 * tt
+                    names[f"ix_s{i}.p0"] = (
+                        self.table + tb.off[f"ix{ratio}.rec"] + 4 * 8 * stride * tt
+                    )
+                    if kind in ("bmax", "mask"):
+                        names[f"ix_bmax{i}"] = self.io["cand_bmax"] + 4 * T * L.BLOCK_TILE * tt
+                out.append(self._op(self.r["ixchain", s, kind, k > 0], layer, names))
+            return out
+
+        ops: dict = {"ixp": chain_ops("plain"), "ixc2": chain_ops("mask" if cand == "user" else "bmax")}
         sel = {
             "ix_visb": self.table + self.tables[s].off[self._visb(ratio)],
             "cand_bmax": self.io["cand_bmax"],
@@ -1107,6 +1132,11 @@ class DeepSeekV41Gaudi:
         pairs = max((L.INDEX_RUN + self.ix_rows(s)) * s.T for s in self.shapes)
         self.ix_merge = [buf(4 * pairs), buf(4 * pairs)]
         self.ix_pos = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
+        # the bucketed chain's device-resident running top-512 carried ACROSS G-tile recipes: recipe k reads
+        # ix_rbuf[k%2]/ix_pbuf[k%2] (the previous recipe's ix_rout/ix_pout) and writes ix_rbuf[(k+1)%2]. Constant
+        # in the context (run rows, not kmax) — the hierarchical merge's running set never leaves the device.
+        self.ix_rbuf = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
+        self.ix_pbuf = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
         self.ix_tile = buf(4 * max(self.ix_rows(s) * s.T for s in self.shapes))
         self.ixcap = {}
         if _os.environ.get("RESIN_DS41_IXCAP"):
@@ -1239,10 +1269,20 @@ class DeepSeekV41Gaudi:
                 )  # fmt: skip
                 for r in (1, 2):
                     graphs["ixg", s, r] = L.index_gslot_graph(
-                        dev, d, T, s.ix_slots, self.ix_lpg(s), self.ix_tp(s),
-                        s.blocks, s.qb, r, self.ix_groups(s, r), INDEX_KEYS,
+                        dev, d, T, self.ix_rec_stride(s), 1, 1,
+                        s.blocks, s.qb, r, self.ix_tiles_padded(r), INDEX_KEYS,
                         L.INDEX_RUN, PAGE_TOKENS,
                     )  # fmt: skip
+                # the bucketed G-tile index chain (plain / candidate-bmax / consumer-mask): each recipe unrolls
+                # IX_CHAIN_G tiles into ONE launch carrying the running top-512 device-resident; recipe 0 starts
+                # fresh (carry=False), later recipes fold the incoming running set (carry=True). One slot per
+                # query block (s.blocks); the record stride is ix_rec_stride for 256-aligned section bases.
+                for kind in ("plain", "bmax", "mask"):
+                    for carry in (False, True):
+                        graphs["ixchain", s, kind, carry] = L.index_chain_graph(
+                            dev, d, T, s.blocks, INDEX_KEYS, nb, L.INDEX_RUN, IX_CHAIN_G,
+                            query_block=qb, parts=1, cpages=self.pages, carry=carry, kind=kind,
+                        )  # fmt: skip
                 graphs["ixm", s] = L.index_merge_graph(dev, d, T, rows, L.INDEX_RUN)
                 # the candidate blocks the source layer publishes, and the sparse reindex arm over them
                 # (prefill and decode alike: the block/mask/gather kernels are per column, shape-agnostic)
@@ -2318,6 +2358,7 @@ class DeepSeekV41Gaudi:
                     "ix_slots": s.ix_slots,
                     "ix_tp": self.ix_tp(s),
                     "ix_lpg": self.ix_lpg(s),
+                    "ix_chain_g": IX_CHAIN_G,
                     "ix_rows": self.ix_rows(s),
                     "blk": (off["blk1"], off["blk2"]),
                     "ix_rec": (off["ix1.rec"], off["ix2.rec"]),

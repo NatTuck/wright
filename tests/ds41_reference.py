@@ -30,6 +30,7 @@ from resin_models_gaudi.deepseek_v41.model import (
     _R_SPARSE,
     DENSE_KEYS,
     INDEX_KEYS,
+    IX_CHAIN_G,
     PREFILTER_BLOCKS,
     PREFILTER_MIN,
     RADIX_MIN,
@@ -392,14 +393,8 @@ class Reference(_Model):
             P = j // PAGE_TOKENS
             page = hist[er, P // op] + ooff + PAIR_ROWS * (P % op)
             e = j % PAGE_TOKENS
-            store[g, 0] = page + e
-            store[g, 2] = (
-                4 * (page + PAGE_ROWS) + e
-            )  # FP8 index key: unit e of the index page
-            store[g, 5] = page + PAGE_ROWS + INDEX_ROWS - 1  # its scale: row 32, f32 e
-            store[g, 6] = e
-            store[g, 3] = page + PAGE_TOKENS
-            store[g, 4] = e
+            store[g, 0] = page
+            store[g, 1] = e  # fp4 store (ds_store_f4): lane 0 the latent page's first row, lane 1 the entry
         # indexer: the tiled chain's launches and the O(T) tables the device builds its group tables from. The
         # per-group tables themselves (slot records, group bases, visible rows, pins) are derived on the device
         # (ds_ix_gslot, ix_gvis, ds_ix_bmax, ix_cmask, ds_ix_merge), so nothing here is per group.
@@ -508,9 +503,9 @@ class Reference(_Model):
             for b in blk:
                 if b is not None:
                     chunks = max(chunks, -(-b[3] // INDEX_KEYS))
-            used = -(-chunks // tp)
-            counts[ratio] = used * (lpg + 1)
-            counts["pf", ratio] = used * (lpg + 2)
+            used = -(-chunks // IX_CHAIN_G)
+            counts[ratio] = used
+            counts["pf", ratio] = used
         return counts
 
     def _engram_ids(

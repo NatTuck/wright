@@ -225,8 +225,8 @@ def test_native_prefill_fill_matches_numpy(span):
             got = native_fill(m, 1, tb, tokens, positions, [row], True, floor)
             same(m, tb, f"{span} T={t} case {case}")
             same_counts(want, got)
-            # the tiled chain's groups this step needs (its index arm takes its groups' launches and merges)
-            used = want[1] // (m.ix_lpg(Shape(t, True)) + 1)
+            # the bucketed chain's recipes this step needs (its index arm takes ceil(chunks/G) recipe launches)
+            used = want[1]
             seen.add((used > 1, want["dense", 1], want["dense", 2]))
     # each span reaches the variant it names
     if span == "prefiltered":
