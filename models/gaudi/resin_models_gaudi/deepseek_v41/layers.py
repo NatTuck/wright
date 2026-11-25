@@ -1291,6 +1291,7 @@ def index_chain_graph(
     heads: int = 0,
     carry: bool = False,
     kind: str = "plain",
+    stop: str = "merge",
 ) -> Graph:
     """The unrolled tiled index chain: ``tiles`` tiles of gather + dequant + score GEMM + acc + assemble + merge
     in ONE recipe, the running top-``run`` carried device-resident in double-buffered buffers. Each tile's acc
@@ -1386,20 +1387,23 @@ def index_chain_graph(
             lg.node("reshape", [dec], [ks2])
             ks = lg.view(ks2, (INDEX_DIM, C, Sp))
             lg.node("batch_gemm", [qs, ks], [sc], GEMM_NT)
-            if prefill:
-                lg.node(
-                    "rg_ds_ix_qacc_o_f32",
-                    [sc, w, table, sq, sk],
-                    [sink, tile],
-                    struct.pack("f", INDEX_SCALE),
-                )
-            else:
-                lg.node(
-                    "rg_ds_ix_slot_acc8_o_f32",
-                    [sc, w, table, sq, sk],
-                    [sink, tile],
-                    struct.pack("f", INDEX_SCALE),
-                )
+            if stop != "gemm":  # RESIN_IX_STOP diagnostic: stop after the GEMM to time the score GEMM alone
+                if prefill:
+                    lg.node(
+                        "rg_ds_ix_qacc_o_f32",
+                        [sc, w, table, sq, sk],
+                        [sink, tile],
+                        struct.pack("f", INDEX_SCALE),
+                    )
+                else:
+                    lg.node(
+                        "rg_ds_ix_slot_acc8_o_f32",
+                        [sc, w, table, sq, sk],
+                        [sink, tile],
+                        struct.pack("f", INDEX_SCALE),
+                    )
+        if stop in ("gemm", "acc"):  # diagnostic: skip the assemble + merge prep + merge
+            continue
         if prev >= 0:  # tile i starts only after tile i-1's merge (the running set it reads)
             for n in first_nodes:
                 lg.g.dep(prev, n)

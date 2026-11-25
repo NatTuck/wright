@@ -246,6 +246,20 @@ def test_unrolled_chain_matches_full(device, recipes, B):
             n = int(want_slots[c, 4])
             assert got2[c, :n].tolist() == want2[c, :n].tolist(), ("RED chain!=ref", B, c)
         print(f"B={B}: RED control OK (scores changed; chain tracks reference under perturbed inputs)")
+        if os.environ.get("CHAIN_BREAKDOWN"):
+            import time as _t
+            for _stop in ("gemm", "acc", "merge"):
+                _g = L.index_chain_graph(device, d, T, S, C, NB, run, B, query_block=qb, parts=1,
+                                         cpages=pages, stop=_stop)
+                _rec = recipes.compile(_g)
+                for _n in _rec.persistent:
+                    _rec.bind(_n, bind[_n])
+                device.sync()
+                _t0 = _t.perf_counter_ns()
+                _rec.launch(); device.sync()
+                _t1 = _t.perf_counter_ns()
+                print(f"BREAKDOWN stop={_stop}: {(_t1 - _t0) / 1e3:.1f} us", flush=True)
+                _g.destroy()
     finally:
         for a in set([rec_c, gb_c, rec_r, gb_r, rinit, pinit, rout, pout, snk, lst, lsl, tile, big, lst_r, lsl_r, thr_r,
                       *addr.values()]):
