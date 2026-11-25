@@ -343,6 +343,9 @@ struct Debug {
     every: usize,
     /// `RESIN_STEP_SYNC_RECIPES`: wait for the stream after each launch of these recipe handles (comma-separated)
     recipes: Vec<i32>,
+    /// `RESIN_STEP_PROF=1`: time each launch on the device (now -> launch -> sync -> elapsed) and print
+    /// `PROF\t<recipe_handle>\t<us>`; the caller maps the handle to a name via the compile order
+    prof: bool,
 }
 
 fn debug() -> &'static Debug {
@@ -361,6 +364,7 @@ fn debug() -> &'static Debug {
                     .collect()
             })
             .unwrap_or_default(),
+        prof: std::env::var("RESIN_STEP_PROF").map(|v| v == "1").unwrap_or(false),
     })
 }
 
@@ -453,8 +457,14 @@ impl Stream for CardStream<'_> {
             self.check(status, || format!("bindings of recipe {recipe}"))?;
         }
         // SAFETY: the recipe is valid by `CardStream::new`.
+        let t0 = if self.debug.prof { Some(std::time::Instant::now()) } else { None };
         let status = unsafe { (self.glue.launch)(recipe) };
         self.check(status, || format!("launch of recipe {recipe}"))?;
+        if let Some(t0) = t0 {
+            // the sync waits for this (and only this, since the stream is empty before t0) launch: the device time
+            self.glue.sync()?;
+            eprintln!("PROF\t{recipe}\t{:.1}", t0.elapsed().as_secs_f64() * 1e6);
+        }
         if self.debug.recipes.contains(&recipe) {
             self.glue.sync()?;
         }

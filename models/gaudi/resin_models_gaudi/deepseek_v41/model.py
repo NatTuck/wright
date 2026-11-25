@@ -1441,6 +1441,9 @@ class DeepSeekV41Gaudi:
         # makes this a first-boot cost only.
         recipes = self.recipes.compile_many(list(graphs.values()), workers=1)
         self.r: dict[tuple, Recipe] = dict(zip(graphs.keys(), recipes, strict=True))
+        if __import__("os").environ.get("RESIN_STEP_PROF"):
+            for _i, _k in enumerate(graphs.keys()):
+                print(f"PROFNAME\t{_i}\t{_k}", flush=True)
         for g in graphs.values():
             g.destroy()
         self.compiles_at_start = self.device.compile_count
