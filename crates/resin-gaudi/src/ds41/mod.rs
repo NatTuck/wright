@@ -381,6 +381,134 @@ pub fn fill(
     cs_all: [&[f32]; 2],
     host_tables: &[HostTable],
 ) -> Result<Counts, String> {
+    fill_impl(
+        model,
+        tables,
+        host,
+        rows,
+        positions,
+        tokens,
+        with_tokens,
+        floor,
+        cs_all,
+        host_tables,
+        false,
+    )
+}
+
+/// The position-only tables of a step (its zeroed ranges, the rope tables `cs`/`cs_inv`, the window
+/// slots' visible key counts and the compressor's rope `cs_g2`/`cs_g1`), written into `host` from the
+/// step's `positions` alone: nothing here reads the rows' block tables, so a worker can write them while
+/// the device runs the previous chunk, into the host copy this step will take. `fill_prepped` then writes
+/// the rest. These are `fill`'s own writes to the same tables, so the two halves sum to `fill` byte for
+/// byte.
+pub fn fill_prep(
+    tables: &Tables,
+    host: &mut [u8],
+    positions: &[i64],
+    cs_all: [&[f32]; 2],
+) -> Result<(), String> {
+    let t = tables.t;
+    let n = positions.len();
+    if n == 0 || n > t {
+        return Err(format!("{n} positions for a step of {t} columns"));
+    }
+    if !tables.prefill {
+        return Err("a prepared step is a prefill step".into());
+    }
+    if positions
+        .iter()
+        .enumerate()
+        .any(|(j, &p)| p != positions[0] + j as i64)
+    {
+        return Err("a prepared step's positions run from its first".into());
+    }
+    if host.len() < tables.nbytes || !tables.nbytes.is_multiple_of(4) {
+        return Err("the host copy is too small or misaligned".into());
+    }
+    let mut pos = vec![0i64; t];
+    pos[..n].copy_from_slice(positions);
+    let mut prof = FillProf::new();
+    prep_tables(tables, host, &pos, cs_all, &mut prof)
+}
+
+/// `fill` over a host copy whose position-only tables were written by `fill_prep` (same `positions`).
+#[allow(clippy::too_many_arguments)]
+pub fn fill_prepped(
+    model: &Model,
+    tables: &Tables,
+    host: &mut [u8],
+    rows: &Rows<'_>,
+    positions: &[i64],
+    tokens: Option<&[i64]>,
+    with_tokens: bool,
+    floor: Option<i64>,
+    cs_all: [&[f32]; 2],
+    host_tables: &[HostTable],
+) -> Result<Counts, String> {
+    fill_impl(
+        model,
+        tables,
+        host,
+        rows,
+        positions,
+        tokens,
+        with_tokens,
+        floor,
+        cs_all,
+        host_tables,
+        true,
+    )
+}
+
+/// The position-only tables (`fill_prep`): `fill`'s zero, meta and rope writes, verbatim. (The window
+/// slots' key counts and the compressor rope stay in `fill`: they interleave with block-table work.)
+fn prep_tables(
+    tables: &Tables,
+    host: &mut [u8],
+    pos: &[i64],
+    cs_all: [&[f32]; 2],
+    prof: &mut FillProf,
+) -> Result<(), String> {
+    for &(lo, hi) in &tables.zero {
+        host[lo..hi].fill(0);
+    }
+    let mut w = words(host, tables.nbytes)?;
+    let n = pos.len();
+    w.set(tables.meta, 0, pos[0]);
+    w.set(tables.meta, 1, n as i64);
+    w.set(tables.meta, 2, 0);
+    w.set(tables.meta, 3, 0);
+    for r in 0..2 {
+        for (column, &position) in pos.iter().enumerate() {
+            let cs = rope(cs_all[r], position)?;
+            w.set_many_f32(tables.cs[r], column * ROPE, cs);
+            // cs_inv is cs with its last 64 lanes negated: copy the row, then flip the tail's signs
+            w.set_many_f32(tables.cs_inv[r], column * ROPE, cs);
+            let inv_start = tables.cs_inv[r] / 4 + column * ROPE;
+            for d in w.0[inv_start + 64..inv_start + ROPE].iter_mut() {
+                *d = (-f32::from_bits(*d as u32)).to_bits() as i32;
+            }
+        }
+    }
+    prof.mark("prep");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_impl(
+    model: &Model,
+    tables: &Tables,
+    host: &mut [u8],
+    rows: &Rows<'_>,
+    positions: &[i64],
+    tokens: Option<&[i64]>,
+    with_tokens: bool,
+    floor: Option<i64>,
+    cs_all: [&[f32]; 2],
+    host_tables: &[HostTable],
+    prepped: bool,
+) -> Result<Counts, String> {
     rows.validate()?;
     let t = tables.t;
     let n = positions.len();
@@ -394,35 +522,22 @@ pub fn fill(
         return Err("the host copy is too small or misaligned".into());
     }
     let mut prof = FillProf::new();
-    for &(lo, hi) in &tables.zero {
-        host[lo..hi].fill(0);
+    if prepped {
+        // the position-only tables (zero, meta, rope) are already in the host copy (`fill_prep`)
+        prof.mark("zero");
+        prof.mark("rope");
+    } else {
+        let mut pos = vec![0i64; t];
+        pos[..n].copy_from_slice(positions);
+        prep_tables(tables, host, &pos, cs_all, &mut prof)?;
     }
-    prof.mark("zero");
     let mut w = words(host, tables.nbytes)?;
     let qb = tables.qb.max(1);
     let r_count = rows.len();
     let page = PAGE_TOKENS;
 
-    w.set(tables.meta, 0, positions[0]);
-    w.set(tables.meta, 1, n as i64);
-    w.set(tables.meta, 2, 0);
-    w.set(tables.meta, 3, 0);
     let mut pos = vec![0i64; t];
     pos[..n].copy_from_slice(positions);
-    for r in 0..2 {
-        for (column, &position) in pos.iter().enumerate() {
-            let cs = rope(cs_all[r], position)?;
-            w.set_many_f32(tables.cs[r], column * ROPE, cs);
-            // cs_inv is cs with its last 64 lanes negated: copy the row, then flip the tail's signs
-            w.set_many_f32(tables.cs_inv[r], column * ROPE, cs);
-            let inv_start = tables.cs_inv[r] / 4 + column * ROPE;
-            for d in w.0[inv_start + 64..inv_start + ROPE].iter_mut() {
-                *d = (-f32::from_bits(*d as u32)).to_bits() as i32;
-            }
-        }
-    }
-
-    prof.mark("rope");
     // each row's blocks: WINDOW rows and ids from logical block window_first (padded with 0), HISTORY rows from
     // block 0 (padded with -1 to at least the model's page count)
     let window_width = (0..r_count)
