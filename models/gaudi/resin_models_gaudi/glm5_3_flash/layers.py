@@ -957,9 +957,14 @@ def ffn_graph(
     return lg.g
 
 
-def paged_shape(tokens: int, top: int, experts: int) -> tuple[int, int, int]:
-    """(row shift, pages, rows): pages for every pair, ceil(T K / PS) + E"""
+def paged_shape(tokens: int, top: int, experts: int, min_ps: int = 8) -> tuple[int, int, int]:
+    """(row shift, pages, rows): pages for every pair, ceil(T K / PS) + E. ``min_ps`` floors the page size PS:
+    the SRAM slicer only places the dequant tile when PS is large enough (PS>=64 on Gaudi 2 for the DSv4.1
+    expert geometry); a smaller PS leaves the master operand "too small" to slice and materializes the decoded
+    expert weights (H*w*P F8) in DRAM workspace (GiB-scale). Default 8 preserves the legacy behavior."""
     psh = 3
+    while (1 << psh) < min_ps:
+        psh += 1
     while (1 << psh) < 2 * tokens * top / experts:
         psh += 1
     PS = 1 << psh

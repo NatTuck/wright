@@ -566,7 +566,7 @@ def _paged_experts(
     d, T = lg.d, lg.T
     H, K, E, w = d.hidden, d.top, d.experts, d.expert
     w0 = w // 128 * 128
-    psh, P, S = paged_shape(T, K, E)
+    psh, P, S = paged_shape(T, K, E, min_ps=64)
     PS = 1 << psh
     meta = lg.meta()
     cntm = lg.tensor((E, 24), I32)
