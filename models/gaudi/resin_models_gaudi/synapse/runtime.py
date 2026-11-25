@@ -141,6 +141,24 @@ def _u64(values: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(values, dtype=np.uint64)
 
 
+_DEFAULT_PLUGINS = "/opt/habanalabs/habana_plugins"
+
+
+def _profiler_hint() -> str:
+    """The profiler's own configuration state, for a ``prof_start`` that failed: which plugin
+    directory this process resolved, whether the HwTrace plugin is in it, and which config file
+    ``HABANA_PROF_CONFIG`` names."""
+    directory = Path(os.environ.get("HABANA_PLUGINS_LIB_PATH") or _DEFAULT_PLUGINS)
+    plugin = directory / "libhw_trace.so"
+    config = os.environ.get("HABANA_PROF_CONFIG") or "<unset>"
+    state = "present" if plugin.exists() else "MISSING"
+    return (
+        f" [profiler: HABANA_PLUGINS_LIB_PATH={directory} libhw_trace.so={state}, "
+        f"HABANA_PROFILE={os.environ.get('HABANA_PROFILE') or '<unset>'}, "
+        f"HABANA_PROF_CONFIG={config}]"
+    )
+
+
 class Device:
     """The acquired Gaudi card of this process."""
 
@@ -364,7 +382,14 @@ class Device:
 
     # ---- profiling (trace.enable_profiler must configure the process first)
     def prof_start(self) -> None:
-        self.check(self.lib.rg_prof_start(), "prof_start")
+        try:
+            self.check(self.lib.rg_prof_start(), "prof_start")
+        except SynapseError as error:
+            # A status-18 (synUnsupported) here is libSynapse's profiler stub answering, i.e. the
+            # HwTrace plugin was never loaded: either HABANA_PLUGINS_LIB_PATH lacks libhw_trace.so or
+            # the profiler was armed after the device was opened. The bare status names neither, so
+            # name the state the process actually resolved (ch5: a stale plugin path fails silently).
+            raise SynapseError(f"{error}{_profiler_hint()}") from None
 
     def prof_stop(self, tsv_path: str | Path) -> int:
         """Stop after every context drains; write the events as TSV and return their count."""
