@@ -281,12 +281,30 @@ struct PrefetchSpec {
     tokens: Vec<i64>,
 }
 
+/// The next prefill chunk's position-only tables (zero, meta, rope), written ahead into the host copy
+/// that chunk's fill will take (`fill_prep`), so its `fill` skips them. Keyed (sequence, pos0, n, t).
+struct PrepFill {
+    k: usize,
+    sequence: u64,
+    pos0: i64,
+    n: usize,
+    t: usize,
+    handle: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+
 /// Greatest common divisor (the cache checkpoint alignment is the groups' block-token LCM).
 fn gcd32(mut a: u32, mut b: u32) -> u32 {
     while b != 0 {
         (a, b) = (b, a % b);
     }
     a
+}
+
+/// `RESIN_DS41_PF_DEBUG=1`: report every cross-chunk Engram prefetch launch and every consuming fill's
+/// key check, so a prefetch that never fires names the field that failed.
+fn pf_debug() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("RESIN_DS41_PF_DEBUG").is_ok_and(|v| v == "1"))
 }
 
 #[pyclass(module = "resin._resin")]
@@ -305,6 +323,10 @@ pub(crate) struct Ds41Executor {
     eg_prefetch: Option<EgPrefetch>,
     eg_ring: Vec<u32>,
     eg_prefetch_on: bool,
+    /// the next prefill chunk's prepared position tables (`fill_prep`), in flight into its host copy
+    /// (`RESIN_DS41_PREP=1` enables)
+    pf_prep: Option<PrepFill>,
+    pf_prep_on: bool,
     context: Py<Ds41Context>,
     shapes: HashMap<(usize, bool), Shaped>,
     layout: Py<CacheLayout>,
@@ -542,14 +564,21 @@ impl Ds41Executor {
             a / gcd32(a, b) * b
         }) as usize;
         let replay_suffix = kv.replay_suffix_tokens() as usize;
+        let mut restorable = prefill_len;
         if alignment > 0 {
-            let restorable = prefill_len.saturating_sub(replay_suffix.max(1));
+            restorable = prefill_len.saturating_sub(replay_suffix.max(1));
             let checkpoint_end = end.min(restorable) / alignment * alignment;
             if checkpoint_end > p0 && checkpoint_end < end {
                 end = checkpoint_end;
             }
         }
         let n = end.min(prompt.len()).saturating_sub(p0);
+        if pf_debug() {
+            eprintln!(
+                "[pf] launch-spec: next pos0={pos0_next} p0={p0} desired={desired} end={end} restorable={restorable} alignment={alignment} n={n} prompt_len={}",
+                prompt.len()
+            );
+        }
         if n == 0 {
             return None;
         }
@@ -600,6 +629,12 @@ impl Ds41Executor {
         let before = spec.before.clone();
         let tokens = spec.tokens.clone();
         let (pos0, t) = (spec.pos0, spec.t);
+        if pf_debug() {
+            eprintln!(
+                "[pf] spawn: pos0={pos0} n={} t={} tmax={}",
+                spec.n, t, self.tmax
+            );
+        }
         let handle = std::thread::spawn(move || {
             // SAFETY: the mmap tables (ptrs) are pinned read-only for the runner's lifetime; the ring
             // (ring_addr) is the executor's own buffer, untouched until this handle is joined. Both
@@ -640,14 +675,28 @@ impl Ds41Executor {
         let engram = self.model.engram.as_ref()?;
         let width = (engram.n - 1) * engram.heads;
         let cur_pos0 = rows.pos0.first().copied().unwrap_or(-1);
+        let debug = pf_debug();
+        let slot = match self.eg_prefetch.as_ref() {
+            Some(slot) => slot,
+            None => {
+                if debug {
+                    eprintln!(
+                        "[pf] miss: no slot in flight (step pos0={cur_pos0} n={} t={} prefill={})",
+                        positions.len(),
+                        shape.0,
+                        shape.1
+                    );
+                }
+                return None;
+            }
+        };
         let before_ok = rows.before_indptr.len() >= 2 && {
             let (lo, hi) = (
                 rows.before_indptr[0] as usize,
                 rows.before_indptr[1] as usize,
             );
-            hi <= rows.before.len() && rows.before[lo..hi] == self.eg_prefetch.as_ref()?.before[..]
+            hi <= rows.before.len() && rows.before[lo..hi] == slot.before[..]
         };
-        let slot = self.eg_prefetch.as_ref()?;
         let tokens_ok = tokens
             .map(|tk| tk.len() >= slot.n && tk[..slot.n] == slot.tokens[..])
             .unwrap_or(false);
@@ -658,7 +707,31 @@ impl Ds41Executor {
             && before_ok
             && tokens_ok;
         if !key_ok {
+            if debug {
+                eprintln!(
+                    "[pf] miss: step pos0={cur_pos0} n={} t={} prefill={} | slot pos0={} n={} t={} | prefill_ok={} pos0_ok={} n_ok={} t_ok={} before_ok={} tokens_ok={}",
+                    positions.len(),
+                    shape.0,
+                    shape.1,
+                    slot.pos0,
+                    slot.n,
+                    slot.t,
+                    shape.1,
+                    slot.pos0 == cur_pos0,
+                    slot.n == positions.len(),
+                    slot.t == shape.0,
+                    before_ok,
+                    tokens_ok
+                );
+            }
             return None;
+        }
+        if debug {
+            eprintln!(
+                "[pf] HIT: pos0={cur_pos0} n={} t={}",
+                positions.len(),
+                shape.0
+            );
         }
         // A match: take the slot and join its worker (blocking only for any gather residual).
         let slot = self.eg_prefetch.take()?;
@@ -688,6 +761,87 @@ impl Ds41Executor {
         Ok(k)
     }
 
+    /// Spawn the worker writing the next prefill chunk's position-only tables (zero, meta, rope) into
+    /// host copy `k` -- the copy that chunk's fill will take -- so its `fill` skips them
+    /// (`fill_prepped`). The copy's last upload is waited for here (it is the full-chunk pass of the chunk
+    /// before last, done long ago), never by the worker: the worker only touches host memory.
+    fn launch_prep(
+        &mut self,
+        py: Python<'_>,
+        k: usize,
+        spec: &PrefetchSpec,
+        sequence: u64,
+    ) -> PyResult<()> {
+        if self.image.used[k] {
+            let glue = self.glue.get();
+            let (event, spin) = (self.image.events + k as i32, self.spin_ns);
+            let start = Instant::now();
+            py.detach(|| glue.glue.wait(event, spin))
+                .map_err(|error| post_accept(py, error))?;
+            self.timings.image_wait += since(start);
+        }
+        let positions: Vec<i64> = (0..spec.n as i64).map(|j| spec.pos0 + j).collect();
+        let shape = (spec.t, true);
+        let tables = self
+            .tables
+            .get(&shape)
+            .ok_or_else(|| PyValueError::new_err(format!("no tables of shape {shape:?}")))?
+            .clone();
+        let cs: [(usize, usize); 2] = std::array::from_fn(|r| {
+            let ro = self.cs[r].bind(py).readonly();
+            let slice = ro.as_slice().expect("cs is contiguous");
+            (slice.as_ptr() as usize, slice.len())
+        });
+        let host = self.image.host.address + k * self.image.stride;
+        let nbytes = tables.nbytes;
+        let handle = std::thread::spawn(move || {
+            // SAFETY: every address below is pinned for the executor's lifetime (the numpy `cs` tables held
+            // by the executor; the host copy, whose upload is waited for above and whose next use -- the
+            // fill that takes it -- waits for this handle). Only Send addresses crossed; slices are rebuilt.
+            let cs: [&[f32]; 2] = std::array::from_fn(|r| {
+                let (ptr, len) = cs[r];
+                unsafe { std::slice::from_raw_parts(ptr as *const f32, len) }
+            });
+            let host = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, nbytes) };
+            ds41::fill_prep(&tables, host, &positions, [&cs[0], &cs[1]])
+        });
+        self.pf_prep = Some(PrepFill {
+            k,
+            sequence,
+            pos0: spec.pos0,
+            n: spec.n,
+            t: spec.t,
+            handle: Some(handle),
+        });
+        Ok(())
+    }
+
+    /// Take the prepared tables of this step when they are its own (same sequence, pos0, n and bucket):
+    /// joins the worker; the step's `fill` then skips the prepared sections (into the same copy `k`).
+    /// Any other slot is joined and dropped (the chunking changed): the step fills inline.
+    fn take_prep(&mut self, sequence: u64, pos0: i64, n: usize, t: usize) -> PyResult<Option<usize>> {
+        let prep = match self.pf_prep.take() {
+            Some(prep) => prep,
+            None => return Ok(None),
+        };
+        let mine = prep.sequence == sequence && prep.pos0 == pos0 && prep.n == n && prep.t == t;
+        let joined = prep
+            .handle
+            .map(|h| h.join().unwrap_or_else(|_| Err("a prefill prep worker panicked".into())))
+            .unwrap_or(Err("a prefill prep worker was not launched".into()));
+        if !mine {
+            self.image.used[prep.k] = false;
+            return Ok(None);
+        }
+        match joined {
+            Ok(()) => Ok(Some(prep.k)),
+            Err(error) => {
+                self.image.used[prep.k] = false;
+                Err(PyValueError::new_err(error))
+            }
+        }
+    }
+
     /// Fill host copy `k` with a step's tables (`with_tokens`: its tokens too, None: the device's); returns the
     /// fill's counts.
     #[allow(clippy::too_many_arguments)]
@@ -701,10 +855,11 @@ impl Ds41Executor {
         tokens: Option<&[i64]>,
         floor: Option<i64>,
     ) -> PyResult<ds41::Counts> {
-        self.fill_with(py, k, shape, rows, positions, tokens, true, floor)
+        self.fill_with(py, k, shape, rows, positions, tokens, true, floor, false)
     }
 
-    /// `fill` (`with_tokens`) or the positions' tables only (`prepare`).
+    /// `fill` (`with_tokens`) or the positions' tables only (`prepare`). `prepped`: host copy `k` already
+    /// holds the step's position-only tables (`fill_prep`, taken by `take_prep`), so the fill skips them.
     #[allow(clippy::too_many_arguments)]
     fn fill_with(
         &mut self,
@@ -716,6 +871,7 @@ impl Ds41Executor {
         tokens: Option<&[i64]>,
         with_tokens: bool,
         floor: Option<i64>,
+        prepped: bool,
     ) -> PyResult<ds41::Counts> {
         let start = Instant::now();
         let rows = rows.view();
@@ -751,11 +907,11 @@ impl Ds41Executor {
         let model = &self.model;
         let host_guards = engram_host_guards(py, &self.engram_host);
         let host_tables = engram_host_slices(&host_guards)?;
-        let counts = py
-            .detach(|| {
-                ds41::fill(
+        let fill = |host: &mut [u8], tables: &ds41::Tables| {
+            if prepped {
+                ds41::fill_prepped(
                     model,
-                    fill_tables,
+                    tables,
                     host,
                     &rows,
                     positions,
@@ -765,7 +921,23 @@ impl Ds41Executor {
                     cs_all,
                     &host_tables,
                 )
-            })
+            } else {
+                ds41::fill(
+                    model,
+                    tables,
+                    host,
+                    &rows,
+                    positions,
+                    tokens,
+                    with_tokens,
+                    floor,
+                    cs_all,
+                    &host_tables,
+                )
+            }
+        };
+        let counts = py
+            .detach(|| fill(host, fill_tables))
             .map_err(PyValueError::new_err)?;
         if let Some(per) = ring_per {
             // Copy the prefetched layer regions into the image at their OWN offsets (the ring is
@@ -1162,7 +1334,7 @@ impl Ds41Executor {
         // the target step's position tables while the device drafts: only its tokens wait for the drafts
         let tv = self.bucket(b * width, false)?;
         let k2 = self.take_image(py)?;
-        let counts = self.fill_with(py, k2, (tv, false), &verify, &positions, None, false, None)?;
+        let counts = self.fill_with(py, k2, (tv, false), &verify, &positions, None, false, None, false)?;
         let drafts = {
             let draft = self.draft.as_ref().expect("checked above");
             let glue = self.glue.get();
@@ -1826,6 +1998,8 @@ impl Ds41Executor {
             eg_ring: Vec::new(),
             eg_prefetch_on: engram_host_mode
                 && std::env::var("RESIN_DS41_PREFETCH").map(|v| v != "0").unwrap_or(true),
+            pf_prep: None,
+            pf_prep_on: std::env::var("RESIN_DS41_PREP").map(|v| v == "1").unwrap_or(false),
             context,
             shapes: built,
             layout,
