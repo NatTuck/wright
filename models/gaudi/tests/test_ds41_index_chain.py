@@ -377,6 +377,126 @@ def test_chain_carry_matches_full(device, recipes, G):
             g.destroy()
 
 
+@pytest.mark.parametrize("T", [1, 4], ids=["T1", "T4"])
+def test_chain_padded_stride_small_decode(device, recipes, T):
+    """The model's small-decode wiring: blocks=T<8 query blocks, but the gslot record stride is rounded to 8
+    (ix_rec_stride) so each tile's slot-table section base is 256-aligned. The chain reads only the first T slots
+    of each stride-8 region (the canonical tile records); the gslot's tail columns are padding it never reads.
+    == one-pass full selection."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+
+    d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+               experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+               route_scale=1.5, ranks=1)
+    rng = np.random.default_rng(41)
+    B, stride = 4, 8
+    qb, S, C, run = 1, T, 2048, L.INDEX_RUN
+    KT = B * C
+    ID, IH = L.INDEX_DIM, L.INDEX_HEADS
+    W = IH * T
+    PR, NB, PAIR = 1024, 16, 97
+    pages = KT // 128
+    vis = np.full(T, KT, np.int32)
+    pos = vis - 1
+    blk = np.zeros((T, 2), np.int32)
+    blk[:, 0] = pos
+    blk[:, 1] = vis
+    ixkeys = rng.standard_normal((KT, ID)).astype(np.float32)
+    rows = np.full((8, KT), -1, np.int32)
+    rows[0] = (np.arange(KT) // 128) * PAIR
+    rows[1] = np.arange(KT) % 128
+    cmp_blocks = np.full((T, pages), -1, np.int32)
+    for c in range(T):
+        npg = -(-int(vis[c]) // 128)
+        cmp_blocks[c, :npg] = np.arange(npg) * PAIR
+    loff = np.zeros(64, np.int32)
+    qb8 = rng.integers(0, 0x78, (W, ID), dtype=np.uint8)
+    qb8 = np.where(rng.integers(0, 2, (W, ID)), qb8 | 0x80, qb8).astype(np.uint8)
+    ix_w = rng.uniform(0.2, 1.0, (T, IH)).astype(np.float32)
+
+    gstore = Graph(device, "t_pad_store")
+    at = gstore.input("arena", (512, PR, NB), U8)
+    gstore.node("rg_ds_store_f4_f32",
+                [at, gstore.input("rows", (8, KT), I32), gstore.input("lat", (512, KT), F32),
+                 gstore.input("ix", (ID, KT), F32)], [gstore.input("sink", (64, 1), I32)])
+    sa = {n: _malloc_upload(device, a) for n, a in {
+        "arena": np.zeros((NB, PR, 512), np.uint8), "sink": np.zeros((1, 64), np.int32), "rows": rows,
+        "lat": np.zeros((KT, 512), np.float32), "ix": np.ascontiguousarray(ixkeys)}.items()}
+    rs = recipes.compile(gstore)
+    for n in rs.persistent:
+        rs.bind(n, sa[n])
+    rs.launch(); device.sync()
+    arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
+    for a in sa.values():
+        device.free(a)
+    gstore.destroy()
+
+    # gslot stride 8 (nblk=T), chain slots=T: the model's ix_rec_stride wiring
+    gslot = L.index_gslot_graph(device, d, T, stride, 1, 1, T, qb, 1, B, C, run, 128)
+    gchain = L.index_chain_graph(device, d, T, S, C, NB, run, B, query_block=qb, cpages=pages)
+    gscore = L.index_score_graph(device, d, T, S, C, NB, C, query_block=qb, parts=1, cpages=pages)
+    gfull = L.index_select_graph(device, d, T, KT)
+    common = {"arena": arena, "cmp_blocks": cmp_blocks, "cmp_loff": loff,
+              "ix_q8": np.ascontiguousarray(qb8), "ix_qs": np.ones(W, np.float32), "ix_w": ix_w, "ix_vis": vis}
+    addr = {n: _malloc_upload(device, a) for n, a in common.items()}
+    addr["blk"] = _malloc_upload(device, blk)
+    addr["dep"] = _malloc_upload(device, np.zeros(64, np.float32))
+    addr["ix_sink"] = addr["ix_sink.p0"] = _malloc_upload(device, np.zeros((1, 64), np.int32))
+    rec = _malloc_upload(device, np.zeros((B * stride, 8), np.int32))
+    gb = _malloc_upload(device, np.zeros((B, 64), np.int32))
+    rinit = _malloc_upload(device, np.zeros((T, run), np.float32))
+    pinit = _malloc_upload(device, np.zeros((T, run), np.int32))
+    rout = _malloc_upload(device, np.zeros((T, run), np.float32))
+    pout = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lst = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lsl = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    tile = _malloc_upload(device, np.zeros((T, C), np.float32))
+    big = _malloc_upload(device, np.zeros((T, KT), np.float32))
+    lst_r = _malloc_upload(device, np.zeros((T, run), np.int32))
+    lsl_r = _malloc_upload(device, np.zeros((T, 8), np.int32))
+    thr_r = _malloc_upload(device, np.zeros((T, 64), np.int32))
+
+    def launch(g, bind):
+        rc = recipes.compile(g)
+        for n in rc.persistent:
+            rc.bind(n, bind[n])
+        rc.launch(); device.sync()
+
+    try:
+        launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
+        bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout,
+                "ix_list": lst, "ix_lslots": lsl}
+        for i in range(B):
+            bind[f"ix_s{i}.p0"] = rec + 4 * 8 * stride * i
+            bind[f"ix_gb{i}"] = gb + 256 * i
+        launch(gchain, bind)
+        got = device.d2h(lst, (T, run), np.int32)
+        got_slots = device.d2h(lsl, (T, 8), np.int32)
+        for i in range(B):
+            launch(gscore, {**addr, "ix_slots": rec + 4 * 8 * stride * i, "ix_score": tile})
+            tl = device.d2h(tile, (T, C), np.float32)
+            bg = device.d2h(big, (T, KT), np.float32)
+            bg[:, i * C:(i + 1) * C] = tl
+            device.h2d(big, np.ascontiguousarray(bg))
+        launch(gfull, {"ix_score": big, "ix_vis": addr["ix_vis"], "ix_list": lst_r,
+                       "ix_lslots": lsl_r, "ix_thr": thr_r})
+        want = device.d2h(lst_r, (T, run), np.int32)
+        want_slots = device.d2h(lsl_r, (T, 8), np.int32)
+        for c in range(T):
+            n = int(want_slots[c, 4])
+            assert int(got_slots[c, 4]) == n, (c, got_slots[c, 4], n)
+            assert got[c, :n].tolist() == want[c, :n].tolist(), (T, c, got[c, :12], want[c, :12])
+        print(f"\npadded-stride T={T} stride={stride}: chain == full selection, bit-exact")
+    finally:
+        for a in set([rec, gb, rinit, pinit, rout, pout, lst, lsl, tile, big, lst_r, lsl_r, thr_r,
+                      *addr.values()]):
+            device.free(a)
+        for g in (gslot, gchain, gscore, gfull):
+            g.destroy()
+
+
 def test_chain_bmax_mask_matches_full(device, recipes):
     """Candidate-source ("bmax") and consumer ("mask") chain kinds, end to end: the bmax chain's selection ==
     one-pass full selection and it publishes cand_bmax; ixbl selects the candidate blocks (cand_thr/cand_list);
