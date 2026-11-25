@@ -91,7 +91,7 @@ def test_listed_fused_vs_official(device, recipes):
     lat_pages = np.array([[0, 129, 258]], np.int32)
     cmp_store = np.full((G2, 8), -1, np.int32)
     for g in range(T // 2):
-        cmp_store[g] = [CMP + g, 0, 4 * (CMP + 129) + g, CMP + 128, g, CMP + 161, g, 0]
+        cmp_store[g] = [CMP, g, 0, 0, 0, 0, 0, 0]
     cmp_groups = np.full((G2, 4), -1, np.int32)
     for g in range(T // 2):
         cmp_groups[g] = [2 * g, 2 * g + 1, 0, 0]
@@ -158,10 +158,13 @@ def test_listed_fused_vs_official(device, recipes):
         g.destroy()
 
     # ---- readback latents + window keys + numpy queries (real weights)
+    # fp4 code+scale store (ds_store_f4): decode bit-exact E2M1[code]*e4m3(scale), entry g of page CMP
+    # (packed layout cmp_store=[CMP,g]); the old fp8_value readback was stale after the fp4 store landed.
+    from test_ds41_fp4_kv import _decode_latent
+
     latd = np.zeros((T // 2, D), np.float64)
     for g in range(T // 2):
-        gs = ar[CMP + 128, 4 * g:4 * g + 4].view(np.float32)[0]
-        latd[g] = fp8_value(ar[CMP + g, :D]) * gs
+        latd[g] = _decode_latent(ar, CMP, g)
 
     def untau(b):
         return _permute_k(b, 64, 4)
@@ -270,9 +273,11 @@ def test_listed_fused_vs_official(device, recipes):
     orel = float(np.linalg.norm(od - o_off_inv.reshape(W, D)) / max(np.linalg.norm(o_off_inv), 1e-12))
     print(f"  p_out REAL graph vs OFFICIAL: norm_rel={rel:.4e} max_abs={np.abs(po - p_off).max():.4e}")
     print(f"  o_inv REAL graph vs OFFICIAL: norm_rel={orel:.4e} max_abs={np.abs(od - o_off_inv.reshape(W, D)).max():.4e}")
-    # The attention fuse is bit-exact up to fp32 (o_inv ~1e-7). p_out carries wo pow2-boundary
-    # amplification of that fp32 noise (scattered ~1e-3 cols); the unfixed split+merge was 1.08e-2.
-    assert orel <= 1e-6, f"listed attention o_inv diverges from official: norm_rel={orel:.4e}"
+    # The attention fuse is bit-exact up to the fp4 dequant bf16 floor: o_inv ~7e-6 on Synapse 1.24.2
+    # (fp4 code*e4m3 scale -> bf16 keys vs the f64 oracle; the old 1e-6 gate was calibrated on the fp8
+    # store / Synapse 1.24.1). p_out carries wo pow2-boundary amplification (scattered ~1e-3 cols); the
+    # unfixed split+merge was 1.08e-2 (RED control, still fails this gate).
+    assert orel <= 1e-5, f"listed attention o_inv diverges from official: norm_rel={orel:.4e}"
     assert rel <= 2e-3, f"listed attention p_out diverges from official: norm_rel={rel:.4e}"
 
 
