@@ -6,9 +6,10 @@
 // blocks 2-9 = listed (ds_gather_list_blk_f4). tile_off is the STEP-COLUMN offset co (the SAME runtime
 // table the listed gather uses): step-column s = tile_off[0] + q in [0, T). meta[0] = pos0, the step's
 // first ABSOLUTE position, so column s's absolute position is pos0 + s. The window is POSITIONAL: window
-// key k (local 0..B-1) of column s is absolute position pos = pos0 + s - 128 + b0*B + k (the 128-key
-// sliding window strictly before the column; b0=0,1 cover it). pos < 0 (or >= the column's visible count
-// klen, or a non-resident page) is an INVALID key: ks_blk = 0 and idx = -1. The dequant is BIT-EXACT
+// key k (local 0..B-1) of column s is absolute position pos = pos0 + s - 127 + b0*B + k (the 128-key
+// sliding window [c-127, c] INCLUDING the column's own position c = pos0+s, per NVIDIA
+// get_window_topk_idxs: offset -(window_size-1) = -127; b0=0,1 cover it). pos < 0 (or >= the column's
+// visible count klen, or a non-resident page) is an INVALID key: ks_blk = 0 and idx = -1. The dequant is BIT-EXACT
 // mla_gather mode 0: the GLOBAL absolute-position window page table lat_pages[pos >> 7] gives the first
 // latent arena row lat0 of the 129-row page (128 fp8 token rows + 1 f32-scale row) holding positions
 // [128*(pos>>7) .. +127] for THIS layer; the token's 512 fp8 latent bytes are rows lat0+(pos&127) at byte
@@ -49,7 +50,8 @@ void main(tensor arena, tensor lat_pages, tensor tile_off, tensor slots, tensor 
             const int k0 = j * VG_KEYS;                  // first local key of this member
             for (int u = 0; u < VG_KEYS; u++) {
                 const int k = k0 + u;                    // local key within the block
-                const int pos = pos0 + s - 128 + kbase + k;  // absolute window key position
+                const int pos = pos0 + s - 127 + kbase + k;  // absolute window key position (WINDOW=128,
+                // offset -(WINDOW-1)=-127: the window [c-127, c] INCLUDES the column's own position c)
                 bfloat128 v0 = zero, v1 = zero, v2 = zero, v3 = zero;
                 int ixv = -1;
                 if (pos >= 0 && pos < klen) {
