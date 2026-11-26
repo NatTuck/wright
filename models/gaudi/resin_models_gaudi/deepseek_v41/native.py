@@ -40,6 +40,19 @@ from resin_models_gaudi.synapse import runtime
 SCORE_COLUMNS = 64  # prompt positions whose logits come back to the host at a time
 
 
+def _device_zero(io, E, m, s) -> None:
+    """Clear, on the device, the host copy's byte ranges the fill does not write whole (``tables.zero`` of
+    shape ``s``): one ``memset`` each, in the io program's upload section, after the upload so the upload
+    cannot overwrite them and before the step's sections read them. ``fill`` skips its own zeroing then
+    (``RESIN_DS41_HOST_ZERO=1`` restores it).
+
+    The host pass this replaces was 40-49 ms of every prefill chunk, with the device idle (FILL_PROF `prep`).
+    """
+    for a, b in m.tables[s].zero:
+        if b > a:
+            io.memset((m.table + a, E.R_BYTES, 0), 0, (b - a) // 4)
+
+
 def _round(nbytes: int, unit: int = 4096) -> int:
     return -(-nbytes // unit) * unit
 
@@ -87,6 +100,10 @@ def build_executor(runner):
         io = GaudiProgram(E.REGISTERS)
         io.section("upload")
         io.upload(m.table, (host.ctypes.data, E.R_IMAGE, stride), (0, E.R_BYTES, 1))
+        # The fill no longer zeroes the host copy: the byte ranges it does not write whole are cleared here,
+        # on the device, after the upload (so the upload cannot overwrite them) and before the step's sections.
+        # A host zeroing pass was 40-49 ms of every prefill chunk, with the device idle (FILL_PROF `prep`).
+        _device_zero(io, E, m, s)
         io.select([(E.R_IMAGE, 2)], [0, 1])
         for k in range(2):
             io.arm()

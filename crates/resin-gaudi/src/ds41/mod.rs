@@ -21,6 +21,14 @@ pub const INDEX_RUN: i64 = 512;
 pub const PENDING_SLOTS: i64 = 4;
 const ROPE: usize = 128;
 
+/// `RESIN_DS41_HOST_ZERO=1`: the fill zeroes the host copy's not-written-whole ranges itself (the old
+/// behaviour). Default off: the io program clears them on the device after the upload, so the zeroing is not
+/// on the host critical path.
+fn host_zero() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RESIN_DS41_HOST_ZERO").map(|v| v == "1").unwrap_or(false))
+}
+
 /// Env-gated (`RESIN_DS41_FILL_PROF=1`) per-section fill timers (stderr, once per fill). Off: one branch.
 struct FillProf {
     on: bool,
@@ -470,8 +478,14 @@ fn prep_tables(
     cs_all: [&[f32]; 2],
     prof: &mut FillProf,
 ) -> Result<(), String> {
-    for &(lo, hi) in &tables.zero {
-        host[lo..hi].fill(0);
+    // The not-written-whole ranges. Cleared on the device by default (the io program's memsets after the
+    // upload, `deepseek_v41/native.py`), which takes the zeroing off the host critical path: a host zeroing
+    // pass was 40-49 ms of every prefill chunk with the device idle (FILL_PROF `prep`). `RESIN_DS41_HOST_ZERO=1`
+    // keeps the old host zeroing for an A/B.
+    if host_zero() {
+        for &(lo, hi) in &tables.zero {
+            host[lo..hi].fill(0);
+        }
     }
     let mut w = words(host, tables.nbytes)?;
     let n = pos.len();
@@ -1618,6 +1632,87 @@ mod tests {
             &[],
         );
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn the_fill_leaves_the_zero_ranges_to_the_device_by_default() {
+        // The io program clears the not-written-whole ranges on the device (native._device_zero), so `fill`
+        // must NOT touch them: a poisoned range survives the fill. With `RESIN_DS41_HOST_ZERO=1` the old
+        // host pass is restored and the same range is cleared — so this gate is RED on that arm, by design:
+        // it pins the default, and the env is the A/B control.
+        let host_zeroing = std::env::var("RESIN_DS41_HOST_ZERO").is_ok_and(|v| v == "1");
+        let model = Model {
+            heads: 8,
+            index_heads: 32,
+            sliding_window: 128,
+            layer_rows: vec![],
+            owners: vec![],
+            pending: vec![],
+            pages: 1,
+            kmax: 4096,
+            kc: 0,
+            candidate: None,
+            engram: None,
+            radix_min: 20480,
+            prefilter_blocks: 0,
+            prefilter_min: 0,
+            dense_keys: 0,
+        };
+        // the `blk_is_per_ratio` fixture (a valid 32-column prefill step) plus a poisoned zero range in a
+        // byte region no table of this fixture touches
+        let tables = Tables {
+            t: 32,
+            prefill: true,
+            qb: 32,
+            win_slots: 1,
+            win_pages: 3,
+            groups2: 17,
+            ix_slots: 8,
+            ix_tp: 1,
+            ix_lpg: 1,
+            ix_chain_g: 8,
+            ix_rows: 2048,
+            nbytes: 200000,
+            meta: 0,
+            cs: [1000, 20000],
+            cs_inv: [40000, 60000],
+            slots: 80000,
+            ix_vis: [81000, 82000],
+            ix_visb: 83000,
+            ix_visb2: 84000,
+            cmp_blocks: [85000, 86000],
+            blk: [90000, 91000],
+            zero: vec![(150000, 160000)],
+            ..Tables::default()
+        };
+        let zero = [0i64];
+        let real = [32i64];
+        let rows = Rows {
+            column: &zero,
+            pos0: &zero,
+            real: &real,
+            window_first: &zero,
+            window_indptr: &[0, 1],
+            window: &[0],
+            window_ids: &[0],
+            history_indptr: &[0, 1],
+            history: &[0],
+            before_indptr: &[0, 0],
+            before: &[],
+        };
+        let cs = vec![0f32; 32 * 128];
+        let mut host = vec![0xABu8; 200000];
+        fill(&model, &tables, &mut host, &rows, &(0..32).collect::<Vec<i64>>(), None, false, None,
+             [&cs, &cs], &[]).unwrap();
+        // the range the device clears is left exactly as it was (or cleared, on the host-zero arm)
+        if host_zeroing {
+            assert!(host[150000..160000].iter().all(|&b| b == 0));
+        } else {
+            assert!(host[150000..160000].iter().all(|&b| b == 0xAB));
+        }
+        // and the fill still wrote its own tables (so this is a moved zero, not a missing one)
+        let word = |off: usize| i32::from_le_bytes(host[off..off + 4].try_into().unwrap());
+        assert_eq!(word(tables.blk[0] + 4), 32);
     }
 
     #[test]
