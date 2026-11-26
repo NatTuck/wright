@@ -1,28 +1,38 @@
 """``scripts/launch_timeline.py`` over a synthetic launch log.
 
-The log is what ``runtime.cpp`` writes from ``RESIN_LAUNCH_LOG``: one ``<ns> <ticks> <recipe> <name>`` line
-per launch. These gates check the tool reads it, ranks recipes, and finds a host gap — the thing the
-timeline exists for. The gap gate is RED-provable: widen the hole and the reported gap must widen with it.
+The log is what ``runtime.cpp`` maps under ``RESIN_LAUNCH_LOG``: a 48-byte header, then one 16-byte record
+``(ticks u64, recipe u32, pad u32)`` per launch, with a ``names.<pid>.tsv`` sidecar for the identities. These
+gates check the tool reads that, ranks recipes, and finds a host gap — the thing the timeline exists for. The
+gap gate is RED-provable: widen the hole and the reported gap must widen with it.
 """
 
 from __future__ import annotations
 
 import json
+import struct
 
 import pytest
 
-from scripts.launch_timeline import main
+from scripts.launch_timeline import HEADER, MAGIC, RECORD, main
 
 
-def write_log(directory, pid: int, rows: list[tuple[float, int, str]]) -> None:
-    with (directory / f"launches.{pid}.tsv").open("w") as stream:
-        stream.write("# ns\tticks\trecipe\tname\n")
-        for ns, ri, name in rows:
-            stream.write(f"{ns:.0f}\t{int(ns)}\t{ri}\t{name}\n")
+def write_log(directory, pid: int, rows: list[tuple[float, int, str]], *, capacity: int = 4096) -> None:
+    """``rows`` are ``(ns, recipe, name)``; the ticks are nanoseconds (ns_per_tick = 1) offset by a realistic
+    non-zero TSC, because a zero tick count is what ends the log."""
+    base = 1 << 40
+    names = {}
+    blob = bytearray(HEADER.pack(MAGIC, 1, RECORD.size, 1.0, base, capacity))
+    for ns, ri, name in rows:
+        names[ri] = name
+        blob += RECORD.pack(base + int(ns), ri, 0)
+    blob += b"\0" * (HEADER.size + capacity * RECORD.size - len(blob))
+    (directory / f"launches.{pid}.bin").write_bytes(bytes(blob))
+    (directory / f"names.{pid}.tsv").write_text(
+        "# recipe\tname\n" + "".join(f"{ri}\t{name}\n" for ri, name in sorted(names.items()))
+    )
 
 
 def run(directory, *extra: str) -> None:
-    main.__globals__["__name__"] = "__main__"
     import sys
 
     argv = sys.argv
@@ -44,16 +54,14 @@ def test_reads_ranks_and_finds_the_host_gap(tmp_path, capsys):
     run(tmp_path, "--json", str(tmp_path / "out.json"))
     out = capsys.readouterr().out
     assert "pid 4242: 4 launches" in out
-    # two ffn launches 2 ms apart, two ixchain launches 1 ms apart
     assert "ffn_T2048" in out and "ixchain_T2048" in out
     # the two 1 ms holes are the only gaps at the default threshold (the 0.5 us step is below it)
     assert "host gaps >= 200 us: 2" in out
     report = json.loads((tmp_path / "out.json").read_text())
     assert report["launches"] == 4
-    # both 1 ms holes, each named by the launches on either side of it
     assert [(g["us"], g["after"], g["before"]) for g in report["gaps"]] == [
-        (1000.0, "ixchain_T2048", "ffn_T2048"),
         (1000.0, "ffn_T2048", "ixchain_T2048"),
+        (1000.0, "ixchain_T2048", "ffn_T2048"),
     ]
 
 
@@ -75,3 +83,17 @@ def test_picks_the_rank_with_most_launches(tmp_path, capsys):
     write_log(tmp_path, 2, [(0.0, 0, "a"), (1.0, 1, "b"), (2.0, 2, "c")])
     run(tmp_path)
     assert "pid 2: 3 launches" in capsys.readouterr().out
+
+
+def test_a_truncated_or_foreign_file_is_refused(tmp_path):
+    (tmp_path / "launches.9.bin").write_bytes(b"not a log at all")
+    with pytest.raises(SystemExit, match="not a launch log"):
+        run(tmp_path)
+
+
+def test_an_unnamed_recipe_is_visible(tmp_path, capsys):
+    """A record whose recipe has no sidecar entry must not silently become an empty name."""
+    write_log(tmp_path, 5, [(0.0, 0, "ffn_T2048")])
+    (tmp_path / "names.5.tsv").write_text("# recipe\tname\n")
+    run(tmp_path)
+    assert "recipe-0" in capsys.readouterr().out
