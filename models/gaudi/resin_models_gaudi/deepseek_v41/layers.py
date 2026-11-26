@@ -1863,10 +1863,16 @@ def _dense_fused(
 # then one wo_a / wo_b recipe over the full T output (attention_out_wo_graph). PREFILL only; decode keeps
 # the small single-launch path (attention_out_graph).
 ATTN_TILE_Q = 128  # query-tile columns (the batch_gemm batch dim S = Q, nh a separate matrix dim)
-ATTN_KEY_BLK = 64  # keys per block (NVIDIA's block)
-ATTN_WIN_BLOCKS = WINDOW // ATTN_KEY_BLK  # 2 window blocks (128 keys, fp8 -> bf16, causal mask)
-ATTN_LIST_BLOCKS = INDEX_TOP // ATTN_KEY_BLK  # 8 listed blocks (512 keys, fp4 -> bf16, count mask)
-ATTN_BLOCKS = ATTN_WIN_BLOCKS + ATTN_LIST_BLOCKS  # 10 blocks in the unified stream
+# keys per block. 64 is NVIDIA's block, but the cost of this recipe is the number of blocks, not the keys:
+# each block round-trips the loop-carried acc_o (D, nh, Q) f32 accumulator, so 10 blocks pay that 10 times,
+# and every block's tiles (gather ~4.2 MB, online ~3 MB) sit far below the ~16 MB where the TPC/DMA envelope
+# is measured. 128 halves the block count and doubles the tile: 5 blocks, ~8.4 MB tiles. The kernels take B
+# as a runtime parameter (ds_gather_list_blk_f4's index space is [1, B/16, Q]), and the online recurrence's
+# f32 noise compounds with the block count, so fewer blocks is also the numerically safer direction.
+ATTN_KEY_BLK = 128
+ATTN_WIN_BLOCKS = WINDOW // ATTN_KEY_BLK  # window blocks (128 keys, fp8 -> bf16, causal mask)
+ATTN_LIST_BLOCKS = INDEX_TOP // ATTN_KEY_BLK  # listed blocks (512 keys, fp4 -> bf16, count mask)
+ATTN_BLOCKS = ATTN_WIN_BLOCKS + ATTN_LIST_BLOCKS  # blocks in the unified stream
 
 
 def _stream_listed_block(

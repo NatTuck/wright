@@ -73,7 +73,9 @@ def _ffn_paged_bytes(name: str) -> float:
 
 HEAD_DIM = 512
 HEADS = 64
-ATTN_BLOCKS = 10  # layers.py: 2 window blocks (128 keys) + 8 listed blocks (512 keys), ATTN_KEY_BLK=64
+# layers.py: ATTN_KEY_BLK keys per block over a 128-key window plus a 512-key listed set
+ATTN_KEY_BLK = 128
+ATTN_BLOCKS = 128 // ATTN_KEY_BLK + 512 // ATTN_KEY_BLK
 
 
 def _attn_out_tile_bytes(name: str) -> float:
@@ -84,10 +86,10 @@ def _attn_out_tile_bytes(name: str) -> float:
     #   pv     (D,nh,Q) f32  written by the PV gemm, read by acc          -> 2*D*nh*Q*4
     #   acc_o  (D,nh,Q) f32  read and written by acc                      -> 2*D*nh*Q*4
     # then fin reads the last acc_o and writes o_tile, both (D,nh,Q) f32  -> 2*D*nh*Q*4
-    # the shipping geometry is Q=ATTN_TILE_Q=128, B=ATTN_KEY_BLK=64; a name without them (a grading label,
+    # the shipping geometry is Q=ATTN_TILE_Q=128, B=ATTN_KEY_BLK; a name without them (a grading label,
     # not a recipe) gets the shipping values
     found = re.search(r"_Q(\d+)_B(\d+)_A", name)
-    q, b = (int(found.group(1)), int(found.group(2))) if found else (128, 64)
+    q, b = (int(found.group(1)), int(found.group(2))) if found else (128, ATTN_KEY_BLK)
     per_block = (
         3 * HEAD_DIM * b * q * 2
         + 2 * b * HEADS * q * 4
@@ -137,7 +139,7 @@ FLOORS: dict[str, Floor] = {
     "ds41_attn_out_tile": Floor(
         "tpc",
         _attn_out_tile_bytes,
-        "10 online-softmax blocks per launch; per block ks_blk(3x) + sc(2x) + P(2x) + pv(2x) + acc_o(2x) in "
+        "one online-softmax block per ATTN_BLOCKS, each ks_blk(3x) + sc(2x) + P(2x) + pv(2x) + acc_o(2x) in "
         "D=512, nh=64, then fin reads acc_o and writes o_tile; dominated by the f32 (D,nh,Q) pv and acc_o",
     ),
     "ds41_attn_out_wo": Floor(
