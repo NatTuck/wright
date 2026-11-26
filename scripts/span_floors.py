@@ -71,6 +71,41 @@ def _ffn_paged_bytes(name: str) -> float:
     return per_layer
 
 
+HEAD_DIM = 512
+HEADS = 64
+ATTN_BLOCKS = 10  # layers.py: 2 window blocks (128 keys) + 8 listed blocks (512 keys), ATTN_KEY_BLK=64
+
+
+def _attn_out_tile_bytes(name: str) -> float:
+    # one launch runs the whole 10-block online softmax over one query tile of Q columns. Per block:
+    #   ks_blk (D,B,Q) bf16 written by the gather and read by both gemms  -> 3*D*B*Q*2
+    #   sc     (B,nh,Q) f32  written by the QK gemm, read by online       -> 2*B*nh*Q*4
+    #   P      (B,nh,Q) bf16 written by online, read by the PV gemm       -> 2*B*nh*Q*2
+    #   pv     (D,nh,Q) f32  written by the PV gemm, read by acc          -> 2*D*nh*Q*4
+    #   acc_o  (D,nh,Q) f32  read and written by acc                      -> 2*D*nh*Q*4
+    # then fin reads the last acc_o and writes o_tile, both (D,nh,Q) f32  -> 2*D*nh*Q*4
+    # the shipping geometry is Q=ATTN_TILE_Q=128, B=ATTN_KEY_BLK=64; a name without them (a grading label,
+    # not a recipe) gets the shipping values
+    found = re.search(r"_Q(\d+)_B(\d+)_A", name)
+    q, b = (int(found.group(1)), int(found.group(2))) if found else (128, 64)
+    per_block = (
+        3 * HEAD_DIM * b * q * 2
+        + 2 * b * HEADS * q * 4
+        + 2 * b * HEADS * q * 2
+        + 2 * HEAD_DIM * HEADS * q * 4
+        + 2 * HEAD_DIM * HEADS * q * 4
+    )
+    return ATTN_BLOCKS * per_block + 2 * HEAD_DIM * HEADS * q * 4
+
+
+def _attn_out_wo_bytes(name: str) -> float:
+    # the output projection over the full T: read the tiles' inverse-roped o_out (D, nh*T) f32, wo_a per
+    # group to (o_lora, T) f32 (written and read), wo_b to this rank's (hidden, T) bf16 partial
+    t = _t(name)
+    o_lora = 1024
+    return HEAD_DIM * HEADS * t * 4 + 2 * o_lora * t * 4 + HIDDEN * t * 2
+
+
 def _owner_store_bytes(name: str) -> float:
     # the cut layer's latent KV for the kept span: T x 1 kv head x 512 dim x K+V x 1 B (fp8)
     t = _t(name)
@@ -99,13 +134,22 @@ FLOORS: dict[str, Floor] = {
         _owner_store_bytes,
         "kept-span latent KV write: T*1 kv head*512 dim*2 (K and V)*1 B (fp8)",
     ),
+    "ds41_attn_out_tile": Floor(
+        "tpc",
+        _attn_out_tile_bytes,
+        "10 online-softmax blocks per launch; per block ks_blk(3x) + sc(2x) + P(2x) + pv(2x) + acc_o(2x) in "
+        "D=512, nh=64, then fin reads acc_o and writes o_tile; dominated by the f32 (D,nh,Q) pv and acc_o",
+    ),
+    "ds41_attn_out_wo": Floor(
+        "tpc",
+        _attn_out_wo_bytes,
+        "read o_out (D, nh*T) f32 + wo_a (o_lora, T) f32 written and read + wo_b (hidden, T) bf16 written",
+    ),
     # No formula derivable from the recipe name alone: the attention path's per-pass KV and activation
     # shapes, and the indexer's key counts, are not in the name. Listed so their silence is visible.
     "ds41_attn_pre": Floor("tpc", None, "UNKNOWN: per-pass q/k/v and KV shapes not in the name"),
     "ds41_attn_win": Floor("tpc", None, "UNKNOWN: window slot geometry not in the name"),
-    "ds41_attn_out": Floor("tpc", None, "UNKNOWN: tile/block parameters not in the name"),
-    "ds41_attn_out_tile": Floor("tpc", None, "UNKNOWN: tile/block parameters not in the name"),
-    "ds41_attn_out_wo": Floor("tpc", None, "UNKNOWN: tile/block parameters not in the name"),
+    "ds41_attn_out": Floor("tpc", None, "UNKNOWN: listed-latent gather shapes not in the name"),
     "ds41_ix_chain": Floor("tpc", None, "UNKNOWN: indexer key counts and tile census not in the name"),
     "ds41_ix_gslot": Floor("tpc", None, "UNKNOWN: slot geometry not in the name"),
     "glm_sample": Floor("flops", None, "UNKNOWN: sampler work is not a bandwidth span"),

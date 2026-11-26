@@ -127,6 +127,30 @@ def test_span_floors_declare_a_regime_and_a_derivation():
     assert moved == pytest.approx(384 * 3 * 5120 * 2304 * 0.5 / 4)
     # the MoE floor does not depend on T above one row per expert
     assert floor("ds41_ffn_paged_T512")[0] == moved
-    assert floor("ds41_attn_out_tile_T512_Q128_B64_A27588") is None
-    assert "UNKNOWN" in derivation("ds41_attn_out_tile_T512")
+    assert floor("ds41_attn_win_T2048_S16_C384_Q128") is None
+    assert "UNKNOWN" in derivation("ds41_attn_win_T2048")
     assert family("ds41_attn_out_tile_T512_Q128") == "ds41_attn_out_tile"
+
+
+def test_span_grade_labels_a_launch_by_its_nodes():
+    """The trace carries no recipe name, so a launch is named by the nodes inside its window. The markers
+    must separate the families, and an unmatched window must stay unclassified rather than be guessed."""
+    from scripts.span_grade import classify
+
+    assert classify({"n10_rg_ds_attn_online_f32", "n10_rg_ds_attn_acc_f32"}) == "ds41_attn_out_tile"
+    assert classify({"n16_rg_ds_ix_merge_f32"}) == "ds41_ix_chain"
+    assert classify({"n10_rg_moe_asg_f32", "n19_rg_mx4_decs_f32"}) == "ds41_ffn_paged"
+    assert classify({"n22_rg_ds_gather_list_blk_f4_f32"}) is None
+
+
+def test_the_attention_tile_floor_is_dominated_by_its_f32_state():
+    """The 10-block online softmax moves a (D, nh, Q) f32 accumulator twice per block plus the PV product;
+    those two terms must dominate, because that is the traffic worth removing."""
+    from scripts.span_floors import floor
+
+    moved, regime, rate = floor("ds41_attn_out_tile_T512_Q128_B64_A27588")
+    assert regime == "tpc"
+    state = 10 * (2 * 512 * 64 * 128 * 4 + 2 * 512 * 64 * 128 * 4)  # pv + acc_o, per block
+    assert state / moved > 0.6
+    # and it is not a small-tile case: one launch moves ~1 GB
+    assert moved > 1e9
