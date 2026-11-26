@@ -105,6 +105,8 @@ _SIGNATURES: dict[str, tuple[object, list[object]]] = {
     "rg_compile_count": (C.c_uint64, []),
     "rg_graph_destroy": (C.c_int, [C.c_int]),
     "rg_recipe_workspace": (C.c_uint64, [C.c_int]),
+    "rg_recipe_name": (C.c_int, [C.c_int, C.c_char_p]),
+    "rg_launch_log_start": (C.c_int, []),
     "rg_slot": (C.c_int, [C.c_int, C.c_char_p]),
     "rg_bind_slots": (C.c_int, [C.c_int, C.c_void_p, C.c_void_p, C.c_int]),
     "rg_launch": (C.c_int, [C.c_int]),

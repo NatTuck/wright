@@ -16,6 +16,9 @@
 #include <unordered_map>
 #include <unistd.h>
 #include <time.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#endif
 
 thread_local char g_err[1024];
 
@@ -25,6 +28,7 @@ struct Recipe {
     std::vector<synLaunchTensorInfoExt> binds;   // one per persistent tensor
     std::vector<std::string> names;
     std::unordered_map<std::string, int> index;
+    std::string graph_name;                      // rg_recipe_name: every recipe must have one
 };
 
 static const int kRing = 32;              // pinned slots for small non-blocking uploads (rg_h2d_nb)
@@ -442,6 +446,117 @@ int rg_register_recipe(synRecipeHandle h, const std::vector<std::string>& persis
 
 RG_API uint64_t rg_recipe_workspace(int ri) { return g_recipes[ri]->workspace_size; }
 
+// ---------------------------------------------------------------- recipe names
+// Every recipe must have a name before it is launched: `rg_launch` aborts otherwise, so a timeline or a
+// profile can never hold an anonymous launch. The name is the graph's (``RecipeCache.compile`` sets it as
+// soon as the index exists, for a fresh compile and for one loaded from the disk cache alike).
+RG_API int rg_recipe_name(int ri, const char* name) {
+    if (ri < 0 || ri >= g_recipe_count || !g_recipes[ri]) {
+        snprintf(g_err, sizeof(g_err), "name: recipe %d does not exist", ri);
+        return -1;
+    }
+    if (!name || !*name) {
+        snprintf(g_err, sizeof(g_err), "name: recipe %d given an empty name", ri);
+        return -1;
+    }
+    g_recipes[ri]->graph_name = name;
+    return 0;
+}
+
+// ---------------------------------------------------------------- launch log
+// ``RESIN_LAUNCH_LOG=<dir>``: one line per launch, ``<ns> <ticks> <recipe> <name>``, from a preallocated
+// buffer dumped at exit. Per launch this is a TSC read and one relaxed store — no sync, no device query, no
+// allocation, no lock — so a logged run keeps its overlap and its timing (unlike ``RESIN_STEP_PROF``, which
+// syncs after every launch). ``RESIN_LAUNCH_LOG_CAPACITY`` sets the entry count (default 1<<22, ~48 MB);
+// entries past it are counted and dropped, never written out of bounds.
+struct LaunchEntry {
+    uint64_t ticks;
+    uint32_t ri;
+};
+
+static std::vector<LaunchEntry> g_launch_log;
+static std::atomic<size_t> g_launch_written{0};
+static std::atomic<int> g_launch_state{0};  // 0: not tried, 1: off, 2: on
+static double g_launch_ns_per_tick = 1.0;
+static uint64_t g_launch_origin = 0;
+static char g_launch_dir[4096];
+
+static inline uint64_t launch_ticks() {
+#if defined(__x86_64__) || defined(__i386__)
+    return __rdtsc();
+#else
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
+#endif
+}
+
+static void launch_log_dump() {
+    if (g_launch_state.load(std::memory_order_acquire) != 2) return;
+    const size_t written = g_launch_written.load(std::memory_order_relaxed);
+    const size_t n = written < g_launch_log.size() ? written : g_launch_log.size();
+    char path[4200];
+    snprintf(path, sizeof(path), "%s/launches.%d.tsv", g_launch_dir, int(getpid()));
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "[launch-log] cannot write %s\n", path);
+        return;
+    }
+    fprintf(f, "# ns\tticks\trecipe\tname\n");
+    for (size_t i = 0; i < n; i++) {
+        const LaunchEntry& e = g_launch_log[i];
+        const char* name = "";
+        if (e.ri < uint32_t(g_recipe_count) && g_recipes[e.ri]) name = g_recipes[e.ri]->graph_name.c_str();
+        fprintf(f, "%.0f\t%llu\t%u\t%s\n", double(e.ticks - g_launch_origin) * g_launch_ns_per_tick,
+                (unsigned long long)e.ticks, e.ri, name);
+    }
+    fclose(f);
+    fprintf(stderr, "[launch-log] %zu launches (%zu requested) -> %s\n", n, written, path);
+}
+
+// Start the log if the environment asks for it; idempotent. Called from Python once the model has loaded, so
+// the TSC calibration is not charged to a step, and lazily from `rg_launch` if it was not.
+RG_API int rg_launch_log_start() {
+    int state = g_launch_state.load(std::memory_order_acquire);
+    if (state != 0) return state == 2 ? 0 : 1;
+    const char* dir = getenv("RESIN_LAUNCH_LOG");
+    if (!dir || !*dir) {
+        g_launch_state.store(1, std::memory_order_release);
+        return 1;
+    }
+    snprintf(g_launch_dir, sizeof(g_launch_dir), "%s", dir);
+    const char* cap = getenv("RESIN_LAUNCH_LOG_CAPACITY");
+    size_t want = (cap && *cap) ? size_t(strtoull(cap, nullptr, 10)) : (size_t(1) << 22);
+    if (want < 1024) want = 1024;
+    g_launch_log.assign(want, LaunchEntry{0, 0});
+    // ticks -> ns, from two clock samples around a short sleep; the log is relative, so only the slope matters
+    timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    uint64_t t0 = launch_ticks();
+    usleep(5000);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    uint64_t t1 = launch_ticks();
+    const long long ns = (long long)(b.tv_sec - a.tv_sec) * 1000000000LL + (long long)(b.tv_nsec - a.tv_nsec);
+    if (t1 > t0 && ns > 0) g_launch_ns_per_tick = double(ns) / double(t1 - t0);
+    g_launch_origin = launch_ticks();
+    atexit(launch_log_dump);
+    g_launch_state.store(2, std::memory_order_release);
+    return 0;
+}
+
+// Append one launch. A hot-path branch on a load of `g_launch_state` (off in production) plus, when on, one
+// relaxed fetch_add and one 16-byte store.
+static inline void launch_log_note(int ri) {
+    int state = g_launch_state.load(std::memory_order_relaxed);
+    if (state == 0) {
+        rg_launch_log_start();
+        state = g_launch_state.load(std::memory_order_relaxed);
+    }
+    if (state != 2) return;
+    const size_t i = g_launch_written.fetch_add(1, std::memory_order_relaxed);
+    if (i < g_launch_log.size()) g_launch_log[i] = LaunchEntry{launch_ticks(), uint32_t(ri)};
+}
+
 // Slot of a persistent tensor name in recipe `ri`, or -1.
 RG_API int rg_slot(int ri, const char* name) {
     Recipe* r = g_recipes[ri];
@@ -458,12 +573,22 @@ RG_API int rg_bind_slots(int ri, const int* slots, const uint64_t* addrs, int n)
 RG_API int rg_launch(int ri) {
     CTX(c);
     Recipe* r = g_recipes[ri];
+    if (r->graph_name.empty()) {
+        // No launch may be anonymous: a timeline, a profile or a rate that names nothing cannot be acted on.
+        fprintf(stderr,
+                "FATAL: launching recipe %d, which has no name; rg_recipe_name was never called for it "
+                "(RecipeCache.compile sets it for every recipe, compiled or loaded)\n",
+                ri);
+        fflush(stderr);
+        abort();
+    }
     for (auto& b : r->binds) if (!b.pTensorAddress) { snprintf(g_err, sizeof(g_err), "launch: %s unbound", b.tensorName); return -1; }
     if (r->workspace_size > c->ws_size) {
         // a recipe that loaded on another context
         std::lock_guard<std::mutex> lock(g_mu);
         if (grow_workspace(c, r->workspace_size)) return -1;
     }
+    launch_log_note(ri);
     synStatus ls = synLaunchWithExternalEventsExt(c->stream, r->binds.data(), r->binds.size(), c->ws, r->h, nullptr, 0, 0);
     if (ls != synSuccess) {
         // Name every bound section and its alignment so a sections-validation failure (status=30) identifies

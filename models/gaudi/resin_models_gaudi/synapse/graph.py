@@ -429,6 +429,12 @@ class RecipeCache:
             handle = self.store.load_or_build_from(
                 artifact, source=source, identity=identity, load=load, build=build
             )
+        # A recipe is launched by index, so it must carry its name from here on: rg_launch aborts on an
+        # anonymous launch. This is the one place both a fresh compile and a cache load pass through.
+        device.check(
+            device.lib.rg_recipe_name(handle, graph.name.encode()),
+            f"name recipe {graph.name}",
+        )
         persistent = {n: t for n, t in graph.tensors.items() if t.persistent}
         return Recipe(
             device,
@@ -474,6 +480,9 @@ class RecipeCache:
             recipes = list(pool.map(one, zip(graphs, missing, strict=True)))
         progress.note("binding recipes")
         info(_compile_summary(recipes, missing, time.monotonic() - start, min(threads, len(graphs))))
+        # Start the launch log now (a no-op unless RESIN_LAUNCH_LOG is set), so its one-off clock calibration
+        # is charged to loading rather than to the first step.
+        self.device.lib.rg_launch_log_start()
         return recipes
 
 

@@ -267,6 +267,16 @@ class DryLib:
     def rg_recipe_workspace(self, r: int) -> int:
         return 0
 
+    def rg_recipe_name(self, r: int, name: bytes) -> int:
+        with self._lock:
+            if r not in self._recipes:
+                return -1
+            self._recipes[r].name = name.decode()
+        return 0
+
+    def rg_launch_log_start(self) -> int:
+        return 1  # the dry device writes no launch log
+
     def rg_slot(self, r: int, name: bytes) -> int:
         try:
             return self._recipes[r].persistent.index(name.decode())
