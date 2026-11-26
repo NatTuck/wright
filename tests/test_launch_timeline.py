@@ -97,3 +97,36 @@ def test_an_unnamed_recipe_is_visible(tmp_path, capsys):
     (tmp_path / "names.5.tsv").write_text("# recipe\tname\n")
     run(tmp_path)
     assert "recipe-0" in capsys.readouterr().out
+
+
+def test_a_window_reports_host_elapsed_and_its_device_floor(tmp_path, capsys):
+    """A window's measured time is host elapsed; its floor is the device bytes its launches declare. The tool
+    must print both and must not present their quotient as a ratio — host time is not device time."""
+    rows = [(0.0, 0, "glm_embed_T2048"), (5_000_000.0, 1, "ds41_ffn_paged_T2048"),
+            (9_000_000.0, 2, "ds41_owner_store_T2048_r1_G2048")]
+    write_log(tmp_path, 11, rows)
+    run(tmp_path, "--spans", "family", "--between", "glm_embed", "ds41_owner_store")
+    out = capsys.readouterr().out
+    assert "window 'glm_embed'..'ds41_owner_store': 3 launches" in out
+    assert "9.0 ms of HOST elapsed" in out
+    # the ffn_paged launch declares the whole per-card expert set: 384*3*5120*2304*0.5/4 bytes
+    assert "MB, a" in out and "device floor at the full envelope" in out
+    assert "this is not a ratio" in out
+
+
+def test_span_floors_declare_a_regime_and_a_derivation():
+    """Every floor entry must say which resource binds it and where its number comes from; a family with no
+    formula must say so instead of silently reporting zero."""
+    from scripts.span_floors import FLOORS, derivation, floor, family
+
+    for name, entry in FLOORS.items():
+        assert entry.regime in ("tpc", "dma", "flops"), name
+        assert entry.derivation, name
+    moved, regime, rate = floor("ds41_ffn_paged_T2048")
+    assert regime == "dma" and rate > 0
+    assert moved == pytest.approx(384 * 3 * 5120 * 2304 * 0.5 / 4)
+    # the MoE floor does not depend on T above one row per expert
+    assert floor("ds41_ffn_paged_T512")[0] == moved
+    assert floor("ds41_attn_out_tile_T512_Q128_B64_A27588") is None
+    assert "UNKNOWN" in derivation("ds41_attn_out_tile_T512")
+    assert family("ds41_attn_out_tile_T512_Q128") == "ds41_attn_out_tile"

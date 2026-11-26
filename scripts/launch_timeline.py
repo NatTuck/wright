@@ -25,8 +25,11 @@ from __future__ import annotations
 import argparse
 import json
 import struct
+import statistics
 from collections import defaultdict
 from pathlib import Path
+
+from scripts.span_floors import TPC_BYTES_PER_S, derivation, family, floor
 
 HEADER = struct.Struct("<8sIIdQQ")
 RECORD = struct.Struct("<QII")
@@ -77,12 +80,113 @@ def names_for(path: Path) -> dict[int, str]:
     return names
 
 
+def spans(rows: list[tuple[float, int, str]], t0: float, args) -> None:
+    """Every span against its declared floor, ranked by how far above it the span runs.
+
+    Two span kinds, because a launch log holds host timestamps and nothing else:
+
+    * **per family**: the *median period* between consecutive launches of that family, against the bytes one
+      launch must move. A family launched once per layer then reports the layer period, which is its cost.
+      The median is what makes this robust: the handful of ~780 ms between-sample holes in a bench run cannot
+      move it, and they are reported separately as gaps.
+    * **window** (``--between START END``): an explicit multi-launch span, from the first launch whose name
+      contains START to the first after it whose name contains END. Its floor is the sum of every launch's
+      own floor inside the window, so a 100-launch chunk is judged as a whole.
+
+    **What these numbers are, and are not.** The log holds *host* timestamps, so a period is host cadence and
+    a window is host elapsed time. Within a step the host races ahead of the device (it issues a chunk's ~100
+    launches in ~130 ms while the device takes ~390 ms to run them) and then blocks at the next step's first
+    launch, which is the ~780 ms holes. So a host window is **not** a device span and must not be divided into
+    a device byte floor: the ratio would flatter the span by however far the host ran ahead. The floors are
+    printed as a reference, and the ratio is printed only for the *gap* spans (host work with a host floor),
+    never for a device span.
+    """
+    per: dict[str, list[float]] = defaultdict(list)
+    for ns, _, name in rows:
+        per[family(name) if args.spans == "family" else name].append(ns / 1e6)
+
+    table = []
+    for group, times in per.items():
+        times.sort()
+        periods = [b - a for a, b in zip(times, times[1:])]
+        period = statistics.median(periods) if periods else 0.0
+        declared = floor(group if args.spans == "family" else group)
+        row = {"group": group, "launches": len(times), "period_ms": period, "floor_ms": None}
+        if declared is not None:
+            per_launch, regime, rate = declared
+            row["bytes"] = per_launch
+            row["regime"] = regime
+            row["floor_ms"] = per_launch / rate * 1e3
+            row["ratio"] = period / row["floor_ms"] if row["floor_ms"] > 0 else None
+            row["gbs"] = per_launch / (period / 1e3) / 1e9 if period > 0 else None
+        table.append(row)
+
+    table.sort(key=lambda r: -r["launches"])
+
+    print("\nhost cadence per span (host timestamps: NOT device time, so no ratio against a device floor):")
+    print(f"{'period ms':>10} {'launches':>9} {'MB/launch':>10} {'floor ms':>9}  span")
+    for r in table[: args.top_spans]:
+        mb = "-" if r.get("bytes") is None else f"{r['bytes'] / 1e6:.3f}"
+        fl = "-" if r.get("floor_ms") is None else f"{r['floor_ms']:.4f}"
+        note = "" if r.get("floor_ms") is not None else f"   [{derivation(r['group'])}]"
+        print(f"{r['period_ms']:10.3f} {r['launches']:9d} {mb:>10} {fl:>9}  {r['group']}{note}")
+
+    for start, end in args.between:
+        window(rows, t0, start, end)
+
+
+def window(rows: list[tuple[float, int, str]], t0: float, start: str, end: str) -> None:
+    """One multi-launch span: first launch containing ``start`` to the first following one containing ``end``."""
+    first = next((i for i, (_, _, n) in enumerate(rows) if start in n), None)
+    if first is None:
+        print(f"\nwindow {start!r}..{end!r}: no launch matches {start!r}")
+        return
+    last = next((i for i in range(first, len(rows)) if end in rows[i][2]), None)
+    if last is None:
+        print(f"\nwindow {start!r}..{end!r}: no launch matches {end!r} after the start")
+        return
+    launches = rows[first : last + 1]
+    measured_ms = (rows[last][0] - rows[first][0]) / 1e6
+    moved = 0.0
+    unfloored = 0
+    for _, _, name in launches:
+        declared = floor(name)
+        if declared is None:
+            unfloored += 1
+        else:
+            moved += declared[0]
+    floor_ms = moved / TPC_BYTES_PER_S * 1e3
+    print(
+        f"\nwindow {start!r}..{end!r}: {len(launches)} launches, {measured_ms:.1f} ms of HOST elapsed "
+        f"({unfloored} launches with no floor declared)"
+    )
+    print(
+        f"  its launches declare {moved / 1e6:.1f} MB, a {floor_ms:.2f} ms device floor at the full envelope."
+        f"  Host elapsed is not device time, so this is not a ratio: it says how far the host ran ahead."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--rank", type=int, help="the pid to report (default: the most launches)")
     parser.add_argument("--top", type=int, default=25, help="recipes to list")
     parser.add_argument("--gap-us", type=float, default=200.0, help="report host gaps at least this long")
+    parser.add_argument(
+        "--spans",
+        choices=("family", "recipe"),
+        help="also compare spans against their declared floors (scripts/span_floors.py)",
+    )
+    parser.add_argument("--top-spans", type=int, default=20, help="spans to list")
+    parser.add_argument(
+        "--between",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("START", "END"),
+        help="also measure one multi-launch span, from the first launch whose name contains START to the "
+        "first following one containing END (repeatable)",
+    )
     parser.add_argument("--json", type=Path, help="also write the table here")
     args = parser.parse_args()
 
@@ -135,6 +239,9 @@ def main() -> None:
     print(f"\nhost gaps >= {args.gap_us:.0f} us: {len(gaps)}")
     for gap, at, a_name, b_name in gaps[:20]:
         print(f"  {gap:9.1f} us at {at:9.3f} ms   after {a_name[:44]:44} before {b_name[:44]}")
+
+    if args.spans:
+        spans(rows, t0, args)
 
     if args.json:
         args.json.write_text(
