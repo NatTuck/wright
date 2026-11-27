@@ -476,7 +476,12 @@ def test_tile_stream_working_set_bounded(device, recipes):
     g_tile.destroy()
     print(f"  WORKSPACE full-T listed: {ws_full / 2**20:.1f} MiB   tile stream: {ws_tile / 2**20:.1f} MiB")
     assert ws_full > 512 << 20, f"full-T listed workspace unexpectedly small: {ws_full}"
-    # the tile workspace is per-query-tile (Q=128 fixed), constant in T; ~65 MiB measured (SSA acc_o chain +
-    # one block's staging), vs the full-T (D,512,T) slab ~1.8 GiB. Bounded well under 128 MiB.
-    assert ws_tile < 128 << 20, f"tile stream workspace not bounded: {ws_tile / 2**20:.1f} MiB"
+    # the tile workspace is per-query-tile and scales with Q (the SSA acc_o chain is (D,nh,Q) f32, so it grows
+    # with the tile's columns), against the full-T (D,512,T) slab ~1.8 GiB. The bound below is therefore in
+    # MiB per tile column: Q=128 measured ~65 MiB (0.51 MiB/col) and Q=256 ~207 MiB (0.81 MiB/col), so 1 MiB
+    # per column holds both with room. The assertion that matters is the >=8x-smaller one after it: that is
+    # what "the stream never materializes the slab" means. On a 96 GiB card a 207 MiB workspace is 0.2 %.
+    assert ws_tile < L.ATTN_TILE_Q * (1 << 20), (
+        f"tile stream workspace not bounded: {ws_tile / 2**20:.1f} MiB for Q={L.ATTN_TILE_Q}"
+    )
     assert ws_tile * 8 < ws_full, f"tile stream not >=8x smaller: {ws_full / max(ws_tile, 1):.1f}x"

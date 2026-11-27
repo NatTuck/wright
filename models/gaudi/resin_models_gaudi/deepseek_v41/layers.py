@@ -1862,7 +1862,7 @@ def _dense_fused(
 # launches T / Q tile recipes per layer (each binding tile_off + its q_all / cs_inv / o_out column slice),
 # then one wo_a / wo_b recipe over the full T output (attention_out_wo_graph). PREFILL only; decode keeps
 # the small single-launch path (attention_out_graph).
-ATTN_TILE_Q = 128  # query-tile columns (the batch_gemm batch dim S = Q, nh a separate matrix dim)
+ATTN_TILE_Q = 256  # query-tile columns (the batch_gemm batch dim S = Q, nh a separate matrix dim)
 # keys per block. 64 is NVIDIA's block, but the cost of this recipe is the number of blocks, not the keys:
 # each block round-trips the loop-carried acc_o (D, nh, Q) f32 accumulator, so 10 blocks pay that 10 times,
 # and every block's tiles (gather ~4.2 MB, online ~3 MB) sit far below the ~16 MB where the TPC/DMA envelope
