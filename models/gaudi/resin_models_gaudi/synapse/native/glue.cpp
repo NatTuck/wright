@@ -269,8 +269,8 @@ static bool geom_bcast3(const HabanaKernelParams* p, uint64_t is[5], uint32_t* r
     const int32_t* prm = (const int32_t*)p->nodeParams.nodeParams;
     if (!prm || p->nodeParams.nodeParamsSize < 4) return false;
     const uint64_t C = uint64_t(prm[0]);
-    if (C == 0) return false;
-    is[0] = 1; is[1] = C; is[2] = sz(p, true, 0, 1) / C;
+    if (C == 0 || C % 2) return false;
+    is[0] = 1; is[1] = C / 2; is[2] = sz(p, true, 0, 1) / C;
     *rank = 3; return true;
 }
 // ix_slot_acc

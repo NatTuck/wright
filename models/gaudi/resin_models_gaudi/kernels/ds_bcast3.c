@@ -9,14 +9,20 @@
 // C*D*S bytes per tile, the same volume the per-slot dequant already wrote, so the saving is upstream: the 16x
 // gather and the 16x read of the fp4 codes.
 //
-// Both sides are declared 2-D on purpose. A 256-byte vector written to a 3-D tensor crosses its innermost
-// extent (S), and the descriptor wraps: the shapes still line up and the values are silently wrong. Flattened,
-// a vector is two whole columns of a 128-wide slab and never crosses anything. The caller views the result as
-// (D, C, S) for the GEMM.
+// TWO LAYOUT FACTS, both of which cost a debugging cycle:
+//
+//  1. Device tensors are column-major with dim 0 fastest. out (D, C*S) therefore has flat memory [s][c][d] with
+//     d fastest -- C-order shape (s, c, d). Reading a d2h dump as (d, s, c) or (d, c, s) is a fixed misread of
+//     a correct buffer.
+//  2. A vector load needs a VECTOR-GRANULAR dim 0. A 256-byte vector at {0, c} on a (128, C) u8 tensor does not
+//     address by c at all -- dim 0 is half a vector, so the descriptor collapses and EVERY load returns column
+//     0's data. So both sides are declared 2-D and one member copies a full 256-byte vector, which is two whole
+//     columns of the 128-wide slab at the vector-aligned flat offset 2c*128. This is x8_copy's shape
+//     ({256*nt, ...}) and it is what the hardware wants; do not "optimise" it back to a partial store.
 //
 // guid: rg_ds_bcast3_f32 (the glue derives it as rg_<file stem>_f32).
-// tensors: 0 in (D, C) u8 | 1 out (D, C*S) u8.  params: C.  index space: [1, C, S]; one member copies one
-// whole column (D elements) of one slot.
+// tensors: 0 in (D, C) u8 | 1 out (D, C*S) u8.  params: C (even).  index space: [1, C / 2, S]; one member is a
+// 256-byte vector = two columns of one slot.
 #include "common.h"
 
 void main(tensor in, tensor out, int C)
@@ -26,9 +32,8 @@ void main(tensor in, tensor out, int C)
     for (int s = off[2]; s < end[2]; s++)
         for (int c = off[1]; c < end[1]; c++)
             for (int d = off[0]; d < end[0]; d++) {
-                int5 ic = {0, c, 0, 0, 0};
-                int5 oc = {0, c + C * s, 0, 0, 0};
-                // a column is one vector's low half: the full 256-byte store would cross into the next column
-                v_u8_st_tnsr_partial(oc, out, v_u8_ld_tnsr_b(ic, in), 127, 0);
+                int5 ic = {0, 2 * c, 0, 0, 0};
+                int5 oc = {0, 2 * c + C * s, 0, 0, 0};
+                v_u8_st_tnsr(oc, out, v_u8_ld_tnsr_b(ic, in));
             }
 }
