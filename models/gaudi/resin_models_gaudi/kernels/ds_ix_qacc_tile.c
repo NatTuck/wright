@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright Aaron Botsis
-// ds_ix_qacc over a SHARED score slab: the tiled index chain's prefill accumulator for a tile whose keys were
-// gathered, dequantized and scored ONCE for all of the step's slots.
+// ds_ix_qacc_o_f32 over a tile whose keys were gathered and dequantized ONCE for all of its slots.
 //
-// ds_ix_qacc reads S (C, NH*Q, S): one slab per slot. Every slot of a tile scores the same keys, so the S axis
-// was 16 identical planes. Here S is (C, NH*T) -- the whole chunk's columns at once, the layout ix_q8 already
-// has -- and the per-slot part is exactly what was always per-slot: ``lim = min(seen, klen)`` (the block's
-// visibility, writing -inf past it), the block's columns ``col = qtok0 + t``, and the per-head weights, which
-// are indexed by the global column.
+// Identical to ds_ix_qacc_o_f32 -- same per-slot score slab S (C, NH*Q, S), same columns, same lim mask,
+// same per-head weights -- except that `sk` is (C,): the shared gather publishes one scale per key because
+// the scale is a property of the key, not of the slot that reads it. That keeps the accumulator's read
+// pattern exactly as it was; the saving is upstream, in the 16x gather and dequant.
 //
-// score = sk[i] * sum_h w[h, col] * scale * qsc[h + NH*col] * relu(S[i, h + NH*col])   if key0 + i < lim
-// score = -inf                                                                        otherwise
-//
-// slots (8, S) i32 per slot: [group, qcol0, qpos0, key0, klen, qtok0, ratio, 0] (group -1: padding)
 // guid: rg_ds_ix_qacc_tile_f32 (the glue derives it as rg_<file stem>_f32).
-// tensors: 0 S (C, NH * T) bf16  1 w (NH, T) f32  2 slots  3 qsc (NH T,) f32  4 sk (C,) f32
+// tensors: 0 S (C, NH*Q, S) bf16  1 w (NH, T) f32  2 slots  3 sq (NH Q, S) f32  4 sk (C,) f32
 //        | 5 sink (64, 1) i32  6 score (K, T) f32
-// params: scale. index space: [C / 1024, Q / 8, S]; member (0, 0, 0) writes the sink. NH = 32.
+// params: scale. index space: [C/1024, Q/8, S]. NH = 32.
 #include "common.h"
 
 #define NINF (-3.0e38f)
@@ -24,7 +18,11 @@
 #define TQ 8
 #define NB 16
 
-void main(tensor S, tensor w, tensor slots, tensor qsc, tensor sk, tensor sink, tensor score, float scale)
+#ifdef SCORE_OUT
+void main(tensor S, tensor w, tensor slots, tensor sq, tensor sk, tensor sink, tensor score, float scale)
+#else
+void main(tensor S, tensor w, tensor slots, tensor score, tensor sq, tensor sk, tensor sink, float scale)
+#endif
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
@@ -55,27 +53,29 @@ void main(tensor S, tensor w, tensor slots, tensor qsc, tensor sk, tensor sink, 
                     #pragma unroll
                     for (int h = 0; h < NH; h++) {
                         int5 wc = {h, col, 0, 0, 0};
-                        int5 qc = {h + NH * col, 0, 0, 0, 0};
-                        wt[h] = s_f32_ld_g(gen_addr(wc, w)) * scale * s_f32_ld_g(gen_addr(qc, qsc));
+                        int5 qc = {h + NH * t, s, 0, 0, 0};
+                        wt[h] = s_f32_ld_g(gen_addr(wc, w)) * scale * s_f32_ld_g(gen_addr(qc, sq));
                     }
                     #pragma unroll 1
-                    for (int j = 0; j < NB; j += 2) {
+                    for (int j = 0; j < NB; j += 2) {  // two vectors of keys per bf16 read
                         const int b = NB * g + j;
-                        float64 a0 = 0.0f, a1 = 0.0f, c0 = 0.0f, c1 = 0.0f;
-                        int5 sc = {64 * b, NH * col, 0, 0, 0};
+                        float64 a0 = 0.0f, a1 = 0.0f, c0 = 0.0f, c1 = 0.0f;  // even and odd heads, keys b | b + 1
+                        int5 sc = {64 * b, NH * t, s, 0, 0};
                         #pragma unroll
                         for (int h = 0; h < NH; h += 2) {
-                            sc[1] = h + NH * col;
+                            sc[1] = h + NH * t;
                             float128 x = convert_bfloat128_to_float128(v_bf16_ld_tnsr_b(sc, S), SW_LINEAR);
                             a0 = v_f32_mac_b(v_f32_max_b(x.v1, 0.0f), wt[h], a0);
                             c0 = v_f32_mac_b(v_f32_max_b(x.v2, 0.0f), wt[h], c0);
-                            sc[1] = h + 1 + NH * col;
+                            sc[1] = h + 1 + NH * t;
                             x = convert_bfloat128_to_float128(v_bf16_ld_tnsr_b(sc, S), SW_LINEAR);
                             a1 = v_f32_mac_b(v_f32_max_b(x.v1, 0.0f), wt[h + 1], a1);
                             c1 = v_f32_mac_b(v_f32_max_b(x.v2, 0.0f), wt[h + 1], c1);
                         }
                         #pragma unroll
                         for (int u = 0; u < 2; u++) {
+                            // the shared gather publishes ONE scale per key (it is per-key, identical across
+                            // slots), so the slot axis is not indexed here
                             int5 kc = {64 * (b + u), 0, 0, 0, 0};
                             const float64 acc = (u ? c0 + c1 : a0 + a1) * v_f32_ld_tnsr_b(kc, sk);
                             const float64 key = lanef + (float)(key0 + 64 * (b + u));

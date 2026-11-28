@@ -225,12 +225,6 @@ static bool geom_ix_gather_f4(const HabanaKernelParams* p, uint64_t is[5], uint3
 static bool geom_ix_gather_tile(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     return geom_ix_gather_f4(p, is, rank);
 }
-// ds_ix_qacc_tile: 1024 keys of 8 query tokens per member, over ONE shared (C, NH*T) score slab, so the slot
-// count comes from the slots tensor (input 2) rather than from the slab's third dim
-static bool geom_ix_qacc_tile(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
-    is[0] = sz(p, false, 0, 0) / 1024; is[1] = sz(p, false, 0, 1) / (32 * 8); is[2] = sz(p, false, 2, 1);
-    *rank = 3; return true;
-}
 // ds_mk_add: 64 vocabulary entries of one rank's slice for one row per member
 static bool geom_mk_add(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, false, 0, 0) + 63) / 64; is[1] = sz(p, true, 0, 1); is[2] = sz(p, false, 0, 2); *rank = 3; return true;
@@ -264,6 +258,10 @@ static bool geom_columns(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_ix_qacc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = sz(p, false, 0, 0) / 1024; is[1] = sz(p, false, 0, 1) / (32 * 8); is[2] = sz(p, false, 0, 2); *rank = 3;
     return true;
+}
+// ds_ix_qacc_tile: the same per-slot slab and index space as ds_ix_qacc (only its sk input is (C,))
+static bool geom_ix_qacc_tile(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    return geom_ix_qacc(p, is, rank);
 }
 // ix_slot_acc
 static bool geom_ix_slot_acc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {

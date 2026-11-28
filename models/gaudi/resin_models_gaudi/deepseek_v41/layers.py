@@ -1409,12 +1409,20 @@ def index_chain_graph(
                 # the same packing view the per-slot path takes: the (2*DIM, C/2) fp8 slab IS the (DIM, C)
                 # key operand, two keys interleaved per row
                 ksv = lg.view(ksf, (INDEX_DIM, C))
-                lg.node("batch_gemm", [q8, ksv], [scf], GEMM_NT)
-                if stop == "gemm":  # + the one flat GEMM (everything but the accumulator)
+                # Variant B: ONE dequant, and the per-slot GEMM and accumulator keep their original shapes and
+                # read patterns. The key slab is one tile for every slot, so it is handed to the batched GEMM
+                # with a batch of 1 -- the score slab stays (C, M, Sp), a slot's plane contiguous, which is the
+                # pattern the accumulator was written for (the flat (C, W) slab made it read one element per
+                # line, and that cost more than the 16x gather it bought).
+                ks1 = lg.view(ksv, (INDEX_DIM, C, 1))
+                nq = lg.g.node("rg_ix_slot_q8_f32", [q8, qsc, table], [qs, sq])
+                first_nodes.append(nq)
+                lg.node("batch_gemm", [qs, ks1], [sc], GEMM_NT)
+                if stop == "gemm":  # + the GEMM (everything but the accumulator)
                     continue
                 lg.node(
                     "rg_ds_ix_qacc_tile_f32",
-                    [scf, w, table, qsc, kf],
+                    [sc, w, table, qsc, kf],
                     [sink, tile],
                     struct.pack("f", INDEX_SCALE),
                 )
