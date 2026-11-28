@@ -75,7 +75,9 @@ def _branch_source(rel: str) -> str:
         text=True,
     )
     if proc.returncode != 0:
-        pytest.skip(f"origin/four-card-ds:{rel} unavailable: {proc.stderr.strip()}")
+        raise pytest.skip.Exception(
+            f"origin/four-card-ds:{rel} unavailable: {proc.stderr.strip()}"
+        )
     return proc.stdout
 
 

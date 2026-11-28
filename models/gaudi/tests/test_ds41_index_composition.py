@@ -510,10 +510,11 @@ def test_prefill_compressed_span(device, recipes, seed):
 
     print(f"\n=== prefill compressed span T={T} seed={seed} ===")
     ar = got["arena"]
-    from test_ds41_fp4_kv import _decode_latent, _decode_index
+    from test_ds41_fp4_kv import _decode_index, _decode_latent
     lat_ok, ix_ok = True, True
     for g in range(T // 2):
-        lat0 = int(cmp_store[g, 0]); e = int(cmp_store[g, 1])
+        lat0 = int(cmp_store[g, 0])
+        e = int(cmp_store[g, 1])
         gotlat = _decode_latent(ar, lat0, e)
         rl = _report(f"latent{g}", gotlat, latd[g])
         lat_ok &= rl < 2e-3

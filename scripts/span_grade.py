@@ -22,11 +22,12 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.span_floors import TPC_BYTES_PER_S, derivation, floor  # noqa: E402
+from scripts.span_floors import derivation, floor  # noqa: E402
 from scripts.trace_union import device_intervals, rows  # noqa: E402
 
 # What a launch's nodes say about which recipe it was. Order matters: the first marker that matches names it.
@@ -36,6 +37,20 @@ MARKERS = (
     ("ds41_ffn_paged", ("rg_moe_asg", "rg_moe_pages", "rg_ds_xact_lin", "rg_ds_xcomb")),
     ("ds41_attn_out_wo", ("rg_ds_xact_lin",)),
 )
+
+
+@dataclass
+class GradeRow:
+    """One family's graded line: measured device time against its declared byte floor."""
+
+    family: str
+    launches: int
+    device_ms: float
+    moved_bytes: float
+    floor_ms: float
+    ratio: float
+    gbs: float
+    derivation: str
 
 
 def classify(nodes: set[str]) -> str | None:
@@ -96,26 +111,26 @@ def main() -> None:
         moved = per_launch * entry["launches"]
         floor_us = moved / rate * 1e6
         table.append(
-            {
-                "family": family,
-                "launches": entry["launches"],
-                "device_ms": entry["us"] / 1e3,
-                "bytes": moved,
-                "floor_ms": floor_us / 1e3,
-                "ratio": entry["us"] / floor_us if floor_us else None,
-                "gbs": moved / (entry["us"] * 1e-6) / 1e9 if entry["us"] else None,
-                "derivation": derivation(f"{family}_T2048"),
-            }
+            GradeRow(
+                family=family,
+                launches=entry["launches"],
+                device_ms=entry["us"] / 1e3,
+                moved_bytes=moved,
+                floor_ms=floor_us / 1e3,
+                ratio=entry["us"] / floor_us if floor_us else 0.0,
+                gbs=moved / (entry["us"] * 1e-6) / 1e9 if entry["us"] else 0.0,
+                derivation=derivation(f"{family}_T2048"),
+            )
         )
-    table.sort(key=lambda r: -(r["ratio"] or 0))
+    table.sort(key=lambda r: -r.ratio)
 
     print(f"\n{'ratio':>8} {'device ms':>10} {'floor ms':>9} {'GB/s':>8} {'launches':>9}  family")
     for r in table[: args.top]:
         print(
-            f"{r['ratio']:8.1f} {r['device_ms']:10.1f} {r['floor_ms']:9.2f} {r['gbs']:8.1f} "
-            f"{r['launches']:9d}  {r['family']}"
+            f"{r.ratio:8.1f} {r.device_ms:10.1f} {r.floor_ms:9.2f} {r.gbs:8.1f} "
+            f"{r.launches:9d}  {r.family}"
         )
-    graded_us = sum(r["device_ms"] * 1e3 for r in table)
+    graded_us = sum(r.device_ms * 1e3 for r in table)
     total_us = sum(dur for _, dur in launches)
     print(
         f"\nclassified {len(launches) - unknown}/{len(launches)} launches "

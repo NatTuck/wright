@@ -1090,7 +1090,7 @@ pub fn engram_gather_into(
     out: &mut [f32],
 ) -> Result<(), String> {
     let rows = weight.len() / 256;
-    if weight.len() % 256 != 0 || scale.len() != rows * 8 {
+    if !weight.len().is_multiple_of(256) || scale.len() != rows * 8 {
         return Err("host Engram table is not (rows, 256) codes + (rows, 8) scales".into());
     }
     if out.len() != ids.len() * 256 {
@@ -1963,8 +1963,10 @@ mod tests {
                         engram_gather_host(&engram, &tables, &mut w, &ids, &[ht], t).unwrap();
                     }
                     let got: Vec<u32> = buf
-                        .chunks_exact(4)
-                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| u32::from_le_bytes(*b))
                         .collect();
                     let want = ref_gather(&weight, &scale, &ids, t, layers, width, 0);
                     assert_eq!(got, want, "seed {seed}, t {t}, variant {variant}");
@@ -2083,8 +2085,10 @@ mod tests {
     }
 
     fn buf_words(buf: &[u8]) -> Vec<u32> {
-        buf.chunks_exact(4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        buf.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect()
     }
 

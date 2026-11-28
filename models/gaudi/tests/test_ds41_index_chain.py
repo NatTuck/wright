@@ -7,7 +7,9 @@ b7f405c tiled-merge gate uses), on the SAME arena/queries/weights. RED control: 
 the selection. Covers the in-place merge-buffer write (section_rmw) and the cross-tile running set.
 """
 from __future__ import annotations
-import os, struct
+
+import os
+
 import numpy as np
 import pytest
 
@@ -42,7 +44,7 @@ def _malloc_upload(device, a):
 def test_unrolled_chain_matches_full(device, recipes, B):
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.synapse.graph import Graph
-    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8, BF16
+    from resin_models_gaudi.synapse.runtime import F32, I32, U8
 
     d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
                experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
@@ -53,7 +55,7 @@ def test_unrolled_chain_matches_full(device, recipes, B):
     KT = B * C                      # total scored keys
     ID, IH = L.INDEX_DIM, L.INDEX_HEADS
     W = IH * T
-    PR, NB, PAIR, CMP = 1024, 16, 97, 0
+    PR, NB, PAIR, _CMP = 1024, 16, 97, 0
     pages = KT // 128
     # per-column visible counts: everything, most, a middle amount, non-multiples of 64
     pattern = np.array([KT, 5000, 900, 700, 3000, 1500, KT - 1, 4096], np.int32)
@@ -95,7 +97,8 @@ def test_unrolled_chain_matches_full(device, recipes, B):
     rs = recipes.compile(gstore)
     for n in rs.persistent:
         rs.bind(n, store_addr[n])
-    rs.launch(); device.sync()
+    rs.launch()
+    device.sync()
     arena = device.d2h(store_addr["arena"], (NB, PR, 512), np.uint8)
     for a in store_addr.values():
         device.free(a)
@@ -138,7 +141,8 @@ def test_unrolled_chain_matches_full(device, recipes, B):
         rec = recipes.compile(g)
         for n in rec.persistent:
             rec.bind(n, bind[n])
-        rec.launch(); device.sync()
+        rec.launch()
+        device.sync()
         return rec
 
     try:
@@ -260,7 +264,8 @@ def test_unrolled_chain_matches_full(device, recipes, B):
                 _best = 1e18
                 for _ in range(7):  # min of 7: the launch is short, so a single sample is mostly noise
                     _t0 = _t.perf_counter_ns()
-                    _rec.launch(); device.sync()
+                    _rec.launch()
+                    device.sync()
                     _best = min(_best, _t.perf_counter_ns() - _t0)
                 print(f"BREAKDOWN stop={_stop}: {_best / 1e3:.1f} us", flush=True)
                 _g.destroy()
@@ -279,7 +284,7 @@ def test_chain_carry_matches_full(device, recipes, G):
     mechanism: ceil(B/G) launches, O(1) host metadata, no (kmax, T) array."""
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.synapse.graph import Graph
-    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+    from resin_models_gaudi.synapse.runtime import F32, I32, U8
 
     d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
                experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
@@ -322,7 +327,8 @@ def test_chain_carry_matches_full(device, recipes, G):
     rs = recipes.compile(gstore)
     for n in rs.persistent:
         rs.bind(n, sa[n])
-    rs.launch(); device.sync()
+    rs.launch()
+    device.sync()
     arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
     for a in sa.values():
         device.free(a)
@@ -355,7 +361,8 @@ def test_chain_carry_matches_full(device, recipes, G):
         rc = recipes.compile(g)
         for n in rc.persistent:
             rc.bind(n, bind[n])
-        rc.launch(); device.sync()
+        rc.launch()
+        device.sync()
 
     try:
         launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
@@ -403,7 +410,7 @@ def test_chain_padded_stride_small_decode(device, recipes, T):
     == one-pass full selection."""
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.synapse.graph import Graph
-    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+    from resin_models_gaudi.synapse.runtime import F32, I32, U8
 
     d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
                experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
@@ -445,7 +452,8 @@ def test_chain_padded_stride_small_decode(device, recipes, T):
     rs = recipes.compile(gstore)
     for n in rs.persistent:
         rs.bind(n, sa[n])
-    rs.launch(); device.sync()
+    rs.launch()
+    device.sync()
     arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
     for a in sa.values():
         device.free(a)
@@ -480,7 +488,8 @@ def test_chain_padded_stride_small_decode(device, recipes, T):
         rc = recipes.compile(g)
         for n in rc.persistent:
             rc.bind(n, bind[n])
-        rc.launch(); device.sync()
+        rc.launch()
+        device.sync()
 
     try:
         launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
@@ -520,7 +529,7 @@ def test_chain_running_blocks_matches_full(device, recipes):
     (kb,T) cand_bmax published). Its cand_list/cand_slots == ixbl over the full block maxima, bit-exact."""
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.synapse.graph import Graph
-    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+    from resin_models_gaudi.synapse.runtime import F32, I32, U8
 
     d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
                experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
@@ -565,7 +574,8 @@ def test_chain_running_blocks_matches_full(device, recipes):
     rs = recipes.compile(gstore)
     for n in rs.persistent:
         rs.bind(n, sa[n])
-    rs.launch(); device.sync()
+    rs.launch()
+    device.sync()
     arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
     for a in sa.values():
         device.free(a)
@@ -614,7 +624,8 @@ def test_chain_running_blocks_matches_full(device, recipes):
         rc = recipes.compile(g)
         for n in rc.persistent:
             rc.bind(n, bind[n])
-        rc.launch(); device.sync()
+        rc.launch()
+        device.sync()
 
     try:
         launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
@@ -653,7 +664,7 @@ def test_chain_running_blocks_matches_full(device, recipes):
             assert got_cl[c, :n].tolist() == want_cl[c, :n].tolist(), (
                 "blocks", c, "setdiff", sorted(set(got_cl[c, :n].tolist()) ^ set(want_cl[c, :n].tolist()))[:20],
                 "order_only", sorted(got_cl[c, :n].tolist()) == sorted(want_cl[c, :n].tolist()))
-            nk = int(want_cs[c, 4])  # key list check below uses full selection
+            int(want_cs[c, 4])  # key list check below uses full selection
         for c in range(T):
             n = min(int(vis[c]), run)
             assert got_lst[c, :n].tolist() == want_lst[c, :n].tolist(), ("keys", c)
@@ -672,7 +683,7 @@ def test_chain_bmax_mask_matches_full(device, recipes):
     cand_list/cand_slots (no full cand_bmax) and == one-pass selection over the scores masked to those blocks."""
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.synapse.graph import Graph
-    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+    from resin_models_gaudi.synapse.runtime import F32, I32, U8
 
     d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
                experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
@@ -716,7 +727,8 @@ def test_chain_bmax_mask_matches_full(device, recipes):
     rs = recipes.compile(gstore)
     for n in rs.persistent:
         rs.bind(n, sa[n])
-    rs.launch(); device.sync()
+    rs.launch()
+    device.sync()
     arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
     for a in sa.values():
         device.free(a)
@@ -761,7 +773,8 @@ def test_chain_bmax_mask_matches_full(device, recipes):
         rc = recipes.compile(g)
         for n in rc.persistent:
             rc.bind(n, bind[n])
-        rc.launch(); device.sync()
+        rc.launch()
+        device.sync()
 
     try:
         launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
@@ -850,7 +863,7 @@ def test_unrolled_chain_prefill(device, recipes, B):
     """Prefill query-block slots (qb=8, parts=2, ds_ix_qacc_o): the chain == one-pass full selection."""
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.synapse.graph import Graph
-    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+    from resin_models_gaudi.synapse.runtime import F32, I32, U8
 
     d = L.Dims(hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
                experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
@@ -860,7 +873,7 @@ def test_unrolled_chain_prefill(device, recipes, B):
     nblk = T // qb
     S, P = nblk, 1
     Sp = S // P
-    K = run + C
+    run + C
     KT = B * C
     ID, IH = L.INDEX_DIM, L.INDEX_HEADS
     W = IH * T
@@ -896,7 +909,8 @@ def test_unrolled_chain_prefill(device, recipes, B):
     rs = recipes.compile(gstore)
     for n in rs.persistent:
         rs.bind(n, sa[n])
-    rs.launch(); device.sync()
+    rs.launch()
+    device.sync()
     arena = device.d2h(sa["arena"], (NB, PR, 512), np.uint8)
     for a in sa.values():
         device.free(a)
@@ -930,7 +944,8 @@ def test_unrolled_chain_prefill(device, recipes, B):
         rc = recipes.compile(g)
         for n in rc.persistent:
             rc.bind(n, bind[n])
-        rc.launch(); device.sync()
+        rc.launch()
+        device.sync()
 
     try:
         launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})

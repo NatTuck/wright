@@ -283,6 +283,11 @@ struct PrefetchSpec {
 
 /// The next prefill chunk's position-only tables (zero, meta, rope), written ahead into the host copy
 /// that chunk's fill will take (`fill_prep`), so its `fill` skips them. Keyed (sequence, pos0, n, t).
+///
+/// Not yet wired to a caller: `RESIN_DS41_PREP` scaffolding, landed inert so the `fill`/`fill_prep` split is
+/// in place for the next prefill step. Upstream CI runs `clippy -D warnings`, so the dead code is allowed
+/// here by name rather than left to fail the build; remove this attribute when `launch_prep` is called.
+#[allow(dead_code)]
 struct PrepFill {
     k: usize,
     sequence: u64,
@@ -324,8 +329,10 @@ pub(crate) struct Ds41Executor {
     eg_ring: Vec<u32>,
     eg_prefetch_on: bool,
     /// the next prefill chunk's prepared position tables (`fill_prep`), in flight into its host copy
-    /// (`RESIN_DS41_PREP=1` enables)
+    /// (`RESIN_DS41_PREP=1` enables). Inert until wired; see `PrepFill`.
+    #[allow(dead_code)]
     pf_prep: Option<PrepFill>,
+    #[allow(dead_code)]
     pf_prep_on: bool,
     context: Py<Ds41Context>,
     shapes: HashMap<(usize, bool), Shaped>,
@@ -765,6 +772,7 @@ impl Ds41Executor {
     /// host copy `k` -- the copy that chunk's fill will take -- so its `fill` skips them
     /// (`fill_prepped`). The copy's last upload is waited for here (it is the full-chunk pass of the chunk
     /// before last, done long ago), never by the worker: the worker only touches host memory.
+    #[allow(dead_code)] // inert RESIN_DS41_PREP scaffolding; see `PrepFill`
     fn launch_prep(
         &mut self,
         py: Python<'_>,
@@ -819,6 +827,7 @@ impl Ds41Executor {
     /// Take the prepared tables of this step when they are its own (same sequence, pos0, n and bucket):
     /// joins the worker; the step's `fill` then skips the prepared sections (into the same copy `k`).
     /// Any other slot is joined and dropped (the chunking changed): the step fills inline.
+    #[allow(dead_code)] // inert RESIN_DS41_PREP scaffolding; see `PrepFill`
     fn take_prep(&mut self, sequence: u64, pos0: i64, n: usize, t: usize) -> PyResult<Option<usize>> {
         let prep = match self.pf_prep.take() {
             Some(prep) => prep,

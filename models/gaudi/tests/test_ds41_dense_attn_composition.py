@@ -134,6 +134,7 @@ def test_dense_compressed_attention(device, recipes):
     # known compressed latents, stored as true fp4 codes + e4m3 group scales (ds_store_f4 layout):
     # page p (128 entries) at latent base row p*97 (latent 80 rows + index 17 rows = PAIR_ROWS).
     from test_ds41_fp4_kv import fp4_ref
+
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import F32, I32, U8
 

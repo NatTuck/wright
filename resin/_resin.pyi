@@ -1,8 +1,17 @@
+import os
 from _typeshed import Incomplete
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from os import PathLike
 from pathlib import Path
-from typing import Any, Final, final
+from typing import Any, Final, Literal, final
+import numpy as np
+import numpy.typing as npt
+from resin.protocols import (
+    ContentBlock,
+    MediaInput,
+    Recipe,
+    Runner,
+)
 __version__: Final[str]
 
 @final
@@ -2154,7 +2163,7 @@ class _NativeResponseParser:
     Common native handle recognized directly by the HTTP actor.
     """
     def feed(self, /, token_ids: "Sequence[int] | npt.NDArray[np.uint32]") -> list[ParserEvent]: ...
-    def finish(self, /, reason: "Literal[\"stop\", \"length\"]") -> list[ParserEvent]: ...
+    def finish(self, /, reason: "Literal['stop', 'length']") -> list[ParserEvent]: ...
 
 @final
 class _ReplicaRouter:

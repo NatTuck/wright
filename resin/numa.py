@@ -198,6 +198,9 @@ def bind(
             yield Binding(device=device, node=node, reason=reason)
             return
         if previous_policy is not None:
+            # `node` is narrowed by the guard above, but the type checker loses that across the try/except
+            # (and across the generator's yield), so restate it here.
+            assert node is not None
             try:
                 _numa_set_policy(_MEMORY_MODES[memory], [node])
                 policy_changed = True
@@ -217,7 +220,7 @@ def bind(
         # failures must surface: continuing with a silently changed parent policy
         # would place subsequent ranks incorrectly.
         try:
-            if policy_changed:
+            if policy_changed and previous_policy is not None:
                 _numa_set_policy(*previous_policy)
         finally:
             if affinity_changed:

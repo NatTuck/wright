@@ -217,7 +217,7 @@ def test_tile_stream_vs_official(device, recipes):
     # debug: download the DEVICE-dequanted window + listed keys (the dequant is independently fp4-gated, so
     # this is ground truth for the recurrence gate, not circular). Oracle keys = exact device gather output.
     from resin_models_gaudi.synapse.graph import Graph
-    from resin_models_gaudi.synapse.runtime import BF16, U8, I32, F32
+    from resin_models_gaudi.synapse.runtime import BF16, F32, I32, U8
     g_kdbg = Graph(device, "kdbg")
     _arena = g_kdbg.input("arena", (512, PR, 1), U8)
     _dep = g_kdbg.input("dep", (64,), F32)
@@ -434,7 +434,8 @@ def test_tile_stream_vs_official(device, recipes):
     print(f"  DBG ix_lslots[:,4] (count) [0,1,63,127]={_lslots[[0,1,63,127],4].tolist()} vis={vis[[0,1,63,127]].tolist()} ixl_norm={np.linalg.norm(ixl):.4e}")
     print(f"  DBG q_all(device) norm={np.linalg.norm(_qall):.4e} q16_ref norm={np.linalg.norm(q16_ref):.4e} rel(q_all,q16_ref)={rel(_qall, q16_ref):.4e}")
     # window-only oracle (listed masked) to test whether the device gathered listed keys
-    topk_w = topk.copy(); topk_w[:, 128:] = -1
+    topk_w = topk.copy()
+    topk_w[:, 128:] = -1
     o_w = _official_attn(q16, kv_b, sink, topk_w, scale, np.float64)
     o_w_inv = inv(o_w)
     print(f"  DBG window-only oracle norm={np.linalg.norm(o_w_inv):.4e} rel(od,win_only)={rel(od,o_w_inv):.4e}")
@@ -461,7 +462,6 @@ def test_tile_stream_working_set_bounded(device, recipes):
     """The bounded tile recipe's compile workspace is ~21-31 MiB vs the full-T listed attention_out_graph
     (~1.3 GiB) at T=2048: the query-tile x key-block stream never materializes the (D,512,T) gathered slab."""
     from resin.models.deepseek_v41 import DeepSeekV41Config
-
     from resin_models_gaudi.deepseek_v41 import layers as L
 
     cfg = DeepSeekV41Config.from_hugging_face(json.load(open(os.path.join(CKPT, "config.json"))))

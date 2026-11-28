@@ -104,7 +104,7 @@ def _cs_row(pos, freqs):
 
 
 def test_compressor_store_matches_numpy(device, recipes):
-    from test_ds41_kernels import Run, fp8_byte, fp8_value, pow2_scale
+    from test_ds41_kernels import Run
 
     from resin_models_gaudi.deepseek_v41 import layers as L
     from resin_models_gaudi.loading.convert import bf16_rne
@@ -177,11 +177,12 @@ def test_compressor_store_matches_numpy(device, recipes):
         rr = 1.0 / np.sqrt((lat[gg] ** 2).mean() + eps)
         latn[gg] = lat[gg] * rr * cmp_norm
     print("\n=== compressor store (fp4 code+scale) ===")
-    from test_ds41_fp4_kv import _decode_latent, _decode_index
+    from test_ds41_fp4_kv import _decode_index, _decode_latent
     # stored latents: fp4 codes + e4m3 scales; value = fp4_ref(rope(latn), mode 1)
     for gg in range(G):
         want = _fq4(_rope_swap(latn[gg], cs_g[:, gg]), 1)
-        lat0 = int(cmp_store[0, gg]); e = int(cmp_store[1, gg])
+        lat0 = int(cmp_store[0, gg])
+        e = int(cmp_store[1, gg])
         gotlat = _decode_latent(ar, lat0, e)
         rl = _report(f"latent{gg}", gotlat, want)
         assert rl < 2e-3, f"latent{gg} diverges {rl:.3e}"
@@ -193,8 +194,9 @@ def test_compressor_store_matches_numpy(device, recipes):
         rr = 1.0 / np.sqrt((k.astype(np.float64) ** 2).mean() + eps)
         kn = k * rr * ix_knorm
         want = _fq4(_rope_swap(kn, cs_g[:, gg]), 0)
-        lat0 = int(cmp_store[0, gg]); e = int(cmp_store[1, gg])
-        ix0 = lat0 + 80
+        lat0 = int(cmp_store[0, gg])
+        e = int(cmp_store[1, gg])
+        lat0 + 80
         gotix = _decode_index(ar, lat0, e)
         ri = _report(f"index{gg}", gotix, want)
         assert ri < 2e-3, f"index{gg} diverges {ri:.3e}"

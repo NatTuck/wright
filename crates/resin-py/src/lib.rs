@@ -2296,6 +2296,9 @@ mod tests {
             prefill_lengths: vec![2],
             token_ids: vec![1, 2],
             token_indptr: vec![0, 2],
+            // a single-row prefill carries its whole prompt: the runner's cross-chunk Engram prefetch reads
+            // the next chunk's tokens from it
+            prefill_prompt: vec![1, 2],
             phase: BatchPhase::Prefill,
             batch_id: 1,
             batch_key: None,

@@ -14,7 +14,6 @@ fail if the one-call form stops agreeing with the two-half form.
 from __future__ import annotations
 
 import shutil
-import struct
 from pathlib import Path
 
 import numpy as np
@@ -93,7 +92,7 @@ def slot_product(device, recipes, which, H, w, E, R, T, n, *, act=None, weights=
     """One ``_halves`` of ``which`` with ``n`` parts of dtype ``dt`` (F32 by default), launched on ``act``
     against ``weights``."""
     from resin_models_gaudi.deepseek_v41 import layers as L
-    from resin_models_gaudi.synapse.runtime import F8, F32, I32
+    from resin_models_gaudi.synapse.runtime import F8, I32
 
     size_of, whole_of, half_of = CASES[which]
     part = whole_of(H, w) if n == 1 else half_of(H, w)

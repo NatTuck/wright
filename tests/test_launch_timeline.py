@@ -9,7 +9,6 @@ gap gate is RED-provable: widen the hole and the reported gap must widen with it
 from __future__ import annotations
 
 import json
-import struct
 
 import pytest
 
@@ -117,16 +116,19 @@ def test_a_window_reports_host_elapsed_and_its_device_floor(tmp_path, capsys):
 def test_span_floors_declare_a_regime_and_a_derivation():
     """Every floor entry must say which resource binds it and where its number comes from; a family with no
     formula must say so instead of silently reporting zero."""
-    from scripts.span_floors import FLOORS, derivation, floor, family
+    from scripts.span_floors import FLOORS, derivation, family, floor
 
     for name, entry in FLOORS.items():
         assert entry.regime in ("tpc", "dma", "flops"), name
         assert entry.derivation, name
-    moved, regime, rate = floor("ds41_ffn_paged_T2048")
+    declared = floor("ds41_ffn_paged_T2048")
+    assert declared is not None, "the MoE floor must be declared"
+    moved, regime, rate = declared
     assert regime == "dma" and rate > 0
     assert moved == pytest.approx(384 * 3 * 5120 * 2304 * 0.5 / 4)
     # the MoE floor does not depend on T above one row per expert
-    assert floor("ds41_ffn_paged_T512")[0] == moved
+    t512 = floor("ds41_ffn_paged_T512")
+    assert t512 is not None and t512[0] == moved
     assert floor("ds41_attn_win_T2048_S16_C384_Q128") is None
     assert "UNKNOWN" in derivation("ds41_attn_win_T2048")
     assert family("ds41_attn_out_tile_T512_Q128") == "ds41_attn_out_tile"
@@ -148,7 +150,9 @@ def test_the_attention_tile_floor_is_dominated_by_its_f32_state():
     those two terms must dominate, because that is the traffic worth removing."""
     from scripts.span_floors import ATTN_BLOCKS, floor
 
-    moved, regime, rate = floor("ds41_attn_out_tile_T512_Q128_B64_A27588")
+    declared = floor("ds41_attn_out_tile_T512_Q128_B64_A27588")
+    assert declared is not None, "the attention tile floor must be declared"
+    moved, regime, rate = declared
     assert regime == "tpc"
     state = ATTN_BLOCKS * (2 * 512 * 64 * 128 * 4 + 2 * 512 * 64 * 128 * 4)  # pv + acc_o, per block
     assert state / moved > 0.6

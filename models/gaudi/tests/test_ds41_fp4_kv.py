@@ -106,7 +106,7 @@ def _fp8_roundtrip(device, recipes, x):
     """The CURRENT production compress-latent store+gather: fq4(mode 1) -> mla_store_i8 (FP8 + pow2
     token scale) -> ds_gather_list (FP8 -> bf16).  Returns the gathered bf16 bits (T, C, 512)."""
     from resin_models_gaudi.synapse.graph import Graph
-    from resin_models_gaudi.synapse.runtime import BF16, F32, I32, U8
+    from resin_models_gaudi.synapse.runtime import F32, I32, U8
 
     T = x.shape[0]
     PR, NB, B = 256, 8, 200  # latent page base row
@@ -308,9 +308,10 @@ def _index_gather_dequant(device, recipes, ix, T, C):
     """The production indexer fp4 path: ds_store_f4 (index codes+e8m0) -> ds_ix_gather_f4 (codes, scales,
     per-key sk=2^k, ktab=k, ids) -> mx4_decs (per-row k, fp4->fp8 NORMALIZED).  Returns (fp8 value (C,128),
     sk (C,)).  The effective key value is fp8_value(dec) * sk."""
+    from test_ds41_kernels import fp8_value
+
     from resin_models_gaudi.synapse.graph import Graph
     from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
-    from test_ds41_kernels import fp8_value
 
     PR, NB, B = 256, 8, 200
     g = Graph(device, "t_fp4ix")

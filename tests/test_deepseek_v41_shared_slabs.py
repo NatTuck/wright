@@ -14,17 +14,21 @@ QWEN_9B_SLAB = 106_496  # rows of a Qwen3.5-9B slab
 
 
 def test_own_slabs_hold_one_window_block():
-    assert OWN.window_block_rows == 5248 and OWN.history_block_rows == 896
+    # history_block_rows is sum(PAIR_ROWS * owner_pages) rounded up to BLOCK_UNIT. PAIR_ROWS is
+    # CMP_PAGE_ROWS (80: 64 fp4 code rows + 16 scale rows) + INDEX_ROWS (17: 16 fp4 code rows + 1 e8m0
+    # scale row) = 97, against the fp8 geometry's 129 + 33 = 162 -- the KV cache is fp4, so a page is
+    # 65 rows shorter and the same owners fit more blocks in a slab (10 history blocks, not 5).
+    assert OWN.window_block_rows == 5248 and OWN.history_block_rows == 512
     assert OWN.slab_rows == OWN.own_slab_rows == 5248
     window, history = OWN.layout(10).groups
-    assert (window.blocks_per_slab, history.blocks_per_slab) == (1, 5)
+    assert (window.blocks_per_slab, history.blocks_per_slab) == (1, 10)
 
 
 def test_a_shared_slab_holds_as_many_blocks_as_fit():
     shared = OWN.with_slab_rows(QWEN_9B_SLAB)
     assert shared.slab_rows == QWEN_9B_SLAB and shared.own_slab_rows == 5248
     window, history = shared.layout(10).groups
-    assert (window.blocks_per_slab, history.blocks_per_slab) == (20, 118)
+    assert (window.blocks_per_slab, history.blocks_per_slab) == (20, 208)
     assert shared.arena_blocks(10) == 11 * QWEN_9B_SLAB // ARENA_BLOCK_ROWS
     assert shared.window_blocks(10) == 11 * 20
     assert shared.state_bytes(10) == OWN.state_bytes(10) * 20

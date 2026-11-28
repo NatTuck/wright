@@ -17,7 +17,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from resin_models_gaudi.deepseek_v41.cache import CMP_PAGE_ROWS, PAGE_ROWS
+from resin_models_gaudi.deepseek_v41.cache import CMP_PAGE_ROWS
 from resin_models_gaudi.glm5_3_flash.layers import GEMM_NN, GEMM_NT
 from resin_models_gaudi.glm5_3_flash.layers import LayerGraph as GlmLayerGraph
 from resin_models_gaudi.glm5_3_flash.weights import NS
@@ -2002,7 +2002,7 @@ def attention_out_tile_graph(
         lg.node("batch_gemm", [P, ks_blk], [pv], GEMM_NN)
         prev = lg.g.node("rg_ds_attn_acc_f32", [acc_o[blk], sscale, pv], [acc_o[blk + 1]])
     o_tile = lg.input("o_tile", (D, nh, Q), F32)
-    fin = lg.g.node(
+    lg.g.node(
         "rg_ds_attn_online_fin_f32",
         [acc_o[ATTN_BLOCKS], mx[ATTN_BLOCKS], sm[ATTN_BLOCKS], lg.input("attn_sink", (nh,), F32), lg.input("cs_inv", (128, Q), F32)],
         [o_tile],

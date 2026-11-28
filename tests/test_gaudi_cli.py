@@ -197,12 +197,12 @@ def test_listen_address_checks() -> None:
         (
             "qwen3_5-gaudi2",
             {"prefill_chunk_size": 256},
-            "prefill-chunk-size 512, 1024, 2048, 4096",
+            "prefill-chunk-size that is a multiple of 512, 1024, 2048, 4096",
         ),
         (
             "glm5_3_flash-gaudi2",
             {"prefill_chunk_size": 512},
-            "prefill-chunk-size 1024, 2048, 4096",
+            "prefill-chunk-size that is a multiple of 1024, 2048, 4096",
         ),
         ("mistral_large4-gaudi2", {"draft_tokens": 2}, "draft-tokens 0, 3"),
         ("mistral_large4-gaudi2", {"prefill_chunk_size": 1500}, "power of two"),

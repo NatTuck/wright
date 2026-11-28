@@ -24,12 +24,28 @@ from __future__ import annotations
 
 import argparse
 import json
-import struct
 import statistics
+import struct
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.span_floors import TPC_BYTES_PER_S, derivation, family, floor
+
+
+@dataclass
+class SpanRow:
+    """One span's line in the cadence table: measured host cadence, and the declared floor for reference."""
+
+    group: str
+    launches: int
+    period_ms: float
+    bytes: float | None = None
+    regime: str | None = None
+    floor_ms: float | None = None
+    ratio: float | None = None
+    gbs: float | None = None
+
 
 HEADER = struct.Struct("<8sIIdQQ")
 RECORD = struct.Struct("<QII")
@@ -105,31 +121,31 @@ def spans(rows: list[tuple[float, int, str]], t0: float, args) -> None:
     for ns, _, name in rows:
         per[family(name) if args.spans == "family" else name].append(ns / 1e6)
 
-    table = []
+    table: list[SpanRow] = []
     for group, times in per.items():
         times.sort()
         periods = [b - a for a, b in zip(times, times[1:])]
         period = statistics.median(periods) if periods else 0.0
-        declared = floor(group if args.spans == "family" else group)
-        row = {"group": group, "launches": len(times), "period_ms": period, "floor_ms": None}
+        row = SpanRow(group=group, launches=len(times), period_ms=period)
+        declared = floor(group)
         if declared is not None:
             per_launch, regime, rate = declared
-            row["bytes"] = per_launch
-            row["regime"] = regime
-            row["floor_ms"] = per_launch / rate * 1e3
-            row["ratio"] = period / row["floor_ms"] if row["floor_ms"] > 0 else None
-            row["gbs"] = per_launch / (period / 1e3) / 1e9 if period > 0 else None
+            row.bytes = per_launch
+            row.regime = regime
+            row.floor_ms = per_launch / rate * 1e3
+            row.ratio = period / row.floor_ms if row.floor_ms > 0 else None
+            row.gbs = per_launch / (period / 1e3) / 1e9 if period > 0 else None
         table.append(row)
 
-    table.sort(key=lambda r: -r["launches"])
+    table.sort(key=lambda r: -r.launches)
 
     print("\nhost cadence per span (host timestamps: NOT device time, so no ratio against a device floor):")
     print(f"{'period ms':>10} {'launches':>9} {'MB/launch':>10} {'floor ms':>9}  span")
     for r in table[: args.top_spans]:
-        mb = "-" if r.get("bytes") is None else f"{r['bytes'] / 1e6:.3f}"
-        fl = "-" if r.get("floor_ms") is None else f"{r['floor_ms']:.4f}"
-        note = "" if r.get("floor_ms") is not None else f"   [{derivation(r['group'])}]"
-        print(f"{r['period_ms']:10.3f} {r['launches']:9d} {mb:>10} {fl:>9}  {r['group']}{note}")
+        mb = "-" if r.bytes is None else f"{r.bytes / 1e6:.3f}"
+        fl = "-" if r.floor_ms is None else f"{r.floor_ms:.4f}"
+        note = "" if r.floor_ms is not None else f"   [{derivation(r.group)}]"
+        print(f"{r.period_ms:10.3f} {r.launches:9d} {mb:>10} {fl:>9}  {r.group}{note}")
 
     for start, end in args.between:
         window(rows, t0, start, end)

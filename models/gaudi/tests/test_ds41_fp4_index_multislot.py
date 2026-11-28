@@ -3,15 +3,17 @@
 reference for every (slot, key); dead keys zero.  Covers the multi-slot gather/decode layout (Sp>1)
 that the single-slot gate does not."""
 from __future__ import annotations
-import os, struct
+
+import os
+import struct
+
 import numpy as np
 import pytest
+from test_ds41_fp4_kv import fp4_ref
+from test_ds41_kernels import fp8_value
 
 pytestmark = pytest.mark.skipif(
     not os.path.exists("/usr/include/habanalabs/synapse_api.h"), reason="needs SDK")
-
-from test_ds41_fp4_kv import fp4_ref, E2M1_SIGNED, e4m3_value
-from test_ds41_kernels import fp8_value
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +42,8 @@ def run(device, recipes, g, arrays, outs):
         r = recipes.compile(g)
         for n in r.persistent:
             r.bind(n, addr[n])
-        r.launch(); device.sync()
+        r.launch()
+        device.sync()
         return {n: device.d2h(addr[n], arrays[n].shape, arrays[n].dtype) for n in outs}
     finally:
         for a in addr.values():
@@ -98,7 +101,8 @@ def test_multislot_index_gather_decode(device, recipes):
     slots[:, 5] = 0
     slots[:, 6] = 2
     slots[:, 7] = 0
-    cmp_blocks = np.full((1, 16), -1, np.int32); cmp_blocks[0, 0] = CMP
+    cmp_blocks = np.full((1, 16), -1, np.int32)
+    cmp_blocks[0, 0] = CMP
     out = run(device, recipes, g, {
         "arena": np.zeros((NB, PR, 512), np.uint8), "sink": np.zeros((1, 64), np.int32),
         "rows": rows, "lat": np.zeros((T, 512), np.float32), "ix": np.ascontiguousarray(ix),

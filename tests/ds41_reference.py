@@ -15,8 +15,6 @@ import numpy as np
 from resin_models_gaudi.deepseek_v41 import layers as L
 from resin_models_gaudi.deepseek_v41.cache import (
     HISTORY_TOKENS,
-    INDEX_ROWS,
-    PAGE_ROWS,
     PAGE_TOKENS,
     PAIR_ROWS,
 )
@@ -31,9 +29,6 @@ from resin_models_gaudi.deepseek_v41.model import (
     DENSE_KEYS,
     INDEX_KEYS,
     IX_CHAIN_G,
-    PREFILTER_BLOCKS,
-    PREFILTER_MIN,
-    RADIX_MIN,
     DeepSeekV41Gaudi,
     J,
     Row,
@@ -399,8 +394,8 @@ class Reference(_Model):
         # per-group tables themselves (slot records, group bases, visible rows, pins) are derived on the device
         # (ds_ix_gslot, ix_gvis, ds_ix_bmax, ix_cmask, ds_ix_merge), so nothing here is per group.
         counts = {"sparse": False, "cand": False}
-        lanes = np.arange(INDEX_KEYS // PAGE_TOKENS)
-        tp, lpg = self.ix_tp(s), self.ix_lpg(s)
+        np.arange(INDEX_KEYS // PAGE_TOKENS)
+        _tp, _lpg = self.ix_tp(s), self.ix_lpg(s)
         for ratio in (1, 2):
             v[f"ix_vis{ratio}"][:] = np.where(live, (pos + 1) // ratio, 0)
             vis = v[f"ix_vis{ratio}"]

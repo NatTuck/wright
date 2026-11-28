@@ -154,7 +154,7 @@ def union_table(path: str | Path, window: str = "preferred") -> dict:
         }
         for (family, name), spans in per_node.items()
     ]
-    node_rows.sort(key=lambda row: -row["union_us"])
+    node_rows.sort(key=lambda row: -float(row["union_us"]))
     engine_rows = [
         {
             "engine": family,
@@ -175,7 +175,7 @@ def union_table(path: str | Path, window: str = "preferred") -> dict:
         ),
         "engines": engine_rows,
         "nodes": node_rows,
-        "attributed": sum(row["union_us"] for row in node_rows) > 0,
+        "attributed": sum(float(row["union_us"]) for row in node_rows) > 0,
         "unnamed_device_events": sum(
             1
             for row in rows(path)

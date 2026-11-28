@@ -2307,7 +2307,6 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
     a slot whose tile holds no visible key is lane 0 = -1. RED-first: one block's seen count moves and the
     records must change with it."""
     from resin_models_gaudi.deepseek_v41 import layers as L
-    from resin_models_gaudi.synapse.runtime import I32
 
     d = L.Dims(
         hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
