@@ -1398,14 +1398,20 @@ def index_chain_graph(
                     struct.pack("i", CMP_PAGE_ROWS),
                 )
                 first_nodes.append(ng)
+                if stop == "gather":  # CHAIN_BREAKDOWN: the gather alone
+                    continue
                 for flat, shaped in ((cf, c1), (sf, s1), (kf, k1), (tf, t1), (idf, i1)):
                     lg.node("reshape", [shaped], [flat])
+                if stop == "dequant":  # + the single dequant
+                    continue
                 lg.node("rg_mx4_decs_f32", [cf, sf, idf, tf], [decf], struct.pack("ii", 0, 0))
                 lg.node("reshape", [decf], [ksf])
                 # the same packing view the per-slot path takes: the (2*DIM, C/2) fp8 slab IS the (DIM, C)
                 # key operand, two keys interleaved per row
                 ksv = lg.view(ksf, (INDEX_DIM, C))
                 lg.node("batch_gemm", [q8, ksv], [scf], GEMM_NT)
+                if stop == "gemm":  # + the one flat GEMM (everything but the accumulator)
+                    continue
                 lg.node(
                     "rg_ds_ix_qacc_tile_f32",
                     [scf, w, table, qsc, kf],
