@@ -303,6 +303,57 @@ def test_unrolled_chain_matches_full(device, recipes, B, T):
                     _best = min(_best, _t.perf_counter_ns() - _t0)
                 print(f"BREAKDOWN stop={_stop}: {_best / 1e3:.1f} us", flush=True)
                 _g.destroy()
+        if os.environ.get("ROW_ARM"):
+            # The ROWS arm of the same index path at the same width and key count: one score graph over the FULL
+            # key range into a (KT, R) slab, then one one-pass selection per row chunk -- no running set, no
+            # assemble, no merge. R is chosen from a slab budget, the reference's rule (M*N*4 <= cap).
+            import time as _t
+            R = 512
+            # the query slab is head-major (column h*T + t), so a row chunk is strided: it must be re-laid-out
+            # (on device this is a copy of ~2 MB per chunk; here it is done host-side, which UNDERSTATES the arm)
+            q8r = np.concatenate([ix_q8[h * T:h * T + R] for h in range(IH)], axis=0)
+            qsr = np.concatenate([ix_qs[h * T:h * T + R] for h in range(IH)], axis=0)
+            slab = _malloc_upload(device, np.zeros((R, KT), np.float32))
+            rb = {
+                **bind,
+                "ix_q8": _malloc_upload(device, q8r),
+                "ix_qs": _malloc_upload(device, qsr),
+                "ix_w": _malloc_upload(device, np.ascontiguousarray(ix_w[:R])),
+                "ix_score": slab,
+                "ix_vis": _malloc_upload(device, vis[:R]),
+                "ix_list": _malloc_upload(device, np.zeros((R, run), np.int32)),
+                "ix_lslots": _malloc_upload(device, np.zeros((R, 8), np.int32)),
+                "ix_thr": _malloc_upload(device, np.zeros((R, 64), np.int32)),
+                "cmp_blocks": _malloc_upload(device, np.ascontiguousarray(cmp_blocks[:R])),
+                # parts=1, so the score graph's slot table is the unsuffixed name; the chain's slots are built by
+                # index_gslot, which this arm does not run, so the records are the tile's own (zeros => a column
+                # sees nothing, which UNDERSTATES the score stage -- noted where the number is reported)
+                "ix_slots": _malloc_upload(device, np.zeros((S, 8), np.int32)),
+            }
+            gsc = L.index_score_graph(device, d, R, S, KT, NB, KT, query_block=qb, pages=pages, cpages=pages)
+            gsl = L.index_select_graph(device, d, R, KT)
+            tot = {}
+            for nm, g in (("score", gsc), ("select", gsl)):
+                _r = recipes.compile(g)
+                for _n in _r.persistent:
+                    _r.bind(_n, rb[_n])
+                for _ in range(2):
+                    _r.launch()
+                device.sync()
+                best = 1e18
+                for _ in range(7):
+                    _t0 = _t.perf_counter_ns()
+                    _r.launch()
+                    device.sync()
+                    best = min(best, _t.perf_counter_ns() - _t0)
+                tot[nm] = best / 1e3
+                print(f"ROWARM {nm} R={R} slab={R * KT * 4 / 2**20:.0f} MiB: {best / 1e3:.1f} us "
+                      f"({best / 1e3 / R:.2f} us/col)", flush=True)
+                g.destroy()
+            # scale to the same 2048 columns the tiled arm measured, so the two are per-column comparable
+            per_col = (tot["score"] + tot["select"]) / R
+            print(f"ROWARM whole path: {per_col:.2f} us/col at R={R} "
+                  f"(tiled chain: 15583.6/2048 = 7.61 us/col)", flush=True)
     finally:
         for a in set([rec_c, gb_c, rec_r, gb_r, rinit, pinit, rout, pout, snk, lst, lsl, tile, big, lst_r, lsl_r, thr_r,
                       *addr.values()]):
