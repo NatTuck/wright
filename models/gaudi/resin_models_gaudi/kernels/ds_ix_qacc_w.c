@@ -17,6 +17,8 @@
 // tensors: 0 S (NH*T, C) bf16  1 w (NH, T) f32  2 slots  3 sq (NH Q, S) f32  4 sk (C,) f32
 //        | 5 sink (64, 1) i32  6 score (K, T) f32
 // params: scale. index space: [C/1024, (NH*T)/256, S]. NH = 32.
+#define SCORE_OUT  // the score slab is a pure OUTPUT, so its parameter comes after sink: without this the
+                    // #else signature takes score as an INPUT and every tensor after it shifts by one
 #include "common.h"
 
 #define NINF (-3.0e38f)

@@ -2508,7 +2508,7 @@ def test_ds_ix_qacc_w_coordinates(device, recipes):
     kk = g.input("sk", (C,), F32)
     sink = g.input("sink", (64, 1), I32)
     score = g.input("score", (C, T), F32)
-    g.node("rg_ds_ix_qacc_w_f32", [S, ww, sl, qq, kk], [score, sink], struct.pack("<f", 1.0))
+    g.node("rg_ds_ix_qacc_w_f32", [S, ww, sl, qq, kk], [sink, score], struct.pack("<f", 1.0))
     recipe = recipes.compile(g)
     addresses = []
     try:
