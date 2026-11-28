@@ -66,15 +66,16 @@ void main(tensor S, tensor w, tensor slots, tensor score, tensor sq, tensor sk, 
                     for (int j = 0; j < NB; j += 2) {  // two vectors of keys per bf16 read
                         const int b = NB * g + j;
                         float64 a0 = 0.0f, a1 = 0.0f, c0 = 0.0f, c1 = 0.0f;  // even and odd heads, keys b | b + 1
-                        // (W, C): the row is the column's head lane, the run of 128 keys is contiguous
-                        int5 sc = {NH * t, 64 * b, 0, 0, 0};
+                        // (W, C): the row is the column's head lane (GLOBAL column, tok0 + t), and the run of
+                        // 128 keys is contiguous
+                        int5 sc = {NH * col, 64 * b, 0, 0, 0};
                         #pragma unroll
                         for (int h = 0; h < NH; h += 2) {
-                            sc[0] = h + NH * t;
+                            sc[0] = h + NH * col;
                             float128 x = convert_bfloat128_to_float128(v_bf16_ld_tnsr_b(sc, S), SW_LINEAR);
                             a0 = v_f32_mac_b(v_f32_max_b(x.v1, 0.0f), wt[h], a0);
                             c0 = v_f32_mac_b(v_f32_max_b(x.v2, 0.0f), wt[h], c0);
-                            sc[0] = h + 1 + NH * t;
+                            sc[0] = h + 1 + NH * col;
                             x = convert_bfloat128_to_float128(v_bf16_ld_tnsr_b(sc, S), SW_LINEAR);
                             a1 = v_f32_mac_b(v_f32_max_b(x.v1, 0.0f), wt[h + 1], a1);
                             c1 = v_f32_mac_b(v_f32_max_b(x.v2, 0.0f), wt[h + 1], c1);

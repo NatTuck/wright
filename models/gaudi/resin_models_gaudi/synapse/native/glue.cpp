@@ -266,7 +266,9 @@ static bool geom_ix_qacc_tile(const HabanaKernelParams* p, uint64_t is[5], uint3
 // ds_ix_qacc_w: the same index space with the score slab's axes swapped -- key blocks from dim 1, columns
 // from dim 0, slots from the slots tensor
 static bool geom_ix_qacc_w(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
-    is[0] = sz(p, false, 0, 1) / 1024; is[1] = sz(p, false, 0, 0) / (32 * 8); is[2] = sz(p, false, 2, 1);
+    // the slab's first axis is the WHOLE step (NH*T), but a slot covers only qb of those columns, so the
+    // per-slot query count comes from sq (input 3, (NH*qb, S)) and the slot count from slots (input 2)
+    is[0] = sz(p, false, 0, 1) / 1024; is[1] = sz(p, false, 3, 0) / (32 * 8); is[2] = sz(p, false, 2, 1);
     *rank = 3; return true;
 }
 // ds_bcast3: one 256-byte vector (two columns of one slot) per member; the tensors are viewed so dim 0 is
