@@ -14,6 +14,7 @@ round to the same values as the checkpoint's per-32 power-of-two scales.
 
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 
@@ -1227,6 +1228,14 @@ def index_select_graph(
 
 INDEX_TILE = 2048  # index keys per tile (one launch's chunk of a slot)
 INDEX_RUN = INDEX_TOP  # the rows of a tile group's running candidates (the top entries so far)
+# The merge can run as ONE kernel (three reductions per listed entry: one to find the next entry and two to
+# broadcast the position and the score at the chosen lane to the slot's lane) or as TWO nodes (`ds_ix_lanes` +
+# `ds_ix_emit`: one reduction, then the emit picks the source lane with a scalar, which needs the lane to cross a
+# node boundary). MEASURED at 93k, T=2048: one kernel 50.1 s / 1864.7 tok/s, two nodes 71.1 s / 1315 tok/s -- the
+# split loses, because five scalar memory ops per entry cost far more than the two reductions they replace (a
+# scalar load or store is hundreds of cycles and the entry loop is serial, a `RED` is six vector ops). The split
+# stays behind this switch as the instrument for the head-reduction work, and off by default.
+IX_SPLIT_MERGE = bool(int(os.environ.get("RESIN_IX_SPLIT_MERGE", "0")))
 INDEX_BLOCKS = 2048  # candidate blocks of 8 entries (candidate_topk_blocks)
 BLOCK_TILE = INDEX_TILE // 8  # blocks of 8 entries in a tile
 
@@ -1264,21 +1273,24 @@ def index_merge_graph(
     # (ds_ix_emit, all scalar). A partial store's source lane is a scalar and a vector cannot become one inside a
     # kernel, so the lane has to cross a node boundary -- and with it crossed, the ordering needs one reduction per
     # entry instead of the three a single kernel needed to broadcast the position and score to the slot's lane.
-    lanes = lg.tensor((run, T), I32)
-    lg.node(
-        "rg_ds_ix_lanes_f32",
-        [score, vis, thr, cnt, gsum, exact, pos, base],
-        [lg.input("ix_lslots", (8, T), I32), lanes],
-        # one member per block of 64 rows, so a member's slots never span two 64-slot vectors (a partial-vector
-        # store writes one vector's lanes, so a member that spans a vector boundary would shift its entries)
-        struct.pack("iiii", max(1, 48 // T), run, heads, run),
-    )
-    lg.node(
-        "rg_ds_ix_emit_f32",
-        [score, vis, gsum, pos, base, lanes],
-        [lg.input("ix_list", (run, T), I32), lg.input("ix_sout", (K, T), F32), lg.input("ix_pos_out", (run, T), I32)],
-        struct.pack("ii", run, run),
-    )
+    _outs = [
+        lg.input("ix_lslots", (8, T), I32),
+        lg.input("ix_list", (run, T), I32),
+        lg.input("ix_sout", (K, T), F32),
+        lg.input("ix_pos_out", (run, T), I32),
+    ]
+    # one member per block of 64 rows, so a member's slots never span two 64-slot vectors (a partial-vector store
+    # writes one vector's lanes, so a member that spans a vector boundary would shift its entries)
+    _nm = max(1, 48 // T)
+    if IX_SPLIT_MERGE:
+        _lanes = lg.tensor((run, T), I32)
+        lg.node("rg_ds_ix_lanes_f32", [score, vis, thr, cnt, gsum, exact, pos, base],
+                [_outs[0], _lanes], struct.pack("iiii", _nm, run, heads, run))
+        lg.node("rg_ds_ix_emit_f32", [score, vis, gsum, pos, base, _lanes],
+                _outs[1:], struct.pack("iii", _nm, run, run))
+    else:
+        lg.node("rg_ds_ix_merge_f32", [score, vis, thr, cnt, gsum, exact, pos, base], _outs,
+                struct.pack("iiii", _nm, run, heads, run))
     return lg.g
 
 
@@ -1505,14 +1517,25 @@ def index_chain_graph(
         # tile's running set lands in the persistent ix_rout/ix_pout so the next G-tile recipe can carry it.
         lo, li = (lslots, ilist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((run, T), I32))
         rn, pn = (rout, pout) if i == tiles - 1 else (rnext, pnext)
-        lanes = lg.tensor((run, T), I32)
-        prev = lg.g.node(
-            "rg_ds_ix_lanes_f32",
-            [m, vis, thr, cnt, gsum, exact, pprev, base],
-            [lo, lanes],
-            struct.pack("iiii", max(1, 48 // T), run, heads, run),
-        )
-        lg.g.node("rg_ds_ix_emit_f32", [m, vis, gsum, pprev, base, lanes], [li, rn, pn], struct.pack("ii", run, run))
+        if IX_SPLIT_MERGE:
+            lanes = lg.tensor((run, T), I32)
+            prev = lg.g.node(
+                "rg_ds_ix_lanes_f32",
+                [m, vis, thr, cnt, gsum, exact, pprev, base],
+                [lo, lanes],
+                struct.pack("iiii", max(1, 48 // T), run, heads, run),
+            )
+            lg.g.node(
+                "rg_ds_ix_emit_f32", [m, vis, gsum, pprev, base, lanes], [li, rn, pn],
+                struct.pack("iii", max(1, 48 // T), run, run),
+            )
+        else:
+            prev = lg.g.node(
+                "rg_ds_ix_merge_f32",
+                [m, vis, thr, cnt, gsum, exact, pprev, base],
+                [lo, li, rn, pn],
+                struct.pack("iiii", max(1, 48 // T), run, heads, run),
+            )
         rprev, pprev = rn, pn
         if kind == "bmax":
             # running top-INDEX_BLOCKS BLOCK merge: fold this tile's rows//8 block maxima into the device-resident
@@ -1532,19 +1555,27 @@ def index_chain_graph(
             lg.node("rg_ix_bcnt_f32", [bm, bvis, bthr], [bcnt, bgsum])
             blo, bli = (cslots, clist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((INDEX_BLOCKS, T), I32))
             brn, bpn = (brout, bpout) if i == tiles - 1 else (lg.tensor((INDEX_BLOCKS, T), F32), lg.tensor((INDEX_BLOCKS, T), I32))
-            blanes = lg.tensor((INDEX_BLOCKS, T), I32)
-            bprev = lg.g.node(
-                "rg_ds_ix_lanes_f32",
-                [bm, bvis, bthr, bcnt, bgsum, bexact, bpprev, bbase],
-                [blo, blanes],
-                struct.pack("iiii", max(1, 48 // T), INDEX_BLOCKS, 0, INDEX_BLOCKS),
-            )
-            lg.g.node(
-                "rg_ds_ix_emit_f32",
-                [bm, bvis, bgsum, bpprev, bbase, blanes],
-                [bli, brn, bpn],
-                struct.pack("ii", INDEX_BLOCKS, INDEX_BLOCKS),
-            )
+            if IX_SPLIT_MERGE:
+                blanes = lg.tensor((INDEX_BLOCKS, T), I32)
+                bprev = lg.g.node(
+                    "rg_ds_ix_lanes_f32",
+                    [bm, bvis, bthr, bcnt, bgsum, bexact, bpprev, bbase],
+                    [blo, blanes],
+                    struct.pack("iiii", max(1, 48 // T), INDEX_BLOCKS, 0, INDEX_BLOCKS),
+                )
+                lg.g.node(
+                    "rg_ds_ix_emit_f32",
+                    [bm, bvis, bgsum, bpprev, bbase, blanes],
+                    [bli, brn, bpn],
+                    struct.pack("iii", max(1, 48 // T), INDEX_BLOCKS, INDEX_BLOCKS),
+                )
+            else:
+                bprev = lg.g.node(
+                    "rg_ds_ix_merge_f32",
+                    [bm, bvis, bthr, bcnt, bgsum, bexact, bpprev, bbase],
+                    [blo, bli, brn, bpn],
+                    struct.pack("iiii", max(1, 48 // T), INDEX_BLOCKS, 0, INDEX_BLOCKS),
+                )
             brprev, bpprev = brn, bpn
     return lg.g
 

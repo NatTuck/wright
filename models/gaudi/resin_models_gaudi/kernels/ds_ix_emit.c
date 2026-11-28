@@ -19,7 +19,10 @@
 // tensors: 0 score (K, T) f32  1 vis (T) i32  2 gsum (K / 4096, T) i32  3 pos_old (512, T) i32
 //          4 gbase (1,) i32 (the group's first key; 0 for the first group)  5 lanes (KS, T) i32
 //        | 6 list (KS, T) i32  7 sout (KS, T) f32  8 pos_out (512, T) i32
-// params: KS, run. index space: [KS, T]
+// params: NM, KS, run. index space: [NM, T] -- the SAME member shape as the merge (ds_ix_lanes.c), so a member
+// walks a range of slots. It must not be [KS, T]: one member per slot is 512 x T index points, and the bmax chain
+// runs at T = 2048 with KS = 2048, i.e. 4.2M members per launch (measured: it took the index chain from 52% to
+// 83% of a 93k prefill).
 #include "common.h"
 
 #define NINF (-3.0e38f)
@@ -27,7 +30,7 @@
 #define NINF_BITS ((int)0xff61b1e6)
 
 void main(tensor score, tensor vis, tensor gsum, tensor pos_old, tensor gbase, tensor lanes,
-          tensor list, tensor sout, tensor pos_out, int KS, int run)
+          tensor list, tensor sout, tensor pos_out, int NM, int KS, int run)
 {
     int5 zc = {0, 0, 0, 0, 0};
     const int base = s_i32_ld_g(gen_addr(zc, gbase));
@@ -86,7 +89,9 @@ void main(tensor score, tensor vis, tensor gsum, tensor pos_old, tensor gbase, t
             continue;
         }
         const int used = st + tt < KS ? st + tt : KS;
-        for (int a = off[0]; a < end[0]; a++) {
+        // the index space's dim 0 is the MEMBER (as in the merge), so a member walks its share of the slots
+        for (int m = off[0]; m < end[0]; m++)
+            for (int a = m * KS / NM; a < (m + 1) * KS / NM; a++) {
             int5 ac = {a, c, 0, 0, 0};
             if (a < used) {
                 // the listed entry's keyed row (node A's output), decoded back to a row
