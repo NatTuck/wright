@@ -2046,8 +2046,12 @@ def attention_out_tile_graph(
             gn = _stream_listed_block(
                 lg, arena_blocks, blocks, b0, B, Q, codes, scales, idx, codes2, scales2, ks2, ks_blk
             )
-        if prev >= 0:  # block i+1's gather waits for block i's acc (the reused staging / SSA state)
-            lg.g.dep(prev, gn)
+        # No control dependency on the previous block: every block's staging is its own tensor (ks_blk, idx, sc,
+        # P, sscale, pv are all allocated inside this loop), so the gathers and the QK GEMMs of all five blocks
+        # can be in flight together and only the online-softmax/acc chain is serial. The dep this replaces forced
+        # block i+1's gather to wait for block i's acc, which is what made the recipe ten strictly sequential
+        # small GEMMs (M=128, N=nh=8) instead of a pipeline. Workspace grows from one block's staging to five
+        # (~75 MB), which is the trade.
         lg.node("batch_gemm", [q_tile, ks_blk], [sc], GEMM_NT)
         lg.node(
             "rg_ds_attn_online_f32", [sc, mx[blk], sm[blk], idx], [P, sscale, mx[blk + 1], sm[blk + 1]],
