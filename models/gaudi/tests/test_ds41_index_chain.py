@@ -1018,8 +1018,9 @@ def test_unrolled_chain_prefill(device, recipes, B):
             g.destroy()
 
 
+@pytest.mark.parametrize("R", [2048, 512, 128], ids=["R2048", "R512", "R128"])
 @pytest.mark.parametrize("mode", ["thr", "radix"], ids=["thr", "radix"])
-def test_index_select_production_width(device, recipes, mode):
+def test_index_select_production_width(device, recipes, mode, R):
     """The ONE-PASS selection at production width, per launch: T=2048 columns over 16384 keys (the 8 tiles of
     C=2048 that the chain scores per chunk, all in one slab). This is the measurement that decides whether the
     tiled merge is worth keeping for the selection, taken on this hardware at this shape rather than predicted:
@@ -1034,7 +1035,7 @@ def test_index_select_production_width(device, recipes, mode):
                experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
                route_scale=1.5, ranks=1)
     rng = np.random.default_rng(3)
-    T, K = 2048, 16384
+    T, K = R, 16384  # R columns per launch: the row chunk that bounds the slab (K x R x 4 bytes)
     score = rng.standard_normal((T, K)).astype(np.float32)
     vis = np.full(T, K, np.int32)
     bind = {
@@ -1061,7 +1062,8 @@ def test_index_select_production_width(device, recipes, mode):
             rec.launch()
             device.sync()
             best = min(best, time.perf_counter_ns() - t0)
-        print(f"\nSELECT mode={mode} T={T} K={K}: {best / 1e3:.1f} us per launch", flush=True)
+        print(f"\nSELECT mode={mode} rows={T} K={K} slab={T * K * 4 / 2**20:.0f} MiB: "
+              f"{best / 1e3:.1f} us per launch, {best / 1e3 / T:.2f} us per column", flush=True)
         assert best > 0
     finally:
         for a in bind.values():
