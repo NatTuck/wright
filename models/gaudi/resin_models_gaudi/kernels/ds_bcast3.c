@@ -33,12 +33,12 @@ void main(tensor in, tensor out)
     for (int s = off[2]; s < end[2]; s++)
         for (int c = off[1]; c < end[1]; c++)
             for (int d = off[0]; d < end[0]; d++) {
-                // the offset goes in COMPONENT 0 as a whole-vector multiple, which is the idiom every
-                // working vector copy in this tree uses (x8_copy: {256*nt, ...}). Indexing the column in
-                // component 1 does not address it: the load then returns the slab's first vector again,
-                // which is the silent "every load is column 0" failure this kernel started with.
-                int5 ic = {256 * c, 0, 0, 0, 0};
-                int5 oc = {256 * c, 0, s, 0, 0};
-                v_u8_st_tnsr(oc, out, v_u8_ld_tnsr_b(ic, in));
+                // the f8 accessors, not the u8 ones: every working byte gather in this tree (x8_copy,
+                // ds_gather_dense_f4) moves u8 tensors with v_f8_*, and the u8 variants do not address a
+                // multi-dimension tensor the same way -- with them a store landed at the slab's start whatever
+                // the column, which is the silent "every load is column 0" failure this kernel started with.
+                int5 ic = {0, c, 0, 0, 0};
+                int5 oc = {0, c, s, 0, 0};
+                v_f8_st_tnsr(oc, out, v_f8_ld_tnsr_b(ic, in));
             }
 }
