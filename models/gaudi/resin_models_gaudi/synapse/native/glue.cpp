@@ -263,6 +263,12 @@ static bool geom_ix_qacc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_ix_qacc_tile(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     return geom_ix_qacc(p, is, rank);
 }
+// ds_ix_qacc_w: the same index space with the score slab's axes swapped -- key blocks from dim 1, columns
+// from dim 0, slots from the slots tensor
+static bool geom_ix_qacc_w(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, false, 0, 1) / 1024; is[1] = sz(p, false, 0, 0) / (32 * 8); is[2] = sz(p, false, 2, 1);
+    *rank = 3; return true;
+}
 // ds_bcast3: one 256-byte vector (two columns of one slot) per member; the tensors are viewed so dim 0 is
 // vector-granular, so dim 1 is C/2
 static bool geom_bcast3(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
@@ -457,6 +463,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_attn_acc")) return geom_attn_stats;
     if (is("ds_ix_slot_acc")) return geom_ix_slot_acc;
     if (is("ds_bcast3")) return geom_bcast3;
+    if (is("ds_ix_qacc_w")) return geom_ix_qacc_w;
     if (is("ds_ix_qacc_tile")) return geom_ix_qacc_tile;  // before the ds_ix_qacc prefix
     if (is("ds_ix_qacc")) return geom_ix_qacc;
     if (is("ds_gather_win_blk")) return geom_mla_gather;

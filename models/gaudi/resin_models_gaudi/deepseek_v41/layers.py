@@ -1408,22 +1408,21 @@ def index_chain_graph(
                 # the same packing view the per-slot path takes: the (2*DIM, C/2) fp8 slab IS the (DIM, C)
                 # key operand, two keys interleaved per row
                 ksv = lg.view(ksf, (INDEX_DIM, C))
-                # Variant B: ONE dequant, and the per-slot GEMM and accumulator keep their original shapes and
-                # read patterns. The key slab is one tile for every slot, so it is handed to the batched GEMM
-                # with a batch of 1 -- the score slab stays (C, M, Sp), a slot's plane contiguous, which is the
-                # pattern the accumulator was written for (the flat (C, W) slab made it read one element per
-                # line, and that cost more than the 16x gather it bought).
-                # Habana's batch_gemm does not broadcast a batch-1 operand, so the one tile is replicated
-                ks1 = lg.tensor((INDEX_DIM, C, Sp), F8)
-                lg.node("rg_ds_bcast3_f32", [ksv], [ks1])
-                nq = lg.g.node("rg_ix_slot_q8_f32", [q8, qsc, table], [qs, sq])
-                first_nodes.append(nq)
-                lg.node("batch_gemm", [qs, ks1], [sc], GEMM_NT)
+                # ONE GEMM, operands SWAPPED so the score slab comes out (W, C) rather than (C, W).
+                # batch_gemm is y(M, N) = x(K, N) . w(K, M)^T, so with x = ks (DIM, C) the output's first axis is
+                # C and with w = ix_q8 (DIM, W) its second is W. That matters because of the accumulator's read
+                # pattern: in (C, W) a column's keys are W elements apart, so it reads one element per line,
+                # while in (W, C) 64 consecutive keys of one column are one contiguous 256-byte vector -- the
+                # pattern ds_ix_qacc was written for. And the key slab is still the single shared tile, so this
+                # needs no broadcast and no expansion copy: it takes the gather's 16x AND the dequant's
+                # expansion write at once. (Measured: the (C, W) version of attempt 2 was 8.6 % slower at 93k.)
+                scw = lg.tensor((W, C), BF16)
+                lg.node("batch_gemm", [ksv, q8], [scw], GEMM_NT)
                 if stop == "gemm":  # + the GEMM (everything but the accumulator)
                     continue
                 lg.node(
-                    "rg_ds_ix_qacc_tile_f32",
-                    [sc, w, table, qsc, kf],
+                    "rg_ds_ix_qacc_w_f32",
+                    [scw, w, table, qsc, kf],
                     [sink, tile],
                     struct.pack("f", INDEX_SCALE),
                 )
