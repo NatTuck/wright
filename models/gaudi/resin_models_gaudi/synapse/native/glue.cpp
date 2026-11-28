@@ -263,9 +263,14 @@ static bool geom_ix_qacc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_ix_qacc_tile(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     return geom_ix_qacc(p, is, rank);
 }
-// ds_bcast3: one 256-byte vector of one column of one slot per member
+// ds_bcast3: one 256-byte vector (two columns) of one slot per member; both tensors are 2-D, so the slot
+// count comes from the params (C is param 0, the output's dim 1 is C*S)
 static bool geom_bcast3(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
-    is[0] = 1; is[1] = sz(p, false, 0, 1) / 2; is[2] = sz(p, true, 0, 2);
+    const int32_t* prm = (const int32_t*)p->nodeParams.nodeParams;
+    if (!prm || p->nodeParams.nodeParamsSize < 4) return false;
+    const uint64_t C = uint64_t(prm[0]);
+    if (C == 0) return false;
+    is[0] = 1; is[1] = C; is[2] = sz(p, true, 0, 1) / C;
     *rank = 3; return true;
 }
 // ix_slot_acc

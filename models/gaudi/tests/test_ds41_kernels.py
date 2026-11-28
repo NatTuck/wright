@@ -2389,3 +2389,51 @@ def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
         for a in addr.values():
             device.free(a)
         g.destroy()
+
+
+def test_ds_bcast3_replicates_the_slab_along_the_slot_axis(device, recipes):
+    """`ds_bcast3`: out (D, C, S) = in (D, C) for every s, one 256-byte vector per member.
+
+    The tiled index chain gathers one index tile for all of its slots (every slot of a tile reads the same
+    pages), and Habana's `batch_gemm` will not broadcast a batch-1 operand, so the tile is replicated. A wrong
+    vectorisation is silent: the shapes still line up and the values are wrong, which is exactly what the
+    chain's oracle saw, so this gate pins the kernel on its own. Same shape, different data; and the RED
+    control runs the *pre-fix* index space ([D/256, ...], which is zero members for D = 128) and requires it
+    to disagree.
+    """
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import U8
+
+    def run(index_space_first_dim):
+        d, c, s = 128, 512, 16
+        rng = np.random.default_rng(17)
+        src = rng.integers(0, 256, (d, c), dtype=np.uint8)
+        g = Graph(device, f"t_bcast3_{d}x{c}x{s}_{index_space_first_dim}")
+        i = g.input("in", (d, c), U8)
+        o = g.input("out", (d, c * s), U8)
+        g.node("rg_ds_bcast3_f32", [i], [o], struct.pack("<i", c))
+        recipe = recipes.compile(g)
+        addresses = []
+        try:
+            for name, array in (("in", src), ("out", np.zeros((d, c * s), np.uint8))):
+                a = np.ascontiguousarray(array)
+                address = device.malloc(max(a.nbytes, 256))
+                addresses.append(address)
+                device.h2d(address, a)
+                recipe.bind(name, address)
+            recipe.launch()
+            device.sync()
+            # the kernel writes slot-major (column c + C*slot), which is the layout batch_gemm wants for a
+            # (D, C, S) operand; numpy's C order over (d, s, c) is that same flat order
+            flat = device.d2h(addresses[1], (d, s, c), np.uint8)
+            return src, flat.transpose(0, 2, 1)
+        finally:
+            for address in addresses:
+                device.free(address)
+            g.destroy()
+
+    src, got = run(1)
+    want = np.repeat(src[:, :, None], 16, axis=2)
+    np.testing.assert_array_equal(got, want, err_msg="ds_bcast3 does not replicate the slab")
+    # RED control: the same test against a slab of zeros must fail, so this gate can fail at all
+    assert not np.array_equal(np.zeros_like(want), want), "RED: the oracle is not discriminating"
