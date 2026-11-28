@@ -1408,21 +1408,19 @@ def index_chain_graph(
                 # the same packing view the per-slot path takes: the (2*DIM, C/2) fp8 slab IS the (DIM, C)
                 # key operand, two keys interleaved per row
                 ksv = lg.view(ksf, (INDEX_DIM, C))
-                # ONE GEMM, operands SWAPPED so the score slab comes out (W, C) rather than (C, W).
-                # batch_gemm is y(M, N) = x(K, N) . w(K, M)^T, so with x = ks (DIM, C) the output's first axis is
-                # C and with w = ix_q8 (DIM, W) its second is W. That matters because of the accumulator's read
-                # pattern: in (C, W) a column's keys are W elements apart, so it reads one element per line,
-                # while in (W, C) 64 consecutive keys of one column are one contiguous 256-byte vector -- the
-                # pattern ds_ix_qacc was written for. And the key slab is still the single shared tile, so this
-                # needs no broadcast and no expansion copy: it takes the gather's 16x AND the dequant's
-                # expansion write at once. (Measured: the (C, W) version of attempt 2 was 8.6 % slower at 93k.)
-                scw = lg.tensor((W, C), BF16)
-                lg.node("batch_gemm", [ksv, q8], [scw], GEMM_NT)
+                # ONE GEMM over the whole step, and the accumulator reads it (C, W). The (W, C) transpose was
+                # tried and abandoned: a vector load runs along dim 0, so keys in the SECOND axis are not a
+                # contiguous run at all (the standalone probe showed plausible magnitudes at the wrong
+                # coordinates), while (C, W) already had the 128-key run contiguous along dim 0 -- which means
+                # attempt 2's 8.6 % is the GEMM's tiling at N = W, not the accumulator's reads, and the lever
+                # is the GEMM, not the layout.
+                scf = lg.tensor((C, W), BF16)
+                lg.node("batch_gemm", [q8, ksv], [scf], GEMM_NT)
                 if stop == "gemm":  # + the GEMM (everything but the accumulator)
                     continue
                 lg.node(
-                    "rg_ds_ix_qacc_w_f32",
-                    [scw, w, table, qsc, kf],
+                    "rg_ds_ix_qacc_tile_f32",
+                    [scf, w, table, qsc, kf],
                     [sink, tile],
                     struct.pack("f", INDEX_SCALE),
                 )
