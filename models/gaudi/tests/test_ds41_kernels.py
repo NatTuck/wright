@@ -2581,3 +2581,44 @@ def test_ds_cat_blk_joins_the_key_blocks(device, recipes):
     want = np.concatenate(trunc, axis=1)  # (D, 5B, Q)
     np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3,
                                err_msg="ds_cat_blk does not place the blocks at i*B")
+
+
+def test_ds_cat_blk_placement_probe(device, recipes):
+    """Where does each block land?  Block i is the constant i+1, so the dump names its own source."""
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import BF16
+
+    D, B, Q = 128, 4, 8
+    g = Graph(device, f"t_cat_probe_{D}x{B}x{Q}")
+    ins = [g.input(f"k{i}", (D, B, Q), BF16) for i in range(5)]
+    out = g.input("out", (D, 5 * B, Q), BF16)
+    g.node("rg_ds_cat_blk_f32", ins, [out])
+    recipe = recipes.compile(g)
+    addresses = []
+    try:
+        # bf16 has an 8-bit mantissa, so an integer sum of axis codes is not representable: probe ONE axis at a
+        # time. value = d identifies the d mapping and shows any leak of q into it.
+        dd = np.arange(D, dtype=np.float32).reshape(D, 1, 1)
+        for i in range(5):
+            v = np.broadcast_to(dd, (D, B, Q)).astype(np.float32)
+            a = np.ascontiguousarray((v.view(np.uint32) >> 16).astype(np.uint16))
+            address = device.malloc(max(a.nbytes, 256))
+            addresses.append(address)
+            device.h2d(address, a)
+            recipe.bind(f"k{i}", address)
+        o = device.malloc(4 * D * 5 * B * Q)
+        addresses.append(o)
+        device.h2d(o, np.zeros((D, 5 * B, Q), np.uint16))
+        recipe.bind("out", o)
+        recipe.launch()
+        device.sync()
+        u = device.d2h(o, (Q, 5 * B, D), np.uint16)
+        got = ((u.astype(np.uint32) << 16).view(np.float32)).transpose(2, 1, 0)
+    finally:
+        for address in addresses:
+            device.free(address)
+        g.destroy()
+    # report, for a few positions, the block / q / d the dump implies
+    probe = {f"[{d},{k},{q}]": float(got[d, k, q])
+             for d in (0, 1, 2, 64) for k in (0, 4) for q in (0, 1, 2)}
+    raise AssertionError(f"got[d,key,q] with value=d: {probe}")
