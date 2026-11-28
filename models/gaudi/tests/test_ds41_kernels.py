@@ -2423,10 +2423,11 @@ def test_ds_bcast3_replicates_the_slab_along_the_slot_axis(device, recipes):
                 recipe.bind(name, address)
             recipe.launch()
             device.sync()
-            # the kernel writes slot-major (column c + C*slot), which is the layout batch_gemm wants for a
-            # (D, C, S) operand; numpy's C order over (d, s, c) is that same flat order
-            flat = device.d2h(addresses[1], (d, s, c), np.uint8)
-            return src, flat.transpose(0, 2, 1)
+            # device tensors are column-major with dim 0 fastest, so out (D, C*S) flat is [s][c][d] with d
+            # fastest -- C-order shape (s, c, d). Reading it as anything else is a fixed misread of a correct
+            # buffer, which is exactly what this gate did before the axes were fixed.
+            flat = device.d2h(addresses[1], (s, c, d), np.uint8)
+            return src, flat.transpose(2, 1, 0)
         finally:
             for address in addresses:
                 device.free(address)
