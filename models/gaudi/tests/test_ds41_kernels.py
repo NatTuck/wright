@@ -2439,3 +2439,38 @@ def test_ds_bcast3_replicates_the_slab_along_the_slot_axis(device, recipes):
     np.testing.assert_array_equal(got, want, err_msg="ds_bcast3 does not replicate the slab")
     # RED control: the same test against a slab of zeros must fail, so this gate can fail at all
     assert not np.array_equal(np.zeros_like(want), want), "RED: the oracle is not discriminating"
+
+
+def test_ds_bcast3_vector_load_probe(device, recipes):
+    """Which elements does one `v_u8_ld_tnsr_b` return? `in = arange`, one member, so the output IS the answer."""
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import U8
+
+    d, c = 256, 2
+    src = np.arange(d * c, dtype=np.uint64).astype(np.uint8)
+    g = Graph(device, f"t_bcast3_probe_{d}x{c}")
+    i = g.input("in", (d, c), U8)
+    o = g.input("out", (d, c), U8)
+    g.node("rg_ds_bcast3_f32", [i], [o])
+    recipe = recipes.compile(g)
+    addresses = []
+    try:
+        for name, array in (("in", src), ("out", np.zeros_like(src))):
+            a = np.ascontiguousarray(array)
+            address = device.malloc(max(a.nbytes, 256))
+            addresses.append(address)
+            device.h2d(address, a)
+            recipe.bind(name, address)
+        recipe.launch()
+        device.sync()
+        got = device.d2h(addresses[1], (c, d), np.uint8).transpose(1, 0)
+    finally:
+        for address in addresses:
+            device.free(address)
+        g.destroy()
+    want = src.reshape(d, c)
+    assert np.array_equal(got, want), (
+        f"vector load not contiguous: got.ravel()[:8]={got.ravel()[:8].tolist()} "
+        f"want.ravel()[:8]={want.ravel()[:8].tolist()} "
+        f"got[1,0]={int(got[1, 0])} want[1,0]={int(want[1, 0])}"
+    )
