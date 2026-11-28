@@ -146,11 +146,12 @@ def test_span_grade_labels_a_launch_by_its_nodes():
 def test_the_attention_tile_floor_is_dominated_by_its_f32_state():
     """The 10-block online softmax moves a (D, nh, Q) f32 accumulator twice per block plus the PV product;
     those two terms must dominate, because that is the traffic worth removing."""
-    from scripts.span_floors import floor
+    from scripts.span_floors import ATTN_BLOCKS, floor
 
     moved, regime, rate = floor("ds41_attn_out_tile_T512_Q128_B64_A27588")
     assert regime == "tpc"
-    state = 10 * (2 * 512 * 64 * 128 * 4 + 2 * 512 * 64 * 128 * 4)  # pv + acc_o, per block
+    state = ATTN_BLOCKS * (2 * 512 * 64 * 128 * 4 + 2 * 512 * 64 * 128 * 4)  # pv + acc_o, per block
     assert state / moved > 0.6
-    # and it is not a small-tile case: one launch moves ~1 GB
-    assert moved > 1e9
+    # and it is not a small-tile case: one launch moves hundreds of MB (526 MB at B=128; it was 1019 MB at
+    # B=64, before ATTN_KEY_BLK doubled and the block count halved)
+    assert moved > 5e8
