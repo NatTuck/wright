@@ -265,6 +265,10 @@ static bool geom_ix_qacc_tile(const HabanaKernelParams* p, uint64_t is[5], uint3
 }
 // ds_ix_qacc_w: the same index space with the score slab's axes swapped -- key blocks from dim 1, columns
 // from dim 0, slots from the slots tensor
+// ds_cat_blk: one member per (key, column); dim 0 is a whole bfloat128 (64 bf16 of D = 128)
+static bool geom_cat_blk(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 1; is[1] = sz(p, false, 0, 1); is[2] = sz(p, false, 0, 2); *rank = 3; return true;
+}
 static bool geom_ix_qacc_w(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     // the slab's first axis is the WHOLE step (NH*T), but a slot covers only qb of those columns, so the
     // per-slot query count comes from sq (input 3, (NH*qb, S)) and the slot count from slots (input 2)
@@ -465,6 +469,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_attn_acc")) return geom_attn_stats;
     if (is("ds_ix_slot_acc")) return geom_ix_slot_acc;
     if (is("ds_bcast3")) return geom_bcast3;
+    if (is("ds_cat_blk")) return geom_cat_blk;
     if (is("ds_ix_qacc_w")) return geom_ix_qacc_w;
     if (is("ds_ix_qacc_tile")) return geom_ix_qacc_tile;  // before the ds_ix_qacc prefix
     if (is("ds_ix_qacc")) return geom_ix_qacc;

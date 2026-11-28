@@ -2532,3 +2532,52 @@ def test_ds_ix_qacc_w_coordinates(device, recipes):
     want = np.maximum(trunc.reshape(T, NH, C), 0.0).sum(axis=1).T  # (C, T)
     np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3,
                                err_msg="ds_ix_qacc_w reads the (W, C) slab at the wrong coordinates")
+
+
+def test_ds_cat_blk_joins_the_key_blocks(device, recipes):
+    """`ds_cat_blk`: out (D, N*B, Q) holds block i's ks_i (D, B, Q) at key rows i*B .. (i+1)*B.
+
+    The tile stream keeps its block recurrence only to bound the workspace; concatenating the blocks lets one
+    GEMM score the whole 640-key set instead of ten small ones. Five gathers cannot write one tensor (Synapse
+    rejects a second producer) and a block's slice is strided in Q, so this node is the join. Five distinct
+    blocks, so a wrong block offset or a transposed axis is visible.
+    """
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import BF16
+
+    D, B, Q = 128, 8, 16
+    rng = np.random.default_rng(31)
+    blocks = [rng.standard_normal((D, B, Q)).astype(np.float32) for _ in range(5)]
+    # author in bf16 so the oracle is exact
+    bf = [(b.view(np.uint32) >> 16).astype(np.uint16) for b in blocks]
+    trunc = [((b.view(np.uint32) >> 16) << 16).view(np.float32) for b in blocks]
+
+    g = Graph(device, f"t_cat_blk_{D}x{B}x{Q}")
+    ins = [g.input(f"k{i}", (D, B, Q), BF16) for i in range(5)]
+    out = g.input("out", (D, 5 * B, Q), BF16)
+    g.node("rg_ds_cat_blk_f32", ins, [out])
+    recipe = recipes.compile(g)
+    addresses = []
+    try:
+        for i, array in enumerate(bf):
+            a = np.ascontiguousarray(array)
+            address = device.malloc(max(a.nbytes, 256))
+            addresses.append(address)
+            device.h2d(address, a)
+            recipe.bind(f"k{i}", address)
+        o = device.malloc(4 * D * 5 * B * Q)
+        addresses.append(o)
+        device.h2d(o, np.zeros((D, 5 * B, Q), np.uint16))
+        recipe.bind("out", o)
+        recipe.launch()
+        device.sync()
+        # dim 0 is fastest, so flat memory of (D, 5B, Q) is [q][key][d] -- C-order (Q, 5B, D)
+        u = device.d2h(o, (Q, 5 * B, D), np.uint16)
+        got = ((u.astype(np.uint32) << 16).view(np.float32)).transpose(2, 1, 0)
+    finally:
+        for address in addresses:
+            device.free(address)
+        g.destroy()
+    want = np.concatenate(trunc, axis=1)  # (D, 5B, Q)
+    np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3,
+                               err_msg="ds_cat_blk does not place the blocks at i*B")
