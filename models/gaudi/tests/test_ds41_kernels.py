@@ -2474,3 +2474,61 @@ def test_ds_bcast3_vector_load_probe(device, recipes):
         f"want.ravel()[:8]={want.ravel()[:8].tolist()} "
         f"got[1,0]={int(got[1, 0])} want[1,0]={int(want[1, 0])}"
     )
+
+
+def test_ds_ix_qacc_w_coordinates(device, recipes):
+    """`ds_ix_qacc_w`: which (row, key) does it read from a (W, C) slab?
+
+    The chain's oracle is red and the two candidates are the swapped GEMM and this accumulator, so this pins the
+    accumulator on its own: a numpy-authored `S (W, C)` with w = sq = sk = 1 and scale 1, so the expected score
+    is `sum_h relu(S[h + NH*col, key])` for every key below the slot's limit. Any other coordinate mapping shows
+    up as a permutation or a wrong row.
+    """
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import BF16, F32, I32
+
+    NH, T, C = 32, 32, 1024
+    W = NH * T
+    rng = np.random.default_rng(23)
+    slab = rng.standard_normal((W, C)).astype(np.float32)
+    w = np.ones((NH, T), np.float32)
+    sq = np.ones((NH * T, 1), np.float32)
+    sk = np.ones(C, np.float32)
+    # one slot: group 0, qcol0, qpos0 large so lim = klen, key0 = 0, klen = C, qtok0 = 0, ratio 1
+    slots = np.array([[0, 0, 1 << 20, 0, C, 0, 1, 0]], np.int32)
+    # bf16 is the top half of the f32 mantissa: author the slab in bf16 so the oracle is exact
+    bf16 = (slab.view(np.uint32) >> 16).astype(np.uint16)
+    trunc = ((slab.view(np.uint32) >> 16) << 16).view(np.float32).reshape(W, C)
+
+    g = Graph(device, f"t_qaccw_{W}x{C}")
+    S = g.input("S", (W, C), BF16)
+    ww = g.input("w", (NH, T), F32)
+    sl = g.input("slots", (8, 1), I32)
+    qq = g.input("sq", (NH * T, 1), F32)
+    kk = g.input("sk", (C,), F32)
+    sink = g.input("sink", (64, 1), I32)
+    score = g.input("score", (C, T), F32)
+    g.node("rg_ds_ix_qacc_w_f32", [S, ww, sl, qq, kk], [score, sink], struct.pack("<f", 1.0))
+    recipe = recipes.compile(g)
+    addresses = []
+    try:
+        for name, array in (
+            ("S", bf16),
+            ("w", w), ("slots", slots), ("sq", sq), ("sk", sk),
+            ("sink", np.zeros((64, 1), np.int32)), ("score", np.zeros((C, T), np.float32)),
+        ):
+            a = np.ascontiguousarray(array)
+            address = device.malloc(max(a.nbytes, 256))
+            addresses.append(address)
+            device.h2d(address, a)
+            recipe.bind(name, address)
+        recipe.launch()
+        device.sync()
+        got = device.d2h(addresses[-1], (C, T), np.float32)
+    finally:
+        for address in addresses:
+            device.free(address)
+        g.destroy()
+    want = np.maximum(trunc.reshape(T, NH, C), 0.0).sum(axis=1).T  # (C, T)
+    np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3,
+                               err_msg="ds_ix_qacc_w reads the (W, C) slab at the wrong coordinates")
