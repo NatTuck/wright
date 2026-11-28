@@ -221,6 +221,16 @@ static bool geom_pairs16(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_ix_gather_f4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = 1; is[1] = sz(p, true, 0, 1) / 32; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
 }
+// ds_ix_gather_tile: the same shape and index space as ds_ix_gather_f4 (it gathers a whole tile, S = 1)
+static bool geom_ix_gather_tile(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    return geom_ix_gather_f4(p, is, rank);
+}
+// ds_ix_qacc_tile: 1024 keys of 8 query tokens per member, over ONE shared (C, NH*T) score slab, so the slot
+// count comes from the slots tensor (input 2) rather than from the slab's third dim
+static bool geom_ix_qacc_tile(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, false, 0, 0) / 1024; is[1] = sz(p, false, 0, 1) / (32 * 8); is[2] = sz(p, false, 2, 1);
+    *rank = 3; return true;
+}
 // ds_mk_add: 64 vocabulary entries of one rank's slice for one row per member
 static bool geom_mk_add(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, false, 0, 0) + 63) / 64; is[1] = sz(p, true, 0, 1); is[2] = sz(p, false, 0, 2); *rank = 3; return true;
@@ -442,6 +452,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_attn_online")) return geom_attn_stats;
     if (is("ds_attn_acc")) return geom_attn_stats;
     if (is("ds_ix_slot_acc")) return geom_ix_slot_acc;
+    if (is("ds_ix_qacc_tile")) return geom_ix_qacc_tile;  // before the ds_ix_qacc prefix
     if (is("ds_ix_qacc")) return geom_ix_qacc;
     if (is("ds_gather_win_blk")) return geom_mla_gather;
     if (is("ds_gather_list_blk_f4")) return geom_gather16;  // (prefix: before ds_gather_list)
@@ -456,6 +467,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_ix_bmax_nat")) return geom_k512;
     if (is("ds_ix_bmax")) return geom_k512;
     if (is("ds_ix_pin")) return geom_columns;
+    if (is("ds_ix_gather_tile")) return geom_ix_gather_tile;
     if (is("ds_ix_gather_f4")) return geom_ix_gather_f4;
     if (is("ds_ix_gather")) return geom_pairs16;
     if (is("ds_ix_gslot")) return geom_ix_gslot;

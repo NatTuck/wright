@@ -1356,7 +1356,6 @@ def index_chain_graph(
         first_nodes = []
         # The prefill branch gathers, dequantizes and scores the tile ONCE for all of its slots; the decode
         # branch keeps the per-slot path (its slots are different rows' columns, so their pages differ).
-        ttbl = lg.input(f"ix_t{i}", (8, 1), I32) if prefill else None
         for p in range(P):
             table = lg.input(f"ix_s{i}.p{p}", (8, Sp), I32)
             qs, sq = lg.tensor((INDEX_DIM, M, Sp), F8), lg.tensor((M, Sp), F32)
@@ -1393,8 +1392,8 @@ def index_chain_graph(
                 ksf = lg.tensor((2 * INDEX_DIM, C // 2), F8)
                 scf = lg.tensor((C, W), BF16)
                 ng = lg.g.node(
-                    "rg_ds_ix_gather_tile_f4",
-                    [lg.arena(blocks), pages, ttbl, lg.dep(), loff],
+                    "rg_ds_ix_gather_tile_f32",
+                    [lg.arena(blocks), pages, table, lg.dep(), loff],
                     [c1, s1, k1, t1, i1],
                     struct.pack("i", CMP_PAGE_ROWS),
                 )
@@ -1403,7 +1402,10 @@ def index_chain_graph(
                     lg.node("reshape", [shaped], [flat])
                 lg.node("rg_mx4_decs_f32", [cf, sf, idf, tf], [decf], struct.pack("ii", 0, 0))
                 lg.node("reshape", [decf], [ksf])
-                lg.node("batch_gemm", [q8, ksf], [scf], GEMM_NT)
+                # the same packing view the per-slot path takes: the (2*DIM, C/2) fp8 slab IS the (DIM, C)
+                # key operand, two keys interleaved per row
+                ksv = lg.view(ksf, (INDEX_DIM, C))
+                lg.node("batch_gemm", [q8, ksv], [scf], GEMM_NT)
                 lg.node(
                     "rg_ds_ix_qacc_tile_f32",
                     [scf, w, table, qsc, kf],

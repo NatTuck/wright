@@ -822,8 +822,6 @@ class DeepSeekV41Gaudi:
                     names[f"ix_s{i}.p0"] = (
                         self.table + tb.off[f"ix{ratio}.rec"] + 4 * 8 * stride * tt
                     )
-                    # the prefill chain's per-tile record: the same slice, read as one column
-                    names[f"ix_t{i}"] = names[f"ix_s{i}.p0"]
                     if kind == "bmax":
                         names[f"ix_gbb{i}"] = self.ix_bbase + 256 * tt
                 out.append(self._op(self.r["ixchain", s, kind, k > 0], layer, names))

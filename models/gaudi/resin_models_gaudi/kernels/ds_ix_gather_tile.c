@@ -14,6 +14,7 @@
 // scale is published. The per-slot mask stays where it already lives, in ds_ix_qacc's ``lim = min(seen, klen)``,
 // which writes -inf past the block's visibility. Called with S = 1, reading the per-tile record ix_t{i}.
 //
+// guid: rg_ds_ix_gather_tile_f32 (the glue derives it as rg_<file stem>_f32).
 // tensors: 0 arena (512, PR, NB) u8  1 cmp_blocks (npages, T) i32  2 slots (8, S) i32  3 after (unread)
 //          4 loff (64,) i32 | 5 codes (64, C, S) u8  6 scales (4, C, S) u8  7 sk (C, S) f32  8 ktab (C, S) i32
 //          9 ids (C, S) i32

@@ -13,8 +13,9 @@
 // score = -inf                                                                        otherwise
 //
 // slots (8, S) i32 per slot: [group, qcol0, qpos0, key0, klen, qtok0, ratio, 0] (group -1: padding)
+// guid: rg_ds_ix_qacc_tile_f32 (the glue derives it as rg_<file stem>_f32).
 // tensors: 0 S (C, NH * T) bf16  1 w (NH, T) f32  2 slots  3 qsc (NH T,) f32  4 sk (C,) f32
-//        | 5 score (K, T) f32  6 sink (64, 1) i32
+//        | 5 sink (64, 1) i32  6 score (K, T) f32
 // params: scale. index space: [C / 1024, Q / 8, S]; member (0, 0, 0) writes the sink. NH = 32.
 #include "common.h"
 
@@ -23,7 +24,7 @@
 #define TQ 8
 #define NB 16
 
-void main(tensor S, tensor w, tensor slots, tensor qsc, tensor sk, tensor score, tensor sink, float scale)
+void main(tensor S, tensor w, tensor slots, tensor qsc, tensor sk, tensor sink, tensor score, float scale)
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
