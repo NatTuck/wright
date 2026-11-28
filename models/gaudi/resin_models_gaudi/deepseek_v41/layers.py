@@ -1354,6 +1354,9 @@ def index_chain_graph(
         rnext = lg.tensor((run, T), F32)
         pnext = lg.tensor((run, T), I32)
         first_nodes = []
+        # The prefill branch gathers, dequantizes and scores the tile ONCE for all of its slots; the decode
+        # branch keeps the per-slot path (its slots are different rows' columns, so their pages differ).
+        ttbl = lg.input(f"ix_t{i}", (8, 1), I32) if prefill else None
         for p in range(P):
             table = lg.input(f"ix_s{i}.p{p}", (8, Sp), I32)
             qs, sq = lg.tensor((INDEX_DIM, M, Sp), F8), lg.tensor((M, Sp), F32)
@@ -1371,6 +1374,43 @@ def index_chain_graph(
             ks2 = lg.tensor((2 * INDEX_DIM, C // 2, Sp), F8)
             sc = lg.tensor((C, M, Sp), BF16 if prefill else F32)
             sink = lg.tensor((64, 1), I32)
+            if prefill:
+                # ONE gather, ONE dequant, ONE GEMM for the whole tile. The per-tile record ix_t{i} carries
+                # lanes 3 and 7 (per-tile) and a klen of the whole tile, so nothing is zeroed here and the
+                # per-slot mask is ds_ix_qacc_tile's `lim`. ix_q8 is already the global (INDEX_DIM, NH*T) query
+                # slab in global column order, so the per-slot query gather is gone too.
+                c1 = lg.tensor((INDEX_DIM // 2, C, 1), U8)
+                s1 = lg.tensor((INDEX_DIM // 32, C, 1), U8)
+                k1, t1, i1 = (
+                    lg.tensor((C, 1), F32),
+                    lg.tensor((C, 1), I32),
+                    lg.tensor((C, 1), I32),
+                )
+                cf = lg.tensor((INDEX_DIM // 2, C), U8)
+                sf = lg.tensor((INDEX_DIM // 32, C), U8)
+                kf, tf, idf = lg.tensor((C,), F32), lg.tensor((C,), I32), lg.tensor((C,), I32)
+                decf = lg.tensor((INDEX_DIM, C), F8)
+                ksf = lg.tensor((2 * INDEX_DIM, C // 2), F8)
+                scf = lg.tensor((C, W), BF16)
+                ng = lg.g.node(
+                    "rg_ds_ix_gather_tile_f4",
+                    [lg.arena(blocks), pages, ttbl, lg.dep(), loff],
+                    [c1, s1, k1, t1, i1],
+                    struct.pack("i", CMP_PAGE_ROWS),
+                )
+                first_nodes.append(ng)
+                for flat, shaped in ((cf, c1), (sf, s1), (kf, k1), (tf, t1), (idf, i1)):
+                    lg.node("reshape", [shaped], [flat])
+                lg.node("rg_mx4_decs_f32", [cf, sf, idf, tf], [decf], struct.pack("ii", 0, 0))
+                lg.node("reshape", [decf], [ksf])
+                lg.node("batch_gemm", [q8, ksf], [scf], GEMM_NT)
+                lg.node(
+                    "rg_ds_ix_qacc_tile_f32",
+                    [scf, w, table, qsc, kf],
+                    [sink, tile],
+                    struct.pack("f", INDEX_SCALE),
+                )
+                continue
             nq = lg.g.node("rg_ix_slot_q8_f32", [q8, qsc, table], [qs, sq])
             ng = lg.g.node(
                 "rg_ds_ix_gather_f4_f32",

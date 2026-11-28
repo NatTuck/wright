@@ -969,6 +969,7 @@ def test_unrolled_chain_prefill(device, recipes, B):
         launch(gslot, {"blk": addr["blk"], "ix_rec": rec, "ix_gbase": gb})
         bind = {**addr, "ix_rinit": rinit, "ix_pinit": pinit, "ix_rout": rout, "ix_pout": pout, "ix_list": lst, "ix_lslots": lsl}
         for i in range(B):
+            bind[f"ix_t{i}"] = rec + 4 * 8 * S * i
             for p in range(P):
                 bind[f"ix_s{i}.p{p}"] = rec + 4 * 8 * S * i + 4 * 8 * Sp * p
                 bind[f"ix_sink.p{p}"] = snk + 256 * (i * P + p)
