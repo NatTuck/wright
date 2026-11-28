@@ -307,22 +307,25 @@ class _Tables:
                 add(f"eg.{layer}", i32, T, J)
         self.layers = layers
         self.v: list[dict[str, np.ndarray]] = []
-        # byte ranges _fill zeroes: all but the tables it writes whole
-        # tables written whole, so the fill does not zero them: the compressed-page tables, and the index
-        # chain's per-group records and group bases (ds_ix_gslot writes every group of both on the device)
-        whole = sorted(
-            (self.off[n], self.off[n] + 4 * int(np.prod(self.spec[n][1])))
-            for n in (
-                "cmp_blocks1", "cmp_blocks2",
-                "ix1.rec", "ix2.rec", "ix1.gb", "ix2.gb",
-                *(f"win_pos.{layer}" for layer in range(layers)),
-            )
-        )  # fmt: skip
-        self.zero, a = [], 0
-        for lo, hi in whole:
-            self.zero.append((a, lo))
-            a = hi
-        self.zero.append((a, self.nbytes))
+        # Byte ranges a step's table image must have ZEROS in before the step reads it. There are none.
+        #
+        # `_fill` writes every byte the device reads: the rope tables and their inverses, the row tables, the
+        # Engram embeddings (the threaded host gather), the compressor's slots and latches, the query-block
+        # records, the pending groups, and the tokens. The tables it writes only for some steps (`ixsc.rec`
+        # for the sparse arm, `eg_xh`/`eg_xl` for a hashing Engram, the DSpark tables) are read only by the
+        # steps that write them. The rest of the image is the device's own (`cmp_blocks*`, the index chain's
+        # per-group records and bases, `win_pos.*`: `ds_ix_gslot` writes every group of both).
+        #
+        # This used to be the complement of the wholly-written table families, i.e. most of the image, and
+        # `f07d5dc` moved that clear onto the device — as memsets that land AFTER the upload that carries the
+        # fill's writes, so every step erased its own `meta`, rope tables, row tables and query-block records
+        # and every prompt answered 'cccccccc'. Measured with no zeroing on either side: correct answers at 4k,
+        # 16k and 186k, a needle retrieved from a 4189-token prompt and from a 128 640-token one, and correct
+        # batched decode — and rates identical to zeroing the ~0.8 MB of conditionally-written tables.
+        #
+        # `test_the_zero_ranges_are_never_written` pins the invariant any future range must satisfy: no byte
+        # of `zero` may be one the fill writes, because the device clear cannot tell them apart.
+        self.zero: list[tuple[int, int]] = []
 
     def bind(self, host: np.ndarray) -> None:
         """Add views of every table in ``host`` (a host copy, at least ``nbytes``)."""

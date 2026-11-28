@@ -322,3 +322,119 @@ def test_verify_rows_store_every_even_pending_state():
         for k in range(groups.shape[0]):
             if groups[k, 1] in (1, 3):
                 assert groups[k, 0] == groups[k, 1] - 1 and groups[k, 2] == 0
+
+
+def _untouched(m, tb, poison_runs):
+    """The bytes the fill leaves untouched, exactly: two fills of the same plan over host copies poisoned with
+    different values. A written byte holds the same value in both runs, so only a byte the fill skipped can
+    still hold run A's poison in A and run B's poison in B — no false positives."""
+    a, b = poison_runs
+    return (a == _POISON[0]) & (b == _POISON[1])
+
+
+_POISON = (0xAB, 0x5A)
+
+
+def _poisoned_fill(m, tb, plan, poison):
+    for h in m.host:
+        h[: tb.nbytes] = poison
+    positions, rows, tokens, with_tokens, floor, draft = plan
+    if draft is None:
+        m._native.fill(
+            tb.shape.T, m.host[0], *_native_rows(rows), np.asarray(positions, np.int64),
+            None if tokens is None else np.asarray(tokens, np.int64), with_tokens,
+            tb.shape.prefill, floor,
+        )  # fmt: skip
+    else:
+        anchors, K = draft
+        _, pos0, _, first, windptr, window, *_ = _native_rows(rows)
+        m._native.fill_draft(
+            tb.shape.T, m.host[0], pos0, first, windptr, window, np.asarray(anchors, np.int64),
+            K, m.cfg.dspark_noise_token_id, m.stages,
+        )  # fmt: skip
+    return m.host[0][: tb.nbytes].copy()
+
+
+def _device_written(tb, layers: int) -> np.ndarray:
+    """The tables the device writes itself, so the fill's leaving them untouched is by design: the
+    compressed-page tables, the index chain's per-group records and group bases (`ds_ix_gslot`), and the
+    window slots' key counts. Everything else the fill leaves untouched must be inside ``zero``."""
+    mask = np.zeros(tb.nbytes, bool)
+    names = ["cmp_blocks1", "cmp_blocks2", "ix1.rec", "ix2.rec", "ix1.gb", "ix2.gb"]
+    names += [f"win_pos.{layer}" for layer in range(layers)]
+    for n in names:
+        if n in tb.off:
+            off = tb.off[n]
+            mask[off : off + 4 * int(np.prod(tb.spec[n][1]))] = True
+    return mask
+
+
+def test_the_zero_ranges_are_never_written():
+    """The invariant a device-side clear rests on: **no byte of `Tables::zero` is ever written by the fill.**
+
+    `zero` names the byte ranges the step's table image is cleared in, and on this engine the clear runs on the
+    device, after the upload that carries the fill's writes. So a byte of `zero` that the fill writes is a byte
+    the clear erases — which is exactly what `f07d5dc` shipped: `zero` was the complement of the wholly-written
+    table families, i.e. most of the image, so every step erased its own `meta`, rope tables, row tables and
+    query-block records, and every prompt answered 'cccccccc'. This gate is the one that would have caught it.
+
+    Two poisons, so a written byte cannot be mistaken for an untouched one: a byte is untouched iff it still
+    holds poison A after the A run and poison B after the B run (a written byte holds the same value in both).
+    """
+    from resin_models_gaudi.deepseek_v41.model import (
+        DECODE_BUCKETS,
+        PREFILL_BUCKETS,
+        Shape,
+        bucket,
+    )
+
+    m = model()
+    rng = np.random.default_rng(11)
+    plans = {}
+    for t in DECODE_BUCKETS:
+        for case in range(2):
+            rows, positions, tokens = plan(m, t, rng, far=bool(case))
+            single = all(r.real == 1 for r in rows)
+            plans.setdefault(Shape(t, False), []).append(
+                (positions, rows, tokens, True, None, None)
+            )
+            if single:  # a prepared step's tokens come from the device
+                plans[Shape(t, False)].append((positions, rows, None, False, None, None))
+    for t in PREFILL_BUCKETS:
+        for case in range(2):
+            n = int(rng.integers(max(1, t // 4 + 1), t + 1)) if t > 32 else int(rng.integers(1, 33))
+            pos0 = int(rng.integers(0, 30_000))
+            floor = int(rng.integers(max(0, pos0 - 300), pos0 + 1)) if case else None
+            plans.setdefault(Shape(t, True), []).append(
+                (pos0 + np.arange(n), [prefill_row(m, rng, n, pos0)],
+                 rng.integers(0, m.cfg.vocab_size, n), True, floor, None)  # fmt: skip
+            )
+    for b in (1, 2):  # a draft step writes less of the same shape
+        shape = Shape(bucket(b * m.block, False), False)
+        for case in range(2):
+            rows = [prefill_row(m, rng, 1, int(rng.integers(0, 30_000)) if case else 0) for _ in range(b)]
+            plans.setdefault(shape, []).append(
+                (None, rows, None, False, None, (rng.integers(0, m.cfg.vocab_size, b), m.block))
+            )
+
+    for shape, cases in plans.items():
+        tb = m.tables[shape]
+        if not tb.zero:
+            continue
+        cleared = np.zeros(tb.nbytes, bool)
+        for a, b in tb.zero:
+            cleared[a:b] = True
+        for case, p in enumerate(cases):
+            untouched = _untouched(m, tb, [
+                _poisoned_fill(m, tb, p, _POISON[0]),
+                _poisoned_fill(m, tb, p, _POISON[1]),
+            ])  # fmt: skip
+            erased = cleared & ~untouched
+            if erased.any():
+                first = int(np.flatnonzero(erased)[0])
+                name = max((o, n) for n, o in tb.off.items() if o <= first)[1]
+                raise AssertionError(
+                    f"T={shape.T} prefill={shape.prefill} case {case}: {int(erased.sum())} bytes of the "
+                    f"cleared range are written by the fill, so the clear erases them; first at {first} "
+                    f"in table {name}"
+                )
