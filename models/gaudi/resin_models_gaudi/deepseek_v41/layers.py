@@ -1416,7 +1416,12 @@ def index_chain_graph(
                 # pattern ds_ix_qacc was written for. And the key slab is still the single shared tile, so this
                 # needs no broadcast and no expansion copy: it takes the gather's 16x AND the dequant's
                 # expansion write at once. (Measured: the (C, W) version of attempt 2 was 8.6 % slower at 93k.)
-                scw = lg.tensor((W, C), BF16)
+                # a persistent slab when RESIN_IX_SCW names it, so a test can read the GEMM's output back
+                scw = (
+                    lg.input("ix_scw", (W, C), BF16)
+                    if __import__("os").environ.get("RESIN_IX_SCW")
+                    else lg.tensor((W, C), BF16)
+                )
                 lg.node("batch_gemm", [ksv, q8], [scw], GEMM_NT)
                 if stop == "gemm":  # + the GEMM (everything but the accumulator)
                     continue
