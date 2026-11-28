@@ -263,6 +263,11 @@ static bool geom_ix_qacc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_ix_qacc_tile(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     return geom_ix_qacc(p, is, rank);
 }
+// ds_bcast3: one 256-byte vector of one column of one slot per member
+static bool geom_bcast3(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 1; is[1] = sz(p, false, 0, 1) / 2; is[2] = sz(p, true, 0, 2);
+    *rank = 3; return true;
+}
 // ix_slot_acc
 static bool geom_ix_slot_acc(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = sz(p, false, 0, 0) / 64; is[1] = sz(p, false, 0, 2); *rank = 2; return true;
@@ -450,6 +455,7 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_attn_online")) return geom_attn_stats;
     if (is("ds_attn_acc")) return geom_attn_stats;
     if (is("ds_ix_slot_acc")) return geom_ix_slot_acc;
+    if (is("ds_bcast3")) return geom_bcast3;
     if (is("ds_ix_qacc_tile")) return geom_ix_qacc_tile;  // before the ds_ix_qacc prefix
     if (is("ds_ix_qacc")) return geom_ix_qacc;
     if (is("ds_gather_win_blk")) return geom_mla_gather;

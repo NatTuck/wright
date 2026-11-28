@@ -1414,7 +1414,9 @@ def index_chain_graph(
                 # with a batch of 1 -- the score slab stays (C, M, Sp), a slot's plane contiguous, which is the
                 # pattern the accumulator was written for (the flat (C, W) slab made it read one element per
                 # line, and that cost more than the 16x gather it bought).
-                ks1 = lg.view(ksv, (INDEX_DIM, C, 1))
+                # Habana's batch_gemm does not broadcast a batch-1 operand, so the one tile is replicated
+                ks1 = lg.tensor((INDEX_DIM, C, Sp), F8)
+                lg.node("rg_ds_bcast3_f32", [ksv], [ks1])
                 nq = lg.g.node("rg_ix_slot_q8_f32", [q8, qsc, table], [qs, sq])
                 first_nodes.append(nq)
                 lg.node("batch_gemm", [qs, ks1], [sc], GEMM_NT)
