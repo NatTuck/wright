@@ -21,19 +21,20 @@
 //     ({256*nt, ...}) and it is what the hardware wants; do not "optimise" it back to a partial store.
 //
 // guid: rg_ds_bcast3_f32 (the glue derives it as rg_<file stem>_f32).
-// tensors: 0 in (D, C) u8 | 1 out (D, C*S) u8.  params: C (even).  index space: [1, C / 2, S]; one member is a
-// 256-byte vector = two columns of one slot.
+// tensors: 0 in (2D, C/2) u8 | 1 out (2D, C/2, S) u8 -- the same memory as (D, C) and (D, C, S), viewed so dim 0
+// is a whole 256-byte vector (dim 0 must be vector-granular: see fact 2 above). One member copies one vector,
+// which is two columns of the 128-wide slab, of one slot. index space: [1, C / 2, S].
 #include "common.h"
 
-void main(tensor in, tensor out, int C)
+void main(tensor in, tensor out)
 {
     const int5 off = get_index_space_offset();
     const int5 end = off + get_index_space_size();
     for (int s = off[2]; s < end[2]; s++)
         for (int c = off[1]; c < end[1]; c++)
             for (int d = off[0]; d < end[0]; d++) {
-                int5 ic = {0, 2 * c, 0, 0, 0};
-                int5 oc = {0, 2 * c + C * s, 0, 0, 0};
+                int5 ic = {0, c, 0, 0, 0};
+                int5 oc = {0, c, s, 0, 0};
                 v_u8_st_tnsr(oc, out, v_u8_ld_tnsr_b(ic, in));
             }
 }

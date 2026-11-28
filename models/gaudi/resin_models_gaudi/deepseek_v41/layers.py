@@ -1390,7 +1390,6 @@ def index_chain_graph(
                 kf, tf, idf = lg.tensor((C,), F32), lg.tensor((C,), I32), lg.tensor((C,), I32)
                 decf = lg.tensor((INDEX_DIM, C), F8)
                 ksf = lg.tensor((2 * INDEX_DIM, C // 2), F8)
-                scf = lg.tensor((C, W), BF16)
                 ng = lg.g.node(
                     "rg_ds_ix_gather_tile_f32",
                     [lg.arena(blocks), pages, table, lg.dep(), loff],

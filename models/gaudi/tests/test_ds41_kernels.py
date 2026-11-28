@@ -2409,13 +2409,14 @@ def test_ds_bcast3_replicates_the_slab_along_the_slot_axis(device, recipes):
         rng = np.random.default_rng(17)
         src = rng.integers(0, 256, (d, c), dtype=np.uint8)
         g = Graph(device, f"t_bcast3_{d}x{c}x{s}_{index_space_first_dim}")
-        i = g.input("in", (d, c), U8)
-        o = g.input("out", (d, c * s), U8)
-        g.node("rg_ds_bcast3_f32", [i], [o], struct.pack("<i", c))
+        # dim 0 must be vector-granular: the same memory as (D, C) and (D, C, S), viewed as 2 D-wide columns
+        i = g.input("in", (2 * d, c // 2), U8)
+        o = g.input("out", (2 * d, c // 2, s), U8)
+        g.node("rg_ds_bcast3_f32", [i], [o])
         recipe = recipes.compile(g)
         addresses = []
         try:
-            for name, array in (("in", src), ("out", np.zeros((d, c * s), np.uint8))):
+            for name, array in (("in", src), ("out", np.zeros((d, c, s), np.uint8))):
                 a = np.ascontiguousarray(array)
                 address = device.malloc(max(a.nbytes, 256))
                 addresses.append(address)
