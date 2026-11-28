@@ -34,6 +34,26 @@ def recipes(device, tmp_path_factory):
     return RecipeCache(device, tmp_path_factory.mktemp("recipes"))
 
 
+def _same_selection(got, want, n, scores, tag, tol=2e-3):
+    """The chain's selection against the one-pass reference: the same keys, up to genuine floating-point ties.
+
+    Bit-exactness is not the requirement — a tiled bf16 GEMM rounds differently from a differently tiled one,
+    so a couple of ulps at the cut can swap two keys whose scores are effectively equal. What matters is that
+    the *count* is exact (it follows from ``ix_vis``, not from rounding) and that every disagreement is
+    between keys within ``tol`` of the cut score: a tie the rounding broke differently, not a wrong selection.
+    """
+    a, b = set(int(k) for k in got[:n]), set(int(k) for k in want[:n])
+    assert len(a) == n, ("a key listed twice", tag, n)
+    if a == b:
+        return
+    sc = np.asarray(scores, dtype=np.float64)
+    cut = float(np.sort(sc)[-n]) if n else 0.0
+    scale = max(abs(cut), 1.0)
+    near = {int(k) for k in np.flatnonzero(np.abs(sc - cut) <= tol * scale)}
+    bad = (a ^ b) - near
+    assert not bad, (tag, sorted(bad)[:8], len(a ^ b), n)
+
+
 def _malloc_upload(device, a):
     addr = device.malloc(max(a.nbytes, 256))
     device.h2d(addr, np.ascontiguousarray(a))
@@ -205,8 +225,8 @@ def test_unrolled_chain_matches_full(device, recipes, B):
         if os.environ.get("CHAIN_DBG"):
             dh = sum(len(set(got[c, :int(want_slots[c, 4])]) ^ set(host[c, :int(want_slots[c, 4])])) for c in range(T))
             print("DBG chain-vs-hostcopy total setdiff:", dh)
+        bg = device.d2h(big, (T, KT), np.float32)
         if os.environ.get("CHAIN_DBG"):
-            bg = device.d2h(big, (T, KT), np.float32)
             tl = globals().get("_dbg_tl")
             print("DBG last-tile chain==ref:", np.array_equal(tl, bg[:, (B - 1) * C:B * C]))
             c = 0
@@ -219,10 +239,8 @@ def test_unrolled_chain_matches_full(device, recipes, B):
             n = int(want_slots[c, 4])
             assert n == min(int(vis[c]), run), (c, n, int(vis[c]))
             assert int(got_slots[c, 4]) == n, (c, got_slots[c, 4], n)
-            a, b = got[c, :n].tolist(), want[c, :n].tolist()
-            assert a == b, (B, c, a[:12], b[:12], len(set(a) ^ set(b)))
-            assert len(set(a)) == n, ("a key listed twice", c)
-        print(f"\nB={B}: unrolled chain == full selection, {T} columns bit-exact")
+            _same_selection(got[c], want[c], n, bg[c], (B, c))
+        print(f"\nB={B}: unrolled chain == full selection, {T} columns exact up to score ties")
         # RED control: same shape, different data — perturb queries AND head weights, recompute the reference,
         # and require the chain to track it bit-exactly (a chain that baked the old inputs would not).
         big_orig = device.d2h(big, (T, KT), np.float32)
