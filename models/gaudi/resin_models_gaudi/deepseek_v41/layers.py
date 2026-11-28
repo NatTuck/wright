@@ -1260,18 +1260,24 @@ def index_merge_graph(
     lg.node("rg_ix_thr_f32", [score, vis], [thr], struct.pack("i", run))
     cnt, gsum = lg.tensor((K // 64, T), I32), lg.tensor((-(-K // 4096), T), I32)
     lg.node("rg_ix_bcnt_f32", [score, vis, thr], [cnt, gsum])
+    # The merge is TWO nodes: the ordering (ds_ix_lanes, one reduction and one store per entry) and the emit
+    # (ds_ix_emit, all scalar). A partial store's source lane is a scalar and a vector cannot become one inside a
+    # kernel, so the lane has to cross a node boundary -- and with it crossed, the ordering needs one reduction per
+    # entry instead of the three a single kernel needed to broadcast the position and score to the slot's lane.
+    lanes = lg.tensor((run, T), I32)
     lg.node(
-        "rg_ds_ix_merge_f32",
+        "rg_ds_ix_lanes_f32",
         [score, vis, thr, cnt, gsum, exact, pos, base],
-        [
-            lg.input("ix_lslots", (8, T), I32),
-            lg.input("ix_list", (run, T), I32),
-            lg.input("ix_sout", (K, T), F32),
-            lg.input("ix_pos_out", (run, T), I32),
-        ],
+        [lg.input("ix_lslots", (8, T), I32), lanes],
         # one member per block of 64 rows, so a member's slots never span two 64-slot vectors (a partial-vector
         # store writes one vector's lanes, so a member that spans a vector boundary would shift its entries)
         struct.pack("iiii", max(1, 48 // T), run, heads, run),
+    )
+    lg.node(
+        "rg_ds_ix_emit_f32",
+        [score, vis, gsum, pos, base, lanes],
+        [lg.input("ix_list", (run, T), I32), lg.input("ix_sout", (K, T), F32), lg.input("ix_pos_out", (run, T), I32)],
+        struct.pack("ii", run, run),
     )
     return lg.g
 
@@ -1499,12 +1505,14 @@ def index_chain_graph(
         # tile's running set lands in the persistent ix_rout/ix_pout so the next G-tile recipe can carry it.
         lo, li = (lslots, ilist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((run, T), I32))
         rn, pn = (rout, pout) if i == tiles - 1 else (rnext, pnext)
+        lanes = lg.tensor((run, T), I32)
         prev = lg.g.node(
-            "rg_ds_ix_merge_f32",
+            "rg_ds_ix_lanes_f32",
             [m, vis, thr, cnt, gsum, exact, pprev, base],
-            [lo, li, rn, pn],
+            [lo, lanes],
             struct.pack("iiii", max(1, 48 // T), run, heads, run),
         )
+        lg.g.node("rg_ds_ix_emit_f32", [m, vis, gsum, pprev, base, lanes], [li, rn, pn], struct.pack("ii", run, run))
         rprev, pprev = rn, pn
         if kind == "bmax":
             # running top-INDEX_BLOCKS BLOCK merge: fold this tile's rows//8 block maxima into the device-resident
@@ -1524,11 +1532,18 @@ def index_chain_graph(
             lg.node("rg_ix_bcnt_f32", [bm, bvis, bthr], [bcnt, bgsum])
             blo, bli = (cslots, clist) if i == tiles - 1 else (lg.tensor((8, T), I32), lg.tensor((INDEX_BLOCKS, T), I32))
             brn, bpn = (brout, bpout) if i == tiles - 1 else (lg.tensor((INDEX_BLOCKS, T), F32), lg.tensor((INDEX_BLOCKS, T), I32))
+            blanes = lg.tensor((INDEX_BLOCKS, T), I32)
             bprev = lg.g.node(
-                "rg_ds_ix_merge_f32",
+                "rg_ds_ix_lanes_f32",
                 [bm, bvis, bthr, bcnt, bgsum, bexact, bpprev, bbase],
-                [blo, bli, brn, bpn],
+                [blo, blanes],
                 struct.pack("iiii", max(1, 48 // T), INDEX_BLOCKS, 0, INDEX_BLOCKS),
+            )
+            lg.g.node(
+                "rg_ds_ix_emit_f32",
+                [bm, bvis, bgsum, bpprev, bbase, blanes],
+                [bli, brn, bpn],
+                struct.pack("ii", INDEX_BLOCKS, INDEX_BLOCKS),
             )
             brprev, bpprev = brn, bpn
     return lg.g

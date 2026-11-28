@@ -250,6 +250,11 @@ static bool geom_ix_list(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
     const int n = p->nodeParams.nodeParams && p->nodeParams.nodeParamsSize >= 4 ? *(const int*)p->nodeParams.nodeParams : 1;
     is[0] = n > 0 ? n : 1; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
 }
+// ds_ix_emit (the split merge's node B): one member per listed slot, so [KS, T]
+static bool geom_ix_emit(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    const int n = p->nodeParams.nodeParams && p->nodeParams.nodeParamsSize >= 4 ? *(const int*)p->nodeParams.nodeParams : 1;
+    is[0] = n > 0 ? n : 1; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
+}
 // ix_unmask
 static bool geom_columns(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = sz(p, true, 0, 1); *rank = 1; return true;
@@ -481,6 +486,8 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_smean")) return geom_elem64;
     if (is("ds_argmax")) return geom_columns;
     if (is("ds_mk_add")) return geom_mk_add;
+    if (is("ds_ix_emit")) return geom_ix_emit;      // the split merge's node B: [KS, T], one member per slot
+    if (is("ds_ix_lanes")) return geom_ix_list;     // node A: the same index space as the merge
     if (is("ds_ix_merge")) return geom_ix_list;
     if (is("ds_ix_assemble")) return geom_elem64;
     if (is("ds_ix_bmax_nat")) return geom_k512;
